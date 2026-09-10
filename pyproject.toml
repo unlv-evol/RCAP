@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rcap"
+version = "0.1.0"
+description = "Reusable Change Adaptation Pipeline (RCAP): engineers the evidence in a SALP-produced SAP into one LLM candidate Adaptation Package."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+    # salp is installed editable from a pinned local clone (see README);
+    # not listed here so pip never resolves the unrelated PyPI name.
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rcap"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
