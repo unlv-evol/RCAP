@@ -53,7 +53,16 @@ class GenerationRecord(BaseModel):
 
 def generate(request: AdaptationRequest, backend: Backend,
              *, expected_placeholders: set[str] | None = None) -> GenerationRecord:
-    theta = {"backend": backend.name, "model": backend.model}
+    # θ must make a weight change distinguishable from an evidence change
+    # (sections 10-12): record generation params and model version when the
+    # backend exposes them, not just its name.
+    theta: dict[str, object] = {"backend": backend.name, "model": backend.model}
+    params = getattr(backend, "params", None)
+    if params:
+        theta["params"] = dict(params)
+    digest = getattr(backend, "model_digest", None)
+    if digest:
+        theta["version"] = digest
     exec_id = hashlib.sha256(
         f"{backend.name}:{backend.model}:{request.request_hash}".encode()).hexdigest()[:16]
 

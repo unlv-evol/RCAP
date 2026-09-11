@@ -1,6 +1,7 @@
 """Regression tests for the findings of the 2026-09-11 spec audit."""
 
 import json
+import typing
 
 import pytest
 
@@ -56,6 +57,37 @@ def test_composite_refusal_becomes_typed_harness_row(sap_dir, pr_manifest, tmp_p
     written = [json.loads(line) for line in
                (tmp_path / "rows.jsonl").read_text().splitlines()]
     assert len(written) == len(rows)
+
+
+def test_theta_records_params_and_model_version(stages):
+    """Audit bug 3: generation params and model digest were computed by the
+    backend but never recorded, so a weight change was indistinguishable from
+    an evidence change in the stored artifacts (spec sections 10-12)."""
+    from rcap.context import build_context
+    from rcap.generate import StubBackend, generate
+    from rcap.package import build_package
+    from rcap.request import synthesize
+
+    case, red, mat, prog = stages
+    ctx = build_context(case, red, mat, prog)
+    req = synthesize(ctx)
+
+    class InstrumentedBackend(StubBackend):
+        params: typing.ClassVar[dict] = {"temperature": 0, "seed": 7, "num_ctx": 1024}
+        model_digest = "family/size/quant"
+
+    gen = generate(req, InstrumentedBackend("```java\nvoid x() {}\n```"))
+    assert gen.generation_config["params"] == {"temperature": 0, "seed": 7,
+                                               "num_ctx": 1024}
+    assert gen.generation_config["version"] == "family/size/quant"
+    pkg = build_package(case, ctx, gen)
+    assert pkg.generation_meta["params"]["seed"] == 7
+    assert pkg.generation_meta["version"] == "family/size/quant"
+
+    # A backend without the attributes keeps the minimal theta.
+    plain = generate(req, StubBackend("```java\nvoid x() {}\n```"))
+    assert "params" not in plain.generation_config
+    assert "version" not in plain.generation_config
 
 
 def test_failure_rows_carry_stable_id_and_dispositions(sap_dir, pr_manifest, tmp_path):
