@@ -82,8 +82,13 @@ def run_configs(
             stage = getattr(exc, "stage", None)
             if stage not in TYPED_FAILURES:
                 raise
-            row = EvalRow(case_id=str(sap_dir), config_id=config.config_id,
-                          mode=mode.value, outcome=f"failure:{stage}")
+            # Stable case identity (never a filesystem path) and the dispositions
+            # established before the failure (section 14 / section 20).
+            sap = Path(sap_dir)
+            case_id = getattr(exc, "case_id", None) or f"{sap.parent.name}/{sap.name}"
+            row = EvalRow(case_id=case_id, config_id=config.config_id,
+                          mode=mode.value, outcome=f"failure:{stage}",
+                          dispositions=getattr(exc, "dispositions", {}))
         row.runtime_ms = int((time.time() - t0) * 1000)
         rows.append(row)
 

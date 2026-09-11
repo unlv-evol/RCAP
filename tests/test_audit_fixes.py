@@ -56,3 +56,26 @@ def test_composite_refusal_becomes_typed_harness_row(sap_dir, pr_manifest, tmp_p
     written = [json.loads(line) for line in
                (tmp_path / "rows.jsonl").read_text().splitlines()]
     assert len(written) == len(rows)
+
+
+def test_failure_rows_carry_stable_id_and_dispositions(sap_dir, pr_manifest, tmp_path):
+    """Audit bug 2: failure rows recorded an absolute filesystem path as case_id
+    and dropped the dispositions established before the failure."""
+    import shutil
+
+    from rcap.eval_harness import run_configs
+    from rcap.generate import StubBackend
+
+    null_sap = tmp_path / "sap-NullTau"
+    shutil.copytree(sap_dir, null_sap)
+    fn = null_sap / "functions" / "fn-1"
+    (fn / "source.after.java").write_text((fn / "source.before.java").read_text())
+
+    rows = run_configs(null_sap, pr_manifest, StubBackend("x"))
+    for row in rows:
+        assert row.outcome == "failure:materialization"
+        assert not row.case_id.startswith("/"), "case_id must not be a path"
+        # The case model's own stable identity, taken from SAP metadata:
+        assert row.case_id == "PR-1/sap-Validator"
+        assert row.dispositions, "pre-failure dispositions must be kept"
+        assert "retained_adaptation_material" in row.dispositions
