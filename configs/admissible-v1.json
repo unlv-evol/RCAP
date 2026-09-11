@@ -1,0 +1,11 @@
+{
+  "policy_id": "admissible-v1",
+  "description": "Default admissible relationship types for semantic evidence reduction (RCAP ref section 6): edges that explain source-target correspondence, structural evolution affecting the change, or constraints on reconstruction. Membership edges are inadmissible (I8).",
+  "admissible": [
+    "aligned_to",
+    "renamed_to", "moved_to", "extracted_into", "extracted_from",
+    "signature_changed", "api_replaced", "depends_on",
+    "cross_file_dependency", "same_function_as"
+  ],
+  "inadmissible": ["same_pull_request", "same_commit", "same_directory"]
+}
