@@ -90,6 +90,25 @@ def test_theta_records_params_and_model_version(stages):
     assert "version" not in plain.generation_config
 
 
+def test_corrupt_payload_is_typed_failure_not_crash(sap_dir, pr_manifest, tmp_path):
+    """Audit bug 5: a non-UTF-8 payload raised an uncaught UnicodeDecodeError
+    instead of the typed evidence failure section 7 requires."""
+    import shutil
+
+    from rcap.materialize import MaterializationFailure
+
+    broken = tmp_path / "sap-Corrupt"
+    shutil.copytree(sap_dir, broken)
+    (broken / "functions" / "fn-1" / "target.java").write_bytes(b"\xff\xfe garbage \x80")
+
+    case = load_case(broken, pr_manifest=pr_manifest)
+    red = reduce_semantic(case, select(case))
+    with pytest.raises(MaterializationFailure) as err:
+        materialize(case, red)
+    assert err.value.stage == "materialization"
+    assert any("not valid UTF-8" in d for d in err.value.diagnostics)
+
+
 def test_non_ascii_payload_reduces_and_recovers_byte_exact():
     """Audit bug 4: _reduce_one spliced the Python str with tree-sitter BYTE
     offsets, silently corrupting reduction and recovery whenever a non-ASCII

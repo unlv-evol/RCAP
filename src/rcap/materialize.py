@@ -92,7 +92,15 @@ def materialize(case: CaseModel, reduction: SemanticReductionManifest) -> Materi
             if not path.is_file():
                 errors.append(f"{entity}: payload ref {ref} does not resolve")
                 continue
-            content = path.read_text(encoding="utf-8")
+            # read_bytes + decode: no newline translation (content must hash
+            # byte-identically to disk), and a corrupt payload is a typed
+            # evidence failure (section 7 behavior 4), never an untyped crash.
+            try:
+                content = path.read_bytes().decode("utf-8")
+            except UnicodeDecodeError as exc:
+                errors.append(f"{entity}: payload {ref} is not valid UTF-8 "
+                              f"(corrupt evidence: {exc})")
+                continue
             record.payloads.append(MaterializedPayload(
                 entity=entity, role=role, ref=ref, content=content,
                 sha256=hashlib.sha256(content.encode()).hexdigest(),
