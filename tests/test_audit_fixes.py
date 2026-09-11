@@ -90,6 +90,33 @@ def test_theta_records_params_and_model_version(stages):
     assert "version" not in plain.generation_config
 
 
+def test_non_ascii_payload_reduces_and_recovers_byte_exact():
+    """Audit bug 4: _reduce_one spliced the Python str with tree-sitter BYTE
+    offsets, silently corrupting reduction and recovery whenever a non-ASCII
+    character preceded a placeheld node."""
+    from salp.structural import grammar_for
+
+    from rcap.reduction_program import _reduce_one, recover
+
+    text = (
+        "void check(int n) {\n"
+        "    // café naïve übermensch — non-ASCII before the removable block\n"
+        "    if (n < 0) {\n"
+        "        log(n);\n"
+        "        throw new IllegalArgumentException();\n"
+        "    }\n"
+        "    use(n);\n"
+        "}\n"
+    )
+    art = _reduce_one("functions/fn-x", "target", text, set(),
+                      grammar_for("java"), 3, None)
+    assert len(art.placeholders) == 1, "the if-block must be placeheld"
+    assert "IllegalArgumentException" not in art.reduced_text
+    assert "café naïve übermensch" in art.reduced_text, "comment must be intact"
+    assert "use(n);" in art.reduced_text, "tail must not be duplicated/truncated"
+    assert recover(art).encode() == text.encode()
+
+
 def test_failure_rows_carry_stable_id_and_dispositions(sap_dir, pr_manifest, tmp_path):
     """Audit bug 2: failure rows recorded an absolute filesystem path as case_id
     and dropped the dispositions established before the failure."""
