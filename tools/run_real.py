@@ -11,7 +11,7 @@ from rcap.backend_ollama import OllamaBackend
 from rcap.context import build_context
 from rcap.generate import generate
 from rcap.intake import load_case
-from rcap.materialize import NullTransformationFailure, materialize
+from rcap.materialize import materialize
 from rcap.package import build_package
 from rcap.reduction_program import reduce_program
 from rcap.reduction_semantic import reduce_semantic
@@ -33,11 +33,14 @@ def main() -> None:
         red = reduce_semantic(case, select(case))
         try:
             mat = materialize(case, red)
-        except NullTransformationFailure as exc:
-            print(f"  REFUSED (typed failure at {exc.stage}): {exc.diagnostics[0]}")
+            prog = reduce_program(case, red, mat)
+            ctx = build_context(case, red, mat, prog)
+        except Exception as exc:
+            stage = getattr(exc, "stage", None)
+            if stage is None:
+                raise
+            print(f"  REFUSED (typed failure at {stage}): {exc.diagnostics[0]}")
             continue
-        prog = reduce_program(case, red, mat)
-        ctx = build_context(case, red, mat, prog)
         req = synthesize(ctx)
 
         t0 = time.time()

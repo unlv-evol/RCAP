@@ -20,7 +20,7 @@ from rcap.generate import Backend
 from rcap.pipeline import run_case
 
 TYPED_FAILURES = ("intake", "semantic_reduction", "materialization",
-                  "program_reduction", "packaging")
+                  "program_reduction", "context_construction", "packaging")
 
 
 class EvalRow(BaseModel):

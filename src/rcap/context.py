@@ -23,6 +23,20 @@ from rcap.reduction_program import (
 from rcap.reduction_semantic import Disposition, SemanticReductionManifest
 
 
+class CompositeCaseUnsupported(Exception):
+    """Typed refusal for multi-entity cases until section-13 per-unit processing
+    exists. Refusing is mandatory here: building a context from only the first
+    entity would silently misrepresent a composite case as fully covered."""
+
+    def __init__(self, case_id: str, entities: list[str]):
+        self.stage = "context_construction"
+        detail = (f"composite case: {len(entities)} materialized entities "
+                  f"({', '.join(entities)}); per-unit processing (spec section 13) "
+                  f"is not implemented — refusing rather than truncating to the first entity")
+        self.diagnostics = [detail]
+        super().__init__(f"composite case unsupported for {case_id}: {self.diagnostics[0]}")
+
+
 class ContextRelationship(BaseModel):
     id: str
     type: str
@@ -64,6 +78,8 @@ def build_context(
     materialized: MaterializationRecord,
     program: ProgramReductionRecord,
 ) -> AdaptationContext:
+    if len(reduction.materialize) > 1:
+        raise CompositeCaseUnsupported(case.case_id, list(reduction.materialize))
     entity = reduction.materialize[0] if reduction.materialize else None
     if entity is None:
         raise ContextConstructionFailure(case.case_id, ["no program entity to adapt"])
