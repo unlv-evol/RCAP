@@ -27,13 +27,26 @@ def run_case(
     semantic_on = config.mode.semantic_reduction
     program_on = config.mode.program_reduction
     case = load_case(sap_dir, pr_manifest=pr_manifest)
-    selection = select(case)
-    reduction = reduce_semantic(case, selection, enabled=semantic_on)
-    materialized = materialize(case, reduction)
-    program = reduce_program(case, reduction, materialized, config,
-                             enabled=program_on, evidence_protection=semantic_on)
-    context: AdaptationContext = build_context(case, reduction, materialized, program)
-    request: AdaptationRequest = synthesize(context)
+    reduction = None
+    try:
+        selection = select(case)
+        reduction = reduce_semantic(case, selection, enabled=semantic_on)
+        materialized = materialize(case, reduction)
+        program = reduce_program(case, reduction, materialized, config,
+                                 enabled=program_on, evidence_protection=semantic_on)
+        context: AdaptationContext = build_context(case, reduction, materialized, program)
+        request: AdaptationRequest = synthesize(context)
+    except Exception as exc:
+        # Section 14: a typed failure record keeps the stable case identity and
+        # the evidence dispositions established before the failure.
+        if getattr(exc, "stage", None) is not None:
+            exc.case_id = case.case_id
+            if reduction is not None:
+                counts: dict[str, int] = {}
+                for d in reduction.dispositions.values():
+                    counts[d.value] = counts.get(d.value, 0) + 1
+                exc.dispositions = counts
+        raise
     expected = {f"/* RCAP_PH_{p.ph_id} */"
                 for a in context.program_context if a.role == "target"
                 for p in a.placeholders}

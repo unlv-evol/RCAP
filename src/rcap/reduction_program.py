@@ -156,8 +156,11 @@ def _reduce_one(
         nodes = [n for n in nodes
                  if _normalize(text[n.start_byte:n.end_byte]) in removable_norm]
 
+    # tree-sitter offsets are BYTE offsets: splice in bytes, decode once at the
+    # end. Splicing the str with byte offsets silently corrupts any payload
+    # containing non-ASCII characters before a placeheld node.
     raw = text.encode()
-    reduced = text
+    reduced_bytes = raw
     placeholders: list[PlaceholderEntry] = []
     for i, node in enumerate(sorted(nodes, key=lambda n: n.start_byte, reverse=True), 1):
         original = raw[node.start_byte:node.end_byte].decode()
@@ -167,8 +170,9 @@ def _reduce_one(
             original_text=original,
             sha256=hashlib.sha256(original.encode()).hexdigest(),
         ))
-        reduced = reduced[:node.start_byte] + PLACEHOLDER.format(n=ph_id) \
-            + reduced[node.end_byte:]
+        reduced_bytes = reduced_bytes[:node.start_byte] \
+            + PLACEHOLDER.format(n=ph_id).encode() + reduced_bytes[node.end_byte:]
+    reduced = reduced_bytes.decode()
 
     nodes_after = _count_nodes(parse(reduced, grammar).root_node)
     return ReducedArtifact(
@@ -238,10 +242,12 @@ def reduce_program(
 def _assert_no_protected_overlap(case: CaseModel, art: ReducedArtifact) -> None:
     """No placeholder may overlap a hunk-touched/protected line — hard failure, not a cut."""
     original = recover(art)
+    # Placeholder spans are byte offsets; measure lines in bytes to match.
     offsets, pos = [], 0
     for line in original.splitlines(keepends=True):
-        offsets.append((pos, pos + len(line)))
-        pos += len(line)
+        n = len(line.encode())
+        offsets.append((pos, pos + n))
+        pos += n
     problems = []
     for entry in art.placeholders:
         for p in art.protected_lines:
