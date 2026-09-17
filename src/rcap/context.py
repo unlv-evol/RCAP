@@ -27,6 +27,11 @@ from rcap.reduction_semantic import Disposition, SemanticReductionManifest
 
 _WS = re.compile(r"\s+")
 
+# I13: markers of a developer target solution / evaluation oracle. Nothing
+# upstream may carry one; their appearance is a validity failure.
+_ORACLE_MARKERS = ("ground_truth", "developer_edit", "developer_solution",
+                   "oracle", "expected_target", "reference_solution")
+
 
 class ContextValidityFailure(ContextConstructionFailure):
     """A context failing a section-9/13 validity condition. Subclasses the
@@ -300,6 +305,19 @@ def build_context(
     # Validity: every retained relationship endpoint and constraint traceable to the SAP.
     problems = [f"constraint {c.id} evidence {c.evidence_ref} is not retained"
                 for c in constraints if c.evidence_ref not in retained]
+    # I13: no evaluation-only or historical target solution may be present —
+    # nothing upstream should carry one, so anything that looks like a
+    # developer solution or oracle is a validity failure, never content.
+    for oid in sorted(retained):
+        rec = case.evidence.get(oid)
+        if rec is None:
+            continue
+        haystack = " ".join([oid.lower(), (rec.element or "").lower(),
+                             *(str(k).lower() for k in rec.attributes)])
+        marker = next((m for m in _ORACLE_MARKERS if m in haystack), None)
+        if marker:
+            problems.append(f"I13 oracle leakage: retained evidence {oid} carries "
+                            f"a developer-solution/oracle marker ({marker})")
     if problems:
         raise ContextValidityFailure(case.case_id, problems)
 

@@ -96,3 +96,14 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
         f"{TEMPLATE_ID}:{TEMPLATE_VERSION}\n{prompt}".encode()).hexdigest()
     return AdaptationRequest(case_id=context.case_id, prompt=prompt,
                              request_hash=request_hash)
+
+
+def untraceable_lines(prompt: str, context: AdaptationContext) -> list[str]:
+    """Section 17 mapping test: every request fact must originate in the
+    context. Synthesis is deterministic (R = Psi(C, I)), so the reference
+    rendering of the context is the complete set of legitimate lines; any
+    non-empty line of the given prompt outside it has no context origin —
+    invented evidence."""
+    legitimate = set(synthesize(context).prompt.splitlines())
+    return [line for line in prompt.splitlines()
+            if line.strip() and line not in legitimate]

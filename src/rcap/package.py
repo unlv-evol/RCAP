@@ -20,6 +20,14 @@ from rcap.generate import GenerationRecord
 from rcap.model import CaseModel
 from rcap.reduction_program import PlaceholderEntry
 
+# I11/I12: keys that would smuggle a downstream validation result or a prior
+# integration outcome into the package. Their appearance anywhere in the
+# package structure fails packaging validation (section 17 negative tests).
+FORBIDDEN_DOWNSTREAM_MARKERS = (
+    "build_result", "test_result", "tests_passed", "validation_result",
+    "compile_result", "correctness", "prior_integration", "integration_outcome",
+)
+
 
 class PackagingFailure(Exception):
     def __init__(self, case_id: str, diagnostics: list[str]):
@@ -105,7 +113,7 @@ def build_package(
     target_art = next(a for a in context.program_context if a.role == "target")
 
     composite = units is not None and len(units) > 1
-    return AdaptationPackage(
+    package = AdaptationPackage(
         units=_unit_entries(units) if composite else [],
         coupling=(coupling.model_dump(exclude={"case_id"})
                   if composite and coupling is not None else {}),
@@ -132,8 +140,33 @@ def build_package(
         },
         outcome="completion",
     )
+    validate_package(package)
+    return package
 
 
 def context_aggregate(case: CaseModel) -> dict[str, object]:
     agg = case.characterization.get("aggregate")
     return agg if isinstance(agg, dict) else {}
+
+
+def _keys_recursive(value: object):
+    if isinstance(value, dict):
+        for k, v in value.items():
+            yield str(k)
+            yield from _keys_recursive(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _keys_recursive(v)
+
+
+def validate_package(package: AdaptationPackage) -> None:
+    """Packaging validation (section 17): a downstream validation result or a
+    prior integration outcome appearing anywhere in the package structure is a
+    packaging failure (I11, I12). Keys are checked, not values — evidence ids
+    like '...verification:covering_tests' are legitimate references."""
+    offending = sorted({k for k in _keys_recursive(package.model_dump())
+                        if any(m in k.lower() for m in FORBIDDEN_DOWNSTREAM_MARKERS)})
+    if offending:
+        raise PackagingFailure(package.case_id, [
+            ("I11/I12 violation: downstream-result field(s) in package: "
+             f"{', '.join(offending)}")])
