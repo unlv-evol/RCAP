@@ -55,6 +55,20 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
         lines = [f"- [{c.kind}] {c.detail}" + (" (BLOCKING)" if c.blocking else "")
                  for c in context.constraints]
         sections.append("## Constraints from recovered evidence\n" + "\n".join(lines))
+    if context.siblings:
+        # Section 13: sibling-edit signatures, so a rename or signature change
+        # made in another unit of the same change stays consistent here.
+        lines = []
+        for s in context.siblings:
+            line = f"- {s.entity}: `{s.signature_after or s.target_signature or '?'}`"
+            if s.signature_before and s.signature_after \
+                    and s.signature_before != s.signature_after:
+                line += f" (changed from `{s.signature_before}`)"
+            lines.append(line)
+        sections.append(
+            "## Other functions edited by this same change (signatures only)\n"
+            "This change also edits the functions below; keep any shared names\n"
+            "and signatures consistent with these edits.\n" + "\n".join(lines))
     if context.target_localization.get("file"):
         sections.append("## Target location\n"
                         f"File: {context.target_localization['file']}")

@@ -11,8 +11,11 @@ condition is a context-construction failure.
 
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field
 
+from rcap.coupling import Unit
 from rcap.materialize import MaterializationRecord
 from rcap.model import CaseModel
 from rcap.reduction_program import (
@@ -22,19 +25,43 @@ from rcap.reduction_program import (
 )
 from rcap.reduction_semantic import Disposition, SemanticReductionManifest
 
+_WS = re.compile(r"\s+")
 
-class CompositeCaseUnsupported(Exception):
-    """Typed refusal for multi-entity cases until section-13 per-unit processing
-    exists. Refusing is mandatory here: building a context from only the first
-    entity would silently misrepresent a composite case as fully covered."""
 
-    def __init__(self, case_id: str, entities: list[str]):
+class ContextValidityFailure(ContextConstructionFailure):
+    """A context failing a section-9/13 validity condition. Subclasses the
+    program-reduction failure type for compatibility, but carries the correct
+    stage attribution (section 14): the failure happened building the context,
+    not reducing the program."""
+
+    def __init__(self, case_id: str, diagnostics: list[str]):
+        super().__init__(case_id, diagnostics)
         self.stage = "context_construction"
-        detail = (f"composite case: {len(entities)} materialized entities "
-                  f"({', '.join(entities)}); per-unit processing (spec section 13) "
-                  f"is not implemented — refusing rather than truncating to the first entity")
-        self.diagnostics = [detail]
-        super().__init__(f"composite case unsupported for {case_id}: {self.diagnostics[0]}")
+
+
+def signature_of(payload_text: str) -> str | None:
+    """The declaration header of a function payload: the text up to the first
+    body brace, whitespace-collapsed. Derived from SAP evidence (the payload
+    itself), never invented; None when the payload has no brace (not a
+    function body)."""
+    head, brace, _ = payload_text.partition("{")
+    if not brace:
+        return None
+    return _WS.sub(" ", head).strip() or None
+
+
+class SiblingSignature(BaseModel):
+    """Section 13 sibling-edit signature: the signatures (never bodies) of the
+    other units edited by the same change, so the backend can keep a rename or
+    signature change consistent. Lightweight coordination, not joint
+    generation."""
+
+    entity: str
+    hunk_ids: list[str]
+    signature_before: str | None = None   # from source.before
+    signature_after: str | None = None    # from source.after
+    target_signature: str | None = None   # from the fork's target payload
+    derivation: str = "declaration header of the SAP function payloads"
 
 
 class ContextRelationship(BaseModel):
@@ -60,6 +87,11 @@ class Correspondence(BaseModel):
 
 class AdaptationContext(BaseModel):
     case_id: str
+    # Section 13: the processing unit this context covers (entity, ordered
+    # hunks, coupling basis/note) and the sibling units' signatures. Empty
+    # unit info means a plain single-unit case.
+    unit: dict[str, object] = Field(default_factory=dict)
+    siblings: list[SiblingSignature] = Field(default_factory=list)
     transformation: dict[str, str]              # role -> reduced text
     edit_regions: list[str]
     target_localization: dict[str, str | None]  # file, function
@@ -77,16 +109,32 @@ def build_context(
     reduction: SemanticReductionManifest,
     materialized: MaterializationRecord,
     program: ProgramReductionRecord,
+    unit: Unit | None = None,
+    siblings: tuple[Unit, ...] = (),
 ) -> AdaptationContext:
-    if len(reduction.materialize) > 1:
-        raise CompositeCaseUnsupported(case.case_id, list(reduction.materialize))
-    entity = reduction.materialize[0] if reduction.materialize else None
+    """Build the context for one processing unit (section 13: per-unit
+    processing). A composite case must name its unit explicitly — building
+    from only the first entity would silently misrepresent the case as fully
+    covered, so that remains a typed failure, never a truncation."""
+    if unit is None:
+        if len(reduction.materialize) > 1:
+            raise ContextValidityFailure(case.case_id, [
+                (f"composite case: {len(reduction.materialize)} materialized entities "
+                 f"({', '.join(reduction.materialize)}); an explicit processing unit "
+                 f"is required (section 13) — refusing rather than truncating "
+                 f"to the first entity")])
+        entity = reduction.materialize[0] if reduction.materialize else None
+    else:
+        entity = unit.entity
+        if entity not in reduction.materialize:
+            raise ContextValidityFailure(case.case_id, [
+                f"unit entity {entity} is not among the materialized entities"])
     if entity is None:
-        raise ContextConstructionFailure(case.case_id, ["no program entity to adapt"])
+        raise ContextValidityFailure(case.case_id, ["no program entity to adapt"])
     arts = {a.role: a for a in program.artifacts if a.entity == entity}
     for role in ("source.before", "source.after", "target"):
         if role not in arts:
-            raise ContextConstructionFailure(case.case_id, [f"missing reduced artifact {role}"])
+            raise ContextValidityFailure(case.case_id, [f"missing reduced artifact {role}"])
 
     retained = reduction.retained_ids()
     relationships = [
@@ -114,15 +162,38 @@ def build_context(
     problems = [f"constraint {c.id} evidence {c.evidence_ref} is not retained"
                 for c in constraints if c.evidence_ref not in retained]
     if problems:
-        raise ContextConstructionFailure(case.case_id, problems)
+        raise ContextValidityFailure(case.case_id, problems)
 
     dispositions = {d.value: sorted(oid for oid, dd in reduction.dispositions.items() if dd is d)
                     for d in Disposition}
 
+    # Section 13: sibling-edit signatures — the signatures (never bodies) of
+    # the other units edited by this change, from their materialized payloads.
+    sibling_sigs: list[SiblingSignature] = []
+    for sib in siblings:
+        roles = materialized.by_role(sib.entity)
+        if not roles:
+            continue  # not materialized: nothing evidenced to signal
+
+        def sig(role: str, roles=roles) -> str | None:
+            payload = roles.get(role)
+            return signature_of(payload.content) if payload else None
+
+        sibling_sigs.append(SiblingSignature(
+            entity=sib.entity, hunk_ids=sib.hunk_ids,
+            signature_before=sig("source.before"),
+            signature_after=sig("source.after"),
+            target_signature=sig("target")))
+
+    unit_edit_regions = (unit.edit_regions if unit is not None
+                         else [er for t in case.transformations for er in t.edit_regions])
+
     return AdaptationContext(
         case_id=case.case_id,
+        unit=unit.model_dump() if unit is not None else {},
+        siblings=sibling_sigs,
         transformation={role: arts[role].reduced_text for role in arts},
-        edit_regions=[er for t in case.transformations for er in t.edit_regions],
+        edit_regions=unit_edit_regions,
         target_localization={"file": case.target_file,
                              "function": entity},
         relationships=relationships,

@@ -49,6 +49,11 @@ class EvalRow(BaseModel):
     fidelity: float | None = None
     readiness: str | None = None
     request_hash: str | None = None
+    # Section 13: processing units in the case (1 for a plain case). Size and
+    # token measurements are sums over units; outcome is completion only when
+    # every unit completed, else the first non-completing unit's state.
+    units: int = 1
+    unit_outcomes: dict[str, str] = Field(default_factory=dict)  # entity -> outcome
     outcome: str = ""                                # completion | failure:<stage> | gen state
     runtime_ms: int = 0
 
@@ -70,6 +75,9 @@ def run_configs(
         try:
             result = run_case(sap_dir, pr_manifest, backend, config)
             scores = result.case.characterization_scores()
+            gens = [ur.generation for ur in result.units]
+            outcome = next((g.outcome for g in gens if g.outcome != "completion"),
+                           "completion")
             row = EvalRow(
                 case_id=result.case.case_id,
                 config_id=config.config_id,
@@ -80,24 +88,30 @@ def run_configs(
                 nodes_before=sum(a.nodes_before for a in result.program.artifacts),
                 nodes_after=sum(a.nodes_after for a in result.program.artifacts),
                 placeholders=sum(len(a.placeholders) for a in result.program.artifacts),
-                context_chars=len(result.context.model_dump_json()),
-                prompt_chars=len(result.request.prompt),
-                input_tokens=result.generation.usage.get("input_tokens"),
-                output_tokens=result.generation.usage.get("output_tokens"),
+                context_chars=sum(len(ur.context.model_dump_json())
+                                  for ur in result.units),
+                prompt_chars=sum(len(ur.request.prompt) for ur in result.units),
+                input_tokens=_summed_usage(gens, "input_tokens"),
+                output_tokens=_summed_usage(gens, "output_tokens"),
                 coverage=scores["coverage"],
                 fidelity=scores["fidelity"],
                 readiness=scores["readiness"],
                 request_hash=result.request.request_hash,
-                outcome=result.generation.outcome,
+                units=len(result.units),
+                unit_outcomes={ur.unit.entity: ur.generation.outcome
+                               for ur in result.units if ur.unit is not None},
+                outcome=outcome,
             )
             if artifacts_dir is not None:
                 mode_dir = artifacts_dir / mode.value
                 mode_dir.mkdir(parents=True, exist_ok=True)
-                (mode_dir / "request.txt").write_text(
-                    result.request.prompt, encoding="utf-8")
-                if result.generation.outcome == "completion":
-                    (mode_dir / "candidate.java").write_text(
-                        result.generation.candidate, encoding="utf-8")
+                for i, ur in enumerate(result.units):
+                    suffix = "" if len(result.units) == 1 else f"-unit{i + 1}"
+                    (mode_dir / f"request{suffix}.txt").write_text(
+                        ur.request.prompt, encoding="utf-8")
+                    if ur.generation.outcome == "completion":
+                        (mode_dir / f"candidate{suffix}.java").write_text(
+                            ur.generation.candidate, encoding="utf-8")
         except Exception as exc:
             stage = getattr(exc, "stage", None)
             if stage not in TYPED_FAILURES:
@@ -123,6 +137,15 @@ def run_configs(
             for row in rows:
                 fh.write(row.model_dump_json() + "\n")
     return rows
+
+
+def _summed_usage(gens, key: str) -> int | None:
+    """Sum a backend-reported token count over units; None unless every unit
+    reported it (a partial sum would understate silently)."""
+    values = [g.usage.get(key) for g in gens]
+    if any(not isinstance(v, int) for v in values):
+        return None
+    return sum(values)
 
 
 def _disposition_counts(reduction) -> dict[str, int]:

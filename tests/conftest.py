@@ -197,6 +197,126 @@ def pr_manifest(pr_dir: Path) -> dict:
     return json.loads((pr_dir / "pr.json").read_text(encoding="utf-8"))
 
 
+F_S2 = """int compute(int a) {
+    int base = lookup(a);
+    return base + OFFSET;
+}
+"""
+F_S2_PRIME = F_S2.replace("base + OFFSET", "base + OFFSET + 1")
+F_T2 = F_S2.replace("lookup(a)", "lookupNode(a)")  # drifted fork copy
+
+
+def _hunk(hunk_id: str, fn_id: str) -> Hunk:
+    """A minimal mapped hunk carrying every schema-required category."""
+    categories = {
+        Category.SOURCE_CHANGE: CategoryEvidence(category=Category.SOURCE_CHANGE, elements=[
+            _element(f"{hunk_id}:source_change:edit_region", "edit_region",
+                     EvidenceState.PRESENT),
+        ]),
+        Category.TARGET_LOCALIZATION: CategoryEvidence(
+            category=Category.TARGET_LOCALIZATION, elements=[
+                _element(f"{hunk_id}:localization:target_function",
+                         "localized_target_function", EvidenceState.PRESENT),
+            ]),
+        Category.FUNCTION_TRANSFORMATION: CategoryEvidence(
+            category=Category.FUNCTION_TRANSFORMATION, elements=[
+                _element(f"{hunk_id}:transformation:triple", "transformation_unit",
+                         EvidenceState.PRESENT),
+            ]),
+        Category.STRUCTURAL: CategoryEvidence(category=Category.STRUCTURAL, elements=[
+            _element(f"{hunk_id}:structural:edit_region_structure",
+                     "edit_region_structure", EvidenceState.PRESENT),
+        ]),
+        Category.REFACTORING: CategoryEvidence(category=Category.REFACTORING, elements=[
+            _element(f"{hunk_id}:refactoring:rename", "refactoring_findings",
+                     EvidenceState.VERIFIED_ABSENT),
+        ]),
+        Category.COMPATIBILITY: CategoryEvidence(category=Category.COMPATIBILITY, elements=[
+            _element(f"{hunk_id}:compatibility:source_apis", "source_apis",
+                     EvidenceState.PRESENT),
+        ]),
+        Category.SURROUNDING: CategoryEvidence(category=Category.SURROUNDING, elements=[
+            _element(f"{hunk_id}:surrounding:enclosing_context", "enclosing_context",
+                     EvidenceState.PRESENT),
+        ]),
+        Category.VERIFICATION: CategoryEvidence(category=Category.VERIFICATION, elements=[
+            _element(f"{hunk_id}:verification:covering_tests", "covering_tests",
+                     EvidenceState.UNAVAILABLE),
+        ]),
+    }
+    return Hunk(
+        hunk_id=hunk_id,
+        transformation=TransformationUnit(fn_id=fn_id, edit_regions=[f"{hunk_id}:ER-1"]),
+        categories={c.value: ce for c, ce in categories.items()},
+        relationships=[Relationship(src=f"{hunk_id}:ER-1", rel="aligned_to",
+                                    dst=f"functions/{fn_id}")],
+        provenance=_prov("fixture"),
+    )
+
+
+def build_composite_pr(root: Path) -> Path:
+    """A composite SAP (section 13): fn-1 edited by H-1 (independent) and
+    fn-2 edited by H-2 and H-3 (shared target function, no explicit link —
+    the inferred-coupling shape real SALP output exhibits)."""
+    pr_dir = root / "linkedinKafka-apacheKafka" / "PR-9"
+    sap_id = "sap-Composite"
+
+    fns = {
+        "fn-1": (FunctionPayload(fn_id="fn-1", ext="java", has_source_before=True,
+                                 has_source_after=True, has_target=True),
+                 F_S, F_S_PRIME, F_T),
+        "fn-2": (FunctionPayload(fn_id="fn-2", ext="java", has_source_before=True,
+                                 has_source_after=True, has_target=True),
+                 F_S2, F_S2_PRIME, F_T2),
+    }
+    hunks = [_hunk("H-1", "fn-1"), _hunk("H-2", "fn-2"), _hunk("H-3", "fn-2")]
+
+    sap = SAP(
+        sap_id=sap_id, change_id="PR-9", schema_version="1.1",
+        source_file="src/main/java/kafka/Composite.java",
+        target_file="src/main/java/kafka/Composite.java",
+        functions={fid: f for fid, (f, *_) in fns.items()},
+        hunks=hunks, hunk_order=["H-1", "H-2", "H-3"],
+        provenance=_prov("fixture", repo="apache/kafka", commit="a" * 40),
+    )
+    for fn, before, after, target in fns.values():
+        sap.add_payload(fn.source_before_ref, before)
+        sap.add_payload(fn.source_after_ref, after)
+        sap.add_payload(fn.target_ref, target)
+    for h in hunks:
+        sap.add_payload(f"hunks/{h.hunk_id}/hunk.diff",
+                        "@@ -1,1 +1,1 @@\n-old\n+new\n")
+
+    characterizer = Characterizer()
+    profiles = {h.hunk_id: characterizer.characterize(
+        {Category(c): ce for c, ce in h.categories.items()}) for h in hunks}
+    write_sap(sap, pr_dir / sap_id, profiles=profiles)
+
+    group = PRGroup(
+        pr_id="PR-9", variant_pair="linkedinKafka-apacheKafka",
+        source_repo="apache/kafka", target_repo="linkedin/kafka",
+        saps=[SAPReference(sap_id=sap_id, gacpd_classification="MO",
+                           path=sap_id, hunk_count=3)],
+    )
+    write_pr_group(group, pr_dir)
+    return pr_dir
+
+
+@pytest.fixture(scope="session")
+def composite_pr_dir(tmp_path_factory) -> Path:
+    return build_composite_pr(tmp_path_factory.mktemp("sapout-composite"))
+
+
+@pytest.fixture(scope="session")
+def composite_sap_dir(composite_pr_dir: Path) -> Path:
+    return composite_pr_dir / "sap-Composite"
+
+
+@pytest.fixture(scope="session")
+def composite_pr_manifest(composite_pr_dir: Path) -> dict:
+    return json.loads((composite_pr_dir / "pr.json").read_text(encoding="utf-8"))
+
+
 @pytest.fixture(scope="session")
 def enriched_pr_dir(tmp_path_factory) -> Path:
     return build_fixture_pr(tmp_path_factory.mktemp("sapout-enriched"), enriched=True)

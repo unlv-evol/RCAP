@@ -5,7 +5,7 @@ import typing
 
 import pytest
 
-from rcap.context import CompositeCaseUnsupported, build_context
+from rcap.context import ContextValidityFailure, build_context
 from rcap.intake import load_case
 from rcap.materialize import materialize
 from rcap.reduction_program import reduce_program
@@ -22,17 +22,19 @@ def stages(sap_dir, pr_manifest):
     return case, red, mat, prog
 
 
-def test_multi_entity_case_is_refused_not_truncated(stages):
+def test_multi_entity_case_without_unit_is_refused_not_truncated(stages):
     """Audit bug 1: build_context used materialize[0], silently packaging only
-    the first entity of a composite case. It must refuse with a typed failure
-    until section-13 per-unit processing exists."""
+    the first entity of a composite case. Section-13 per-unit processing now
+    exists (the pipeline names each unit explicitly); a composite build
+    WITHOUT a named unit must still refuse, never truncate."""
     case, red, mat, prog = stages
     multi = red.model_copy(deep=True)
     multi.materialize = [*multi.materialize, "functions/fn-2"]
-    with pytest.raises(CompositeCaseUnsupported) as err:
+    with pytest.raises(ContextValidityFailure) as err:
         build_context(case, multi, mat, prog)
     assert err.value.stage == "context_construction"
     assert "fn-2" in err.value.diagnostics[0]
+    assert "explicit processing unit" in err.value.diagnostics[0]
 
 
 def test_single_entity_case_still_builds(stages):
@@ -47,8 +49,9 @@ def test_composite_refusal_becomes_typed_harness_row(sap_dir, pr_manifest, tmp_p
     from rcap import eval_harness, pipeline
     from rcap.generate import StubBackend
 
-    def refuse(case, reduction, materialized, program):
-        raise CompositeCaseUnsupported(case.case_id, list(reduction.materialize))
+    def refuse(case, reduction, materialized, program, **kwargs):
+        raise ContextValidityFailure(case.case_id,
+                                     ["composite case: explicit processing unit required"])
 
     monkeypatch.setattr(pipeline, "build_context", refuse)
     rows = eval_harness.run_configs(sap_dir, pr_manifest, StubBackend("x"),

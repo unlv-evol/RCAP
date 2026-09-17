@@ -188,6 +188,17 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
                         attributes={"reason": entry["reason"]} if entry.get("reason") else {},
                     )
 
+    # Section 13 cross-file relationships: explicit SALP-recorded semantic
+    # edges from the PR manifest. A dependency is followed only through such
+    # an edge; shared PR/commit/directory membership is never sufficient (I8)
+    # — that stays enforced by the admissible-relationship policy.
+    for edge in (pr_manifest or {}).get("cross_file_relationships") or []:
+        relationships.append(RelationshipEdge(
+            src=edge.get("from", ""), rel=edge.get("rel", ""), dst=edge.get("to", ""),
+            state=edge.get("state", "PRESENT"), evidence=edge.get("evidence"),
+            hunk_id="PR",
+        ))
+
     functions = _load_functions(sap_dir, manifest)
 
     if diagnostics and any("foundational" in d for d in diagnostics):

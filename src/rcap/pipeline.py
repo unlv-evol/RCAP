@@ -1,22 +1,45 @@
-"""End-to-end driver: one SAP directory -> one Adaptation Package (or a typed failure)."""
+"""End-to-end driver: one SAP directory -> one Adaptation Package (or a typed failure).
+
+Composite cases (RCAP ref section 13) run through the SAME pipeline with
+per-unit coordination: each processing unit gets its own context, request and
+generation (one at a time, with sibling-edit signatures attached), and the
+case still produces exactly ONE Adaptation Package aggregating the units.
+"""
 
 from __future__ import annotations
 
 from rcap.config import ExecutionConfig
 from rcap.context import AdaptationContext, build_context
-from rcap.generate import Backend, GenerationRecord, generate
+from rcap.coupling import CouplingRecord, detect_units
+from rcap.generate import Backend, generate
 from rcap.intake import load_case
 from rcap.materialize import materialize
 from rcap.package import AdaptationPackage, build_package
 from rcap.reduction_program import reduce_program
 from rcap.reduction_semantic import reduce_semantic
-from rcap.request import AdaptationRequest, synthesize
+from rcap.request import synthesize
 from rcap.selection import select
+
+
+class UnitResult:
+    """One processing unit's artifacts (section 13)."""
+
+    def __init__(self, unit, context, request, generation):
+        self.unit = unit
+        self.context = context
+        self.request = request
+        self.generation = generation
 
 
 class CaseResult:
     def __init__(self, **stages):
         self.__dict__.update(stages)
+
+
+def _expected_placeholders(context: AdaptationContext) -> set[str]:
+    return {f"/* RCAP_PH_{p.ph_id} */"
+            for a in context.program_context if a.role == "target"
+            for p in a.placeholders}
 
 
 def run_case(
@@ -34,8 +57,26 @@ def run_case(
         materialized = materialize(case, reduction)
         program = reduce_program(case, reduction, materialized, config,
                                  enabled=program_on, evidence_protection=semantic_on)
-        context: AdaptationContext = build_context(case, reduction, materialized, program)
-        request: AdaptationRequest = synthesize(context)
+
+        coupling: CouplingRecord = detect_units(case)
+        units = [u for u in coupling.units if u.entity in reduction.materialize]
+        unit_results: list[UnitResult] = []
+        if len(units) <= 1:
+            # Single-unit case: the plain path (unit=None keeps the context
+            # and request byte-identical to a non-composite build).
+            context = build_context(case, reduction, materialized, program)
+            unit_results.append(UnitResult(units[0] if units else None,
+                                           context, None, None))
+        else:
+            # Section 13 per-unit processing, in application order, each with
+            # the signatures of its siblings. Units are never joined.
+            for unit in units:
+                context = build_context(
+                    case, reduction, materialized, program, unit=unit,
+                    siblings=tuple(s for s in units if s is not unit))
+                unit_results.append(UnitResult(unit, context, None, None))
+        for ur in unit_results:
+            ur.request = synthesize(ur.context)
     except Exception as exc:
         # Section 14: a typed failure record keeps the stable case identity and
         # the evidence dispositions established before the failure.
@@ -48,14 +89,20 @@ def run_case(
                     counts[d.value] = counts.get(d.value, 0) + 1
                 exc.dispositions = counts
         raise
-    expected = {f"/* RCAP_PH_{p.ph_id} */"
-                for a in context.program_context if a.role == "target"
-                for p in a.placeholders}
-    generation: GenerationRecord = generate(request, backend,
-                                            expected_placeholders=expected)
+
+    for ur in unit_results:
+        ur.generation = generate(ur.request, backend,
+                                 expected_placeholders=_expected_placeholders(ur.context))
+
     package: AdaptationPackage | None = None
-    if generation.outcome == "completion":
-        package = build_package(case, context, generation)
+    if all(ur.generation.outcome == "completion" for ur in unit_results):
+        package = build_package(case, unit_results[0].context,
+                                unit_results[0].generation,
+                                units=unit_results, coupling=coupling)
+
+    primary = unit_results[0]
     return CaseResult(case=case, selection=selection, reduction=reduction,
-                      materialized=materialized, program=program, context=context,
-                      request=request, generation=generation, package=package)
+                      materialized=materialized, program=program,
+                      coupling=coupling, units=unit_results,
+                      context=primary.context, request=primary.request,
+                      generation=primary.generation, package=package)
