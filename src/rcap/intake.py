@@ -133,6 +133,7 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
     evidence: dict[str, EvidenceRecord] = {}
     relationships: list[RelationshipEdge] = []
     transformations: list[Transformation] = []
+    category_confidence: dict[str, float] = {}
 
     for hunk_id in manifest.get("hunks", []):
         hdir = sap_dir / "hunks" / hunk_id
@@ -176,6 +177,10 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
                     if (base / ref).is_file():
                         doc = _read_json(base / ref)
                         break
+            if doc and isinstance(doc.get("confidence"), (int, float)):
+                # Section 9(7): index confidence is metadata for ranking,
+                # never a retention gate.
+                category_confidence[f"{hunk_id}:{cat}"] = float(doc["confidence"])
             if doc and doc.get("elements"):
                 _collect_elements(doc, hunk_id, evidence)
             else:
@@ -228,6 +233,7 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
         evidence=evidence,
         relationships=relationships,
         characterization=characterization,
+        category_confidence=category_confidence,
         repo_state={"bindings": bindings,
                     "reconciliation": reconciliation,
                     "provenance": provenance.get("repository_pin")},

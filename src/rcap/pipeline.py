@@ -37,8 +37,12 @@ class CaseResult:
 
 
 def _expected_placeholders(context: AdaptationContext) -> set[str]:
+    # Only the unit's OWN target placeholders bind the candidate; a helper
+    # artifact's placeholders are supporting context, never expected output.
+    entity = context.target_localization.get("function")
     return {f"/* RCAP_PH_{p.ph_id} */"
-            for a in context.program_context if a.role == "target"
+            for a in context.program_context
+            if a.role == "target" and a.entity == entity
             for p in a.placeholders}
 
 
@@ -60,11 +64,16 @@ def run_case(
 
         coupling: CouplingRecord = detect_units(case)
         units = [u for u in coupling.units if u.entity in reduction.materialize]
+        # Section 9(5): retained entities beyond every unit's tau are helpers —
+        # supporting program context, not transformations of their own.
+        helpers = tuple(e for e in reduction.materialize
+                        if e not in {u.entity for u in units})
         unit_results: list[UnitResult] = []
         if len(units) <= 1:
             # Single-unit case: the plain path (unit=None keeps the context
             # and request byte-identical to a non-composite build).
-            context = build_context(case, reduction, materialized, program)
+            context = build_context(case, reduction, materialized, program,
+                                    helpers=helpers)
             unit_results.append(UnitResult(units[0] if units else None,
                                            context, None, None))
         else:
@@ -73,7 +82,8 @@ def run_case(
             for unit in units:
                 context = build_context(
                     case, reduction, materialized, program, unit=unit,
-                    siblings=tuple(s for s in units if s is not unit))
+                    siblings=tuple(s for s in units if s is not unit),
+                    helpers=helpers)
                 unit_results.append(UnitResult(unit, context, None, None))
         for ur in unit_results:
             ur.request = synthesize(ur.context)

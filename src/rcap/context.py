@@ -94,7 +94,14 @@ class AdaptationContext(BaseModel):
     siblings: list[SiblingSignature] = Field(default_factory=list)
     transformation: dict[str, str]              # role -> reduced text
     edit_regions: list[str]
-    target_localization: dict[str, str | None]  # file, function
+    # Section 9(2): file, region, containing function, match kind, and — when
+    # SALP recorded multiple plausible correspondences — the alternatives and
+    # their ambiguity, never silently collapsed.
+    target_localization: dict[str, object]
+    # Section 9(7): per-category index confidence and the localization
+    # alignment confidence/similarity — metadata for candidate ranking, never
+    # a retention gate; a low-confidence localization is surfaced, not hidden.
+    confidence: dict[str, object] = Field(default_factory=dict)
     relationships: list[ContextRelationship] = Field(default_factory=list)
     constraints: list[ContextConstraint] = Field(default_factory=list)
     program_context: list[ReducedArtifact] = Field(default_factory=list)
@@ -104,6 +111,131 @@ class AdaptationContext(BaseModel):
     reduction_mode: dict[str, str] = Field(default_factory=dict)
 
 
+def _tail(object_id: str) -> str:
+    return object_id.rsplit(":", 1)[-1]
+
+
+def _retained_by_tail(case: CaseModel, retained: set[str], *tails: str):
+    for oid in sorted(retained):
+        rec = case.evidence.get(oid)
+        if rec is not None and _tail(oid) in tails:
+            yield rec
+
+
+def _localization(case: CaseModel, retained: set[str], entity: str) -> dict[str, object]:
+    """Section 9(2): target file, region, containing function, match kind, and
+    alternatives with their ambiguity preserved."""
+    loc: dict[str, object] = {"file": case.target_file, "function": entity,
+                              "region": None, "match_kind": None,
+                              "alternatives": [], "ambiguous": False}
+    for rec in _retained_by_tail(case, retained,
+                                 "localized_target_function", "target_function"):
+        a = rec.attributes
+        loc["match_kind"] = loc["match_kind"] or a.get("match_kind")
+        loc["region"] = loc["region"] or a.get("region") or a.get("method")
+    for rec in _retained_by_tail(case, retained, "alternative_candidates"):
+        if rec.state == "PRESENT":
+            candidates = rec.attributes.get("candidates") or []
+            loc["alternatives"] = list(candidates)
+            loc["ambiguous"] = bool(candidates)
+    return loc
+
+
+def _localization_confidence(case: CaseModel, retained: set[str]) -> dict[str, object]:
+    for rec in _retained_by_tail(case, retained, "alignment_confidence"):
+        if rec.state == "PRESENT":
+            return {k: v for k, v in rec.attributes.items()
+                    if k in ("confidence", "similarity")}
+    return {}
+
+
+def _derive_correspondence(case: CaseModel, retained: set[str]) -> Correspondence:
+    """Section 9(9): type the correspondence from SAP alignment evidence.
+    Insufficient evidence yields one_to_one with an uncertain flag — never a
+    guess, and RCAP never invents correspondences for a non-one-to-one case."""
+    functions = list(_retained_by_tail(case, retained,
+                                       "localized_target_function", "target_function"))
+    alternatives = [rec for rec in _retained_by_tail(case, retained,
+                                                     "alternative_candidates")
+                    if rec.state == "PRESENT" and rec.attributes.get("candidates")]
+    if alternatives:
+        n = sum(len(rec.attributes["candidates"]) for rec in alternatives)
+        return Correspondence(uncertain=True, reason=(
+            f"{n} alternative target correspondences recorded by SALP; "
+            "not typed beyond one_to_one without stronger alignment evidence"))
+    kinds = {rec.attributes.get("match_kind") for rec in functions} - {None}
+    if len(functions) == 1 and kinds <= {"exact", "signature"} and kinds:
+        return Correspondence(type="one_to_one", uncertain=False,
+                              reason=f"single localized target function, "
+                                     f"match_kind={next(iter(kinds))}")
+    return Correspondence(uncertain=True, reason=(
+        "SAP alignment evidence insufficient to type the correspondence; "
+        "defaulting to one_to_one rather than guessing"))
+
+
+def _artifact_of(dep: str) -> str:
+    parts = dep.split(":")
+    return parts[1] if len(parts) >= 2 else parts[0]
+
+
+def _touches(dep: str, tau_text: str) -> bool:
+    """Does a dependency's artifact name appear in the edit's program text?"""
+    return _artifact_of(dep).lower() in tau_text.lower()
+
+
+def _dependency_constraints(case: CaseModel, retained: set[str],
+                            tau_text: str) -> list[ContextConstraint]:
+    """Section 9(6): dependency constraints from the DIFF, never the raw
+    lists. A SALP-emitted diff element is consumed directly; otherwise the
+    diff is computed locally from the two lists, and the constraint records
+    that RCAP did so. Only entries touching APIs the edit region uses enter
+    the context; the raw lists stay referenced by evidence id only."""
+    out: list[ContextConstraint] = []
+
+    for rec in _retained_by_tail(case, retained, "dependency_diff", "api_diff"):
+        if rec.state != "PRESENT":
+            continue
+        a = rec.attributes
+        for kind in ("added", "removed", "version_changed"):
+            for dep in a.get(kind) or []:
+                if _touches(str(dep), tau_text):
+                    out.append(ContextConstraint(
+                        id=f"constraint:{rec.object_id}:{dep}",
+                        kind="dependency_constraint",
+                        detail=f"{kind}: {dep}", evidence_ref=rec.object_id))
+        return out  # the SALP diff is authoritative when present
+
+    lists: dict[str, tuple[str, list[str]]] = {}
+    for side, tail in (("source", "source_dependencies"),
+                       ("target", "target_dependencies")):
+        for rec in _retained_by_tail(case, retained, tail):
+            if rec.state == "PRESENT":
+                lists[side] = (rec.object_id,
+                               [str(d) for d in rec.attributes.get("dependencies") or []])
+    if "source" not in lists or "target" not in lists:
+        return out
+
+    def by_key(deps: list[str]) -> dict[str, str]:
+        return {dep.rsplit(":", 1)[0]: dep for dep in deps}
+
+    src_ref, src = lists["source"]
+    tgt_ref, tgt = lists["target"]
+    src_map, tgt_map = by_key(src), by_key(tgt)
+    note = "diff computed locally by RCAP from the SAP dependency lists"
+    entries = (
+        [("removed_in_target", src_map[k], src_ref) for k in src_map.keys() - tgt_map.keys()]
+        + [("added_in_target", tgt_map[k], tgt_ref) for k in tgt_map.keys() - src_map.keys()]
+        + [("version_changed", f"{src_map[k]} -> {tgt_map[k]}", tgt_ref)
+           for k in src_map.keys() & tgt_map.keys() if src_map[k] != tgt_map[k]]
+    )
+    for kind, dep, ref in entries:
+        if _touches(dep, tau_text):
+            out.append(ContextConstraint(
+                id=f"constraint:{ref}:{dep}", kind="dependency_constraint",
+                detail=f"{kind}: {dep} ({note})", evidence_ref=ref))
+    return out
+
+
 def build_context(
     case: CaseModel,
     reduction: SemanticReductionManifest,
@@ -111,19 +243,21 @@ def build_context(
     program: ProgramReductionRecord,
     unit: Unit | None = None,
     siblings: tuple[Unit, ...] = (),
+    helpers: tuple[str, ...] = (),
 ) -> AdaptationContext:
     """Build the context for one processing unit (section 13: per-unit
     processing). A composite case must name its unit explicitly — building
     from only the first entity would silently misrepresent the case as fully
     covered, so that remains a typed failure, never a truncation."""
     if unit is None:
-        if len(reduction.materialize) > 1:
+        tau_entities = [e for e in reduction.materialize if e not in helpers]
+        if len(tau_entities) > 1:
             raise ContextValidityFailure(case.case_id, [
-                (f"composite case: {len(reduction.materialize)} materialized entities "
-                 f"({', '.join(reduction.materialize)}); an explicit processing unit "
+                (f"composite case: {len(tau_entities)} materialized entities "
+                 f"({', '.join(tau_entities)}); an explicit processing unit "
                  f"is required (section 13) — refusing rather than truncating "
                  f"to the first entity")])
-        entity = reduction.materialize[0] if reduction.materialize else None
+        entity = tau_entities[0] if tau_entities else None
     else:
         entity = unit.entity
         if entity not in reduction.materialize:
@@ -158,6 +292,11 @@ def build_context(
                 id=f"constraint:{oid}", kind=str(a.get("kind", "refactoring")),
                 detail=f"{a.get('from', '?')} -> {a.get('to', '?')}", evidence_ref=oid))
 
+    # Section 9(6): dependency constraints from the diff, filtered to APIs the
+    # edit's program text actually uses.
+    tau_text = "\n".join(arts[r].reduced_text for r in arts)
+    constraints.extend(_dependency_constraints(case, retained, tau_text))
+
     # Validity: every retained relationship endpoint and constraint traceable to the SAP.
     problems = [f"constraint {c.id} evidence {c.evidence_ref} is not retained"
                 for c in constraints if c.evidence_ref not in retained]
@@ -188,19 +327,25 @@ def build_context(
     unit_edit_regions = (unit.edit_regions if unit is not None
                          else [er for t in case.transformations for er in t.edit_regions])
 
+    # Section 9(5): retained helper entities beyond tau — their reduced
+    # target-side representation (what exists in the fork), recovery maps kept.
+    helper_arts = [a for h in helpers for a in program.artifacts
+                   if a.entity == h and a.role == "target"]
+
     return AdaptationContext(
         case_id=case.case_id,
         unit=unit.model_dump() if unit is not None else {},
         siblings=sibling_sigs,
         transformation={role: arts[role].reduced_text for role in arts},
         edit_regions=unit_edit_regions,
-        target_localization={"file": case.target_file,
-                             "function": entity},
+        target_localization=_localization(case, retained, entity),
+        confidence={"category": dict(case.category_confidence),
+                    "localization": _localization_confidence(case, retained)},
         relationships=relationships,
         constraints=constraints,
-        program_context=[arts[r] for r in ("source.before", "source.after", "target")],
-        correspondence=Correspondence(
-            uncertain=True, reason="fidelity flags not serialized by current SALP output"),
+        program_context=[arts[r] for r in ("source.before", "source.after", "target")]
+                        + helper_arts,
+        correspondence=_derive_correspondence(case, retained),
         dispositions=dispositions,
         metadata_refs={"sap": case.sap_id,
                        "characterization": f"{case.sap_id}/characterization.json"},

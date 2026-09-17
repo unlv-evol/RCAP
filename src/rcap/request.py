@@ -69,9 +69,25 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
             "## Other functions edited by this same change (signatures only)\n"
             "This change also edits the functions below; keep any shared names\n"
             "and signatures consistent with these edits.\n" + "\n".join(lines))
+    helper_arts = [a for a in context.program_context
+                   if a.role == "target"
+                   and a.entity != context.target_localization.get("function")]
+    if helper_arts:
+        # Section 9(5): retained helper context (reduced, recovery maps kept in
+        # the context) — supporting material, not something to adapt.
+        blocks = [f"### {a.entity} (do not modify)\n```java\n{a.reduced_text}```"
+                  for a in helper_arts]
+        sections.append("## Related fork context (reduced helpers)\n"
+                        + "\n\n".join(blocks))
     if context.target_localization.get("file"):
-        sections.append("## Target location\n"
-                        f"File: {context.target_localization['file']}")
+        lines = [f"File: {context.target_localization['file']}"]
+        alternatives = context.target_localization.get("alternatives") or []
+        if alternatives:
+            # Section 9(2): ambiguity stays visible, never silently collapsed.
+            lines.append(f"NOTE: localization is ambiguous — "
+                         f"{len(alternatives)} plausible target functions were "
+                         f"recorded; the one above is the primary candidate.")
+        sections.append("## Target location\n" + "\n".join(lines))
     sections.append("## Output\nOne ```java block containing the full adapted "
                     "target function. Nothing else.")
 

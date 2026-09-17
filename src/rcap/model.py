@@ -101,6 +101,9 @@ class CaseModel(BaseModel):
     evidence: dict[str, EvidenceRecord]
     relationships: list[RelationshipEdge]
     characterization: dict[str, object] = Field(default_factory=dict)  # metadata, never a gate (I10)
+    # Section 9(7): per-category index confidence ("<hunk>:<category>" -> score),
+    # carried for candidate ranking; never a retention gate.
+    category_confidence: dict[str, float] = Field(default_factory=dict)
     repo_state: dict[str, object] = Field(default_factory=dict)
     diagnostics: list[str] = Field(default_factory=list)
 
