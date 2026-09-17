@@ -20,6 +20,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from rcap.intake import repo_pin
 from rcap.model import CaseModel
 from rcap.reduction_semantic import SemanticReductionManifest
 
@@ -57,6 +58,9 @@ class MaterializedPayload(BaseModel):
     ref: str             # SAP-relative path
     content: str
     sha256: str
+    # The case binding this payload was resolved under (section 7(2), I2);
+    # None when the case records no binding for the role's repository.
+    repository_pin: dict[str, object] | None = None
     fidelity_flags_available: bool = False
 
 
@@ -76,6 +80,32 @@ def materialize(case: CaseModel, reduction: SemanticReductionManifest) -> Materi
         "fidelity flags not present in SAP output; payloads treated as clean function bodies"
     )
     errors: list[str] = []
+
+    # Section 7(2): payloads resolve against the case's pinned repository
+    # states (I2). Materialization is independently invocable, so the pin
+    # check is re-run here rather than assumed from intake: every
+    # evidence-level pin must agree with the case binding for its repository —
+    # a disagreement is a materialization error, never a silent substitution.
+    bindings = case.repo_state.get("bindings")
+    bindings = bindings if isinstance(bindings, dict) else {}
+    for rec in case.evidence.values():
+        pin = repo_pin(rec.provenance)
+        if pin is None:
+            continue
+        bound = bindings.get(pin["repo"])
+        if isinstance(bound, dict) and bound.get("commit") \
+                and pin["commit"] != bound["commit"]:
+            errors.append(
+                f"{rec.object_id}: repository-state pin {pin['repo']}@{pin['commit']} "
+                f"disagrees with case binding {bound['commit']}")
+    if not bindings:
+        record.diagnostics.append(
+            "no repository-state bindings recorded for the case; payload pins unverified")
+
+    def role_binding(role: str) -> dict[str, object] | None:
+        repo = case.source_repo if role.startswith("source") else case.target_repo
+        bound = bindings.get(repo)
+        return {"repo": repo, **bound} if repo and isinstance(bound, dict) else None
 
     for entity in reduction.materialize:
         fn_id = entity.split("/", 1)[1]
@@ -104,6 +134,7 @@ def materialize(case: CaseModel, reduction: SemanticReductionManifest) -> Materi
             record.payloads.append(MaterializedPayload(
                 entity=entity, role=role, ref=ref, content=content,
                 sha256=hashlib.sha256(content.encode()).hexdigest(),
+                repository_pin=role_binding(role),
             ))
 
     if errors:
