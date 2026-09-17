@@ -41,6 +41,7 @@ def run_case(
         # the evidence dispositions established before the failure.
         if getattr(exc, "stage", None) is not None:
             exc.case_id = case.case_id
+            exc.characterization = case.characterization_scores()
             if reduction is not None:
                 counts: dict[str, int] = {}
                 for d in reduction.dispositions.values():

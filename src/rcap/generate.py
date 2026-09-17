@@ -47,6 +47,10 @@ class GenerationRecord(BaseModel):
     candidate: str | None = None
     diagnostics: list[str] = Field(default_factory=list)
     generation_config: dict[str, object] = Field(default_factory=dict)  # theta
+    # Backend-reported token counts (section 15: Request/Input and Output
+    # Tokens, measured separately). Recorded only when the runtime reports
+    # them — never estimated. Empty for backends without a tokenizer.
+    usage: dict[str, int] = Field(default_factory=dict)
     request_hash: str
     exec_id: str
 
@@ -66,16 +70,21 @@ def generate(request: AdaptationRequest, backend: Backend,
     exec_id = hashlib.sha256(
         f"{backend.name}:{backend.model}:{request.request_hash}".encode()).hexdigest()[:16]
 
+    usage: dict[str, int] = {}
+
     def record(outcome: str, candidate: str | None = None, *, diag: list[str] | None = None):
         return GenerationRecord(
             case_id=request.case_id, outcome=outcome, candidate=candidate,
-            diagnostics=diag or [], generation_config=theta,
+            diagnostics=diag or [], generation_config=theta, usage=dict(usage),
             request_hash=request.request_hash, exec_id=exec_id)
 
     try:
         raw = backend.generate(request)
     except Exception as exc:  # noqa: BLE001 - any backend crash is a generation failure state
         return record("backend_error", diag=[str(exc)])
+    reported = getattr(backend, "last_usage", None)
+    if reported:
+        usage.update({k: v for k, v in reported.items() if isinstance(v, int)})
 
     if not raw or not raw.strip():
         return record("no_output")

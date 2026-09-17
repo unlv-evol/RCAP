@@ -28,6 +28,7 @@ class EvalRow(BaseModel):
 
     case_id: str
     config_id: str
+    ref_config_id: str = ""                          # the Raw Context config percentages reference
     mode: str                                        # the harness configuration
     reduction_mode: dict[str, str] = Field(default_factory=dict)  # per hunk
     dispositions: dict[str, int] = Field(default_factory=dict)    # never collapsed
@@ -36,6 +37,17 @@ class EvalRow(BaseModel):
     placeholders: int = 0
     context_chars: int = 0
     prompt_chars: int = 0
+    # Backend-reported token counts, recorded only when the runtime reports
+    # them (section 15: "measured separately"); never estimated. The context
+    # itself is backend-independent and has no honest token count without a
+    # tokenizer, so context size stays in characters (context_chars).
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    # SAP characterization, explanatory metadata only (I10): min-over-hunks
+    # Coverage/Fidelity scores and the aggregate Readiness level.
+    coverage: float | None = None
+    fidelity: float | None = None
+    readiness: str | None = None
     request_hash: str | None = None
     outcome: str = ""                                # completion | failure:<stage> | gen state
     runtime_ms: int = 0
@@ -49,6 +61,7 @@ def run_configs(
     artifacts_dir: Path | None = None,
 ) -> list[EvalRow]:
     base = base_config or ExecutionConfig()
+    ref_config_id = f"{base.config_id}:{EvaluationMode.RAW.value}"
     rows = []
     for mode in modes:
         config = base.model_copy(update={"mode": mode,
@@ -56,9 +69,11 @@ def run_configs(
         t0 = time.time()
         try:
             result = run_case(sap_dir, pr_manifest, backend, config)
+            scores = result.case.characterization_scores()
             row = EvalRow(
                 case_id=result.case.case_id,
                 config_id=config.config_id,
+                ref_config_id=ref_config_id,
                 mode=mode.value,
                 reduction_mode={h: m.value for h, m in result.reduction.mode.items()},
                 dispositions=_disposition_counts(result.reduction),
@@ -67,6 +82,11 @@ def run_configs(
                 placeholders=sum(len(a.placeholders) for a in result.program.artifacts),
                 context_chars=len(result.context.model_dump_json()),
                 prompt_chars=len(result.request.prompt),
+                input_tokens=result.generation.usage.get("input_tokens"),
+                output_tokens=result.generation.usage.get("output_tokens"),
+                coverage=scores["coverage"],
+                fidelity=scores["fidelity"],
+                readiness=scores["readiness"],
                 request_hash=result.request.request_hash,
                 outcome=result.generation.outcome,
             )
@@ -86,9 +106,14 @@ def run_configs(
             # established before the failure (section 14 / section 20).
             sap = Path(sap_dir)
             case_id = getattr(exc, "case_id", None) or f"{sap.parent.name}/{sap.name}"
+            scores = getattr(exc, "characterization", None) or {}
             row = EvalRow(case_id=case_id, config_id=config.config_id,
+                          ref_config_id=ref_config_id,
                           mode=mode.value, outcome=f"failure:{stage}",
-                          dispositions=getattr(exc, "dispositions", {}))
+                          dispositions=getattr(exc, "dispositions", {}),
+                          coverage=scores.get("coverage"),
+                          fidelity=scores.get("fidelity"),
+                          readiness=scores.get("readiness"))
         row.runtime_ms = int((time.time() - t0) * 1000)
         rows.append(row)
 

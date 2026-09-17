@@ -104,6 +104,27 @@ class CaseModel(BaseModel):
     repo_state: dict[str, object] = Field(default_factory=dict)
     diagnostics: list[str] = Field(default_factory=list)
 
+    def characterization_scores(self) -> dict[str, object]:
+        """Section-15 explanatory metadata: min-over-hunks Coverage/Fidelity
+        scores (SALP's own aggregation rule) plus the aggregate Readiness
+        level. Explanatory only, never a gate (I10); every field is None when
+        the SAP carries no characterization."""
+        out: dict[str, object] = {"coverage": None, "fidelity": None, "readiness": None}
+        agg = self.characterization.get("aggregate")
+        if isinstance(agg, dict):
+            out["readiness"] = agg.get("readiness")
+        hunks = self.characterization.get("hunks")
+        if isinstance(hunks, dict):
+            cov = [h.get("coverage_score") for h in hunks.values() if isinstance(h, dict)]
+            fid = [h.get("fidelity_score") for h in hunks.values() if isinstance(h, dict)]
+            cov = [c for c in cov if isinstance(c, (int, float))]
+            fid = [f for f in fid if isinstance(f, (int, float))]
+            if cov:
+                out["coverage"] = min(cov)
+            if fid:
+                out["fidelity"] = min(fid)
+        return out
+
     def resolve_endpoint(self, raw: str) -> Endpoint | None:
         """Resolve an edge endpoint to one of exactly three kinds, or None.
 

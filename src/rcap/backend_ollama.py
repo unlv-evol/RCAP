@@ -50,10 +50,20 @@ class OllamaBackend:
             return None
 
     def generate(self, request: AdaptationRequest) -> str:
+        self.last_usage: dict[str, int] | None = None
         data = self._api("/api/chat", {
             "model": self.model,
             "messages": [{"role": "user", "content": request.prompt}],
             "stream": False,
             "options": self.params,
         })
+        # Runtime-reported token counts (section 15). prompt_eval_count is
+        # what the runtime actually evaluated — a warm prompt-prefix cache can
+        # make it lower than the full prompt length; recorded as reported.
+        usage = {}
+        if isinstance(data.get("prompt_eval_count"), int):
+            usage["input_tokens"] = data["prompt_eval_count"]
+        if isinstance(data.get("eval_count"), int):
+            usage["output_tokens"] = data["eval_count"]
+        self.last_usage = usage or None
         return data.get("message", {}).get("content", "")
