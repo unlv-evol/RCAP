@@ -8,6 +8,7 @@ state. Completion is not correctness (I11); correctness is SVRP's.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import re
 from typing import Protocol
@@ -52,7 +53,11 @@ class GenerationRecord(BaseModel):
     # them — never estimated. Empty for backends without a tokenizer.
     usage: dict[str, int] = Field(default_factory=dict)
     request_hash: str
+    # exec_id is the deterministic (backend, model, request) anchor; the
+    # timestamp (section 11: "a timestamp may be added") makes repeated runs —
+    # separate executions by definition — distinguishable in stored artifacts.
     exec_id: str
+    executed_at: str = ""
 
 
 def generate(request: AdaptationRequest, backend: Backend,
@@ -79,7 +84,9 @@ def generate(request: AdaptationRequest, backend: Backend,
         return GenerationRecord(
             case_id=request.case_id, outcome=outcome, candidate=candidate,
             diagnostics=diag or [], generation_config=theta, usage=dict(usage),
-            request_hash=request.request_hash, exec_id=exec_id)
+            request_hash=request.request_hash, exec_id=exec_id,
+            executed_at=datetime.datetime.now(datetime.UTC)
+            .isoformat(timespec="seconds"))
 
     # Section 11: "request or context exceeding backend limits" is a distinct
     # outcome, refused BEFORE invocation against the backend's own declared

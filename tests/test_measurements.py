@@ -119,6 +119,22 @@ def test_aggregate_excludes_failure_rows_from_size_metrics():
     assert agg["full_rcap"]["outcomes"] == {"failure:materialization": 1}
 
 
+def test_package_characterization_carries_scores_and_timestamp(sap_dir, pr_manifest):
+    """Section 12: the package's characterization holds coverage, fidelity and
+    readiness; section 11: the execution record carries a timestamp alongside
+    the deterministic exec_id."""
+    from rcap.pipeline import run_case
+
+    result = run_case(sap_dir, pr_manifest,
+                      StubBackend("```java\nvoid v() { /* RCAP_PH_target.1 */ }\n```"))
+    pkg = result.package
+    assert pkg is not None
+    for key in ("coverage", "fidelity", "readiness"):
+        assert key in pkg.characterization
+    assert pkg.generation_meta["executed_at"].startswith("20")
+    assert result.generation.executed_at == pkg.generation_meta["executed_at"]
+
+
 def test_rows_roundtrip_through_jsonl(sap_dir, pr_manifest, tmp_path):
     out = tmp_path / "rows.jsonl"
     rows = run_configs(sap_dir, pr_manifest, UsageBackend(CANDIDATE), out_path=out)

@@ -87,7 +87,8 @@ def _unit_entries(units) -> list[UnitEntry]:
             context_ref=hashlib.sha256(ctx.model_dump_json().encode()).hexdigest(),
             request_ref={"template_id": "rcap-request-v1", "template_version": "1",
                          "request_hash": gen.request_hash},
-            generation_meta={**gen.generation_config, "exec_id": gen.exec_id},
+            generation_meta={**gen.generation_config, "exec_id": gen.exec_id,
+                             "executed_at": gen.executed_at},
         ))
     return entries
 
@@ -122,11 +123,17 @@ def build_package(
         recovery_map=target_art.placeholders,
         context_ref=context_ref,
         sap_ref=case.sap_id,
-        characterization=dict(context_aggregate(case)),
+        # Section 12: coverage/fidelity/readiness as metadata (I10) — the
+        # min-over-hunks scores alongside SALP's aggregate record.
+        characterization={**context_aggregate(case),
+                          **{k: v for k, v in case.characterization_scores().items()
+                             if v is not None}},
         correspondence=context.correspondence.model_dump(),
         request_ref={"template_id": "rcap-request-v1", "template_version": "1",
                      "request_hash": generation.request_hash},
-        generation_meta={**generation.generation_config, "exec_id": generation.exec_id},
+        generation_meta={**generation.generation_config,
+                         "exec_id": generation.exec_id,
+                         "executed_at": generation.executed_at},
         provenance={
             "repo_state": case.repo_state,
             "source_repo": case.source_repo,
