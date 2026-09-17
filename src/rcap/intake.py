@@ -240,6 +240,19 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
         diagnostics=diagnostics,
     )
 
+    # Section 4: a signature string is not a valid endpoint; it is normalized
+    # to the object id of the structural element representing that method.
+    for edge in case.relationships:
+        for attr in ("src", "dst"):
+            raw = getattr(edge, attr)
+            if case.resolve_endpoint(raw) is not None or not _looks_like_signature(raw):
+                continue
+            normalized = _structural_element_for(case, raw)
+            if normalized is not None:
+                setattr(edge, attr, normalized)
+                case.diagnostics.append(
+                    f"{edge.hunk_id}: signature endpoint {raw!r} normalized to {normalized}")
+
     # Endpoint resolution: an endpoint that resolves to nothing is a recorded
     # diagnostic, never a silently dropped edge (RCAP ref section 6).
     for edge in case.relationships:
@@ -249,6 +262,21 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
                     f"{edge.hunk_id}: edge endpoint {raw!r} ({edge.rel}) resolves to nothing"
                 )
     return case
+
+
+def _looks_like_signature(raw: str) -> bool:
+    return "(" in raw
+
+
+def _structural_element_for(case: CaseModel, signature: str) -> str | None:
+    """The object id of the structural/localization element whose method
+    attribute matches the signature, or None (leaving the unresolved-endpoint
+    diagnostic to record the gap)."""
+    for rec in case.evidence.values():
+        for key in ("method", "signature"):
+            if rec.attributes.get(key) == signature:
+                return rec.object_id
+    return None
 
 
 def _fn_id_of(transformation: dict) -> str | None:

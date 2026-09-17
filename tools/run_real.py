@@ -52,6 +52,8 @@ def main() -> None:
 
         case_out = OUT / sap
         case_out.mkdir(parents=True, exist_ok=True)
+        # Compact JSON: sha256(context.json) == the package's context_ref.
+        (case_out / "context.json").write_text(ctx.model_dump_json())
         (case_out / "request.txt").write_text(req.prompt)
         (case_out / "generation.json").write_text(gen.model_dump_json(indent=1))
         if gen.outcome == "completion":

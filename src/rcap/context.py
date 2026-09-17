@@ -74,6 +74,7 @@ class ContextRelationship(BaseModel):
     type: str
     src: str
     dst: str
+    provenance_ref: str | None = None  # resolvable SAP reference (section 9 schema)
 
 
 class ContextConstraint(BaseModel):
@@ -278,7 +279,9 @@ def build_context(
     retained = reduction.retained_ids()
     relationships = [
         ContextRelationship(
-            id=f"{e.src}-{e.rel}->{e.dst}", type=e.rel, src=e.src, dst=e.dst)
+            id=f"{e.src}-{e.rel}->{e.dst}", type=e.rel, src=e.src, dst=e.dst,
+            provenance_ref=("pr.json#cross_file_relationships" if e.hunk_id == "PR"
+                            else f"hunks/{e.hunk_id}/hunk.json#relationships"))
         for e in reduction.retained_edges
     ]
 

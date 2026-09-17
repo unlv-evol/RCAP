@@ -107,6 +107,12 @@ def run_configs(
                 mode_dir.mkdir(parents=True, exist_ok=True)
                 for i, ur in enumerate(result.units):
                     suffix = "" if len(result.units) == 1 else f"-unit{i + 1}"
+                    # The exact context is persisted next to the package —
+                    # compact form, so sha256(file) == the package's
+                    # context_ref and the run is reconstructable from its
+                    # outputs alone (section 2).
+                    (mode_dir / f"context{suffix}.json").write_text(
+                        ur.context.model_dump_json(), encoding="utf-8")
                     (mode_dir / f"request{suffix}.txt").write_text(
                         ur.request.prompt, encoding="utf-8")
                     if ur.generation.outcome == "completion":
