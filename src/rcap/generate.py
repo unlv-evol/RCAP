@@ -43,7 +43,7 @@ class StubBackend:
 
 class GenerationRecord(BaseModel):
     case_id: str
-    outcome: str  # completion | no_output | unparseable | placeholder_violation | backend_error
+    outcome: str  # completion | no_output | unparseable | placeholder_violation | limits_exceeded | backend_error
     candidate: str | None = None
     diagnostics: list[str] = Field(default_factory=list)
     generation_config: dict[str, object] = Field(default_factory=dict)  # theta
@@ -67,6 +67,9 @@ def generate(request: AdaptationRequest, backend: Backend,
     digest = getattr(backend, "model_digest", None)
     if digest:
         theta["version"] = digest
+    limit_chars = getattr(backend, "request_limit_chars", None)
+    if limit_chars:
+        theta["request_limit_chars"] = limit_chars
     exec_id = hashlib.sha256(
         f"{backend.name}:{backend.model}:{request.request_hash}".encode()).hexdigest()[:16]
 
@@ -78,6 +81,15 @@ def generate(request: AdaptationRequest, backend: Backend,
             diagnostics=diag or [], generation_config=theta, usage=dict(usage),
             request_hash=request.request_hash, exec_id=exec_id)
 
+    # Section 11: "request or context exceeding backend limits" is a distinct
+    # outcome, refused BEFORE invocation against the backend's own declared
+    # acceptance limit — an oversized request silently truncated by the runtime
+    # is a garbage completion, not a measurement.
+    if limit_chars and len(request.prompt) > limit_chars:
+        return record("limits_exceeded", diag=[
+            (f"request is {len(request.prompt)} chars; backend declares an "
+             f"acceptance limit of {limit_chars} chars")])
+
     try:
         raw = backend.generate(request)
     except Exception as exc:  # noqa: BLE001 - any backend crash is a generation failure state
@@ -85,6 +97,16 @@ def generate(request: AdaptationRequest, backend: Backend,
     reported = getattr(backend, "last_usage", None)
     if reported:
         usage.update({k: v for k, v in reported.items() if isinstance(v, int)})
+
+    # Post-hoc runtime evidence of the same limit: a reported input-token
+    # count at (or past) the declared context window means the runtime
+    # saturated — ollama truncates the prompt silently in that case.
+    num_ctx = params.get("num_ctx") if isinstance(params, dict) else None
+    if num_ctx and usage.get("input_tokens", 0) >= num_ctx:
+        return record("limits_exceeded", diag=[
+            (f"runtime evaluated {usage['input_tokens']} prompt tokens, "
+             f"saturating the declared context window ({num_ctx}); "
+             "the input was truncated by the runtime")])
 
     if not raw or not raw.strip():
         return record("no_output")
