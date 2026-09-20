@@ -68,3 +68,13 @@ setting takes for granted — the population taxonomy is itself a result.
   `placeholder_violation` — the model dropped a required placeholder and the
   candidate was refused packaging rather than silently accepted; PPatHF's
   pipeline reinserts placeholders without an equivalent check.
+
+---
+
+**Update 2026-09-20**: we also ran the reverse comparison — our zero-shot
+backend on THEIR full 310-case Vim→Neovim dataset, scored with THEIR metric
+code. Headline: 39.4% exact (vs their fine-tuned 42.3%, vs their best
+non-fine-tuned baseline 30.6%), and their own reduction module HURTS
+zero-shot accuracy (30.3%) at 16K context. Full write-up with caveats
+(possible training-data leakage, quantization, model size):
+`docs/ppathf-replication.md`.
