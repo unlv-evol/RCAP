@@ -51,7 +51,7 @@ matrices below. PR 17374 has no verdict at all ("no_verdict" row).
 | stage | PRs | note |
 |---|---|---|
 | paper sample | 393 | |
-| GACPD minting attempted | 366 new + 27 pre-existing | `make_gacpd.py`, rc=0 for **all 366** (`mint_log.tsv`) |
+| GACPD minting attempted | 363 new + 30 pre-existing | `make_gacpd.py`, rc=0 for **all 366** mint-log rows (`mint_log.tsv`; 3 rows were re-mints of pre-existing PRs) |
 | PRs with ≥1 modified `.java` file | 342 | 51 PRs modify no `.java` file (config/tests/other languages) — recorded exclusion |
 | PRs SALP minted SAPs for | **291** | further 51 PRs had `.java` changes but every changed file is absent from linkedin/kafka at the cutoff (GACPD class NA) or otherwise unprocessable — recorded exclusion |
 | SAPs minted | 698 dirs (SALP reports 699 minted — one same-named SAP in PR-17049 was minted twice and overwrote itself, see validate note) | all **readiness=HIGH**, no `foundational_unavailable` |
@@ -77,7 +77,7 @@ Per SAP (698):
 | placeholder_violation | 86 | 12.3% |
 | limits_exceeded (typed refusal before invocation: prompt exceeds backend ctx; mean prompt 154k chars vs 14k for completions) | 40 | 5.7% |
 | unparseable | 10 | 1.4% |
-| backend_error (all 6 are 600–990s timeouts) | 6 | 0.9% |
+| backend_error (all 6 are 600–993s timeouts) | 6 | 0.9% |
 | failure:intake (the defective PR-17049 SAP) | 1 | 0.1% |
 
 148/698 SAPs (21.2%) are composite (multi-unit); 97/148 completed on **all**
@@ -122,8 +122,10 @@ materialization + 16 placeholder_violation + 7 limits + 2 backend_error +
   the previously hand-verified 7-line callback port — plus one test-file SAP
   backend timeout).
 - *RePatch-conflict-free but RCAP failed/refused* (27): **PR 13887 — the
-  single genuine RePatch win in the whole 477-scenario study (CONFLICT_FREE +
-  VALID) — is a null-τ materialization failure for RCAP.** Also PR 12893,
+  single genuine RePatch-beats-git win in the whole 477-scenario study
+  (CONFLICT_FREE + VALID where git itself conflicted; three other
+  CONFLICT_FREE+VALID cases exist but git also applied those cleanly) — is a
+  null-τ materialization failure for RCAP.** Also PR 12893,
   12915, 14281 (null-τ), PR 12468, 12584 (placeholder_violation), PR 15517
   (limits_exceeded — whole-file τ larger than the 16k context).
 - *No verdict on either RePatch side*: PR 17374 (SKIPPED_NO_SCENARIO,
@@ -170,7 +172,7 @@ completion is a *candidate*, not a validated adaptation.
 ## Runtime / tokens
 
 - RCAP sweep wall time: ~13.4 h (sum of per-SAP runtimes 48,380 s; single
-  GPU, sequential). Minting: ~50 min for 366 PRs. SALP run+validate: ~35 min.
+  GPU, sequential). Minting: ~18 min for 366 PRs. SALP run+validate: ~13 min.
 - Backend tokens (backend-reported, never estimated): **1,710,527 input**,
   **845,877 output** across the 698-SAP sweep.
 - Mean completion runtime 75.3 s/SAP; the 6 backend_errors are 600 s-class
@@ -215,3 +217,19 @@ completion is a *candidate*, not a validated adaptation.
 - `results.jsonl` — 698 per-SAP records (outcome, units, tokens, runtime,
   readiness).
 - `compare.py`, `comparison.json` — aggregation and the matrices above.
+
+---
+
+**Update 2026-09-21 — independent verification.** An adversarial authenticity
+audit (`verification-audit/repatch-authenticity.md`) recomputed every number
+in this document from the raw artifacts: the funnel, the full SAP/PR outcome
+taxonomies, both alignment matrices cell-for-cell, the 4/74 VALID claim, and
+the token/runtime totals all reproduce exactly; for 15 stratified spot-check
+rows the deterministic pre-LLM stages were re-executed and reproduced every
+failure outcome, with rebuilt prompts matching recorded sizes byte-exactly.
+Verdict: authentic; the small errata it found (mint-funnel split, two
+timing claims, timeout range, PR 13887 phrasing) are applied above. One
+caveat stands: this sweep persisted outcome/token rows only — candidate
+files and generation records were not written to disk, so the 357 candidates
+cannot be inspected post hoc. A re-run with artifact persistence (planned
+together with SVRP validation) closes that.
