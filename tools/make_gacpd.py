@@ -35,6 +35,10 @@ from pathlib import Path
 
 HUNK_HEADER = re.compile(r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@.*$")
 
+# Extensions SALP can parse: src/salp/structural/grammars.py registers Java
+# (.java) and Scala (.scala/.sc) and nothing else.
+PARSEABLE_EXT = frozenset({"java", "scala", "sc"})
+
 
 def git(clone: Path, *args: str) -> str:
     result = subprocess.run(
@@ -74,9 +78,11 @@ def only(hunk: list[str], kind: str, *, prefix_stripped: bool = True) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def similarity_block(n: int) -> list[dict]:
+def similarity_block(n: int, ext: str) -> list[dict]:
+    # checkName must name the artifact that actually exists: SALP anchors its
+    # hunk pattern on `hunk_<n>_<mode>.<ext>`.
     return [
-        {"checkName": f"hunk_{n}_{mode}.java", "similarityPercent": 0, "tokenSize": ts}
+        {"checkName": f"hunk_{n}_{mode}.{ext}", "similarityPercent": 0, "tokenSize": ts}
         for ts in (50, 40) for mode in ("additions", "deletions")
     ]
 
@@ -91,6 +97,13 @@ def main() -> None:
     ap.add_argument("--cutoff", required=True)
     ap.add_argument("--divergence", required=True)
     ap.add_argument("--max-files", type=int, default=4)
+    ap.add_argument("--base", default=None,
+                    help="explicit base commit for the PR diff. Without it the "
+                         "base is merge-base(head, HEAD), which COLLAPSES TO HEAD "
+                         "itself when the PR head is already an ancestor of the "
+                         "mainline (a merged PR), yielding an empty diff and a "
+                         "silently empty SAP. Callers that know the base should "
+                         "pass it.")
     args = ap.parse_args()
 
     src_clone = args.cache / (args.mainline.replace("/", "__") + ".git")
@@ -103,7 +116,11 @@ def main() -> None:
     if not git_ok(src_clone, "rev-parse", "--verify", pr_ref):
         git(src_clone, "fetch", "origin", f"+{pr_ref}:{pr_ref}")
     head = git(src_clone, "rev-parse", pr_ref).strip()
-    base = git(src_clone, "merge-base", head, "HEAD").strip()
+    base = (args.base or git(src_clone, "merge-base", head, "HEAD")).strip()
+    if base == head:
+        raise SystemExit(
+            f"base == head ({head[:12]}): the PR head is an ancestor of the "
+            "mainline, so merge-base gives an empty diff. Pass --base explicitly.")
     target_commit = git(tgt_clone, "rev-list", "-1", f"--before={args.cutoff}",
                         "HEAD").strip()
     print(f"PR head {head[:12]}  base {base[:12]}  target@cutoff {target_commit[:12]}")
@@ -112,8 +129,18 @@ def main() -> None:
         line.split("\t", 1) for line in
         git(src_clone, "diff", "--name-status", base, head).splitlines()
     ]
-    java_modified = [p for s, p in changed if s == "M" and p.endswith(".java")]
-    print(f"{len(java_modified)} modified .java files in the PR")
+    # SALP ships tree-sitter Java and Scala grammars (and only those), so those
+    # are the extensions worth emitting. Filtering to .java alone silently drops
+    # every Scala change, which is exactly how the first No-SAP handover came to
+    # under-report the population.
+    modified = [p for s, p in changed
+                if s == "M" and p.rsplit(".", 1)[-1].lower() in PARSEABLE_EXT]
+    by_ext = {}
+    for p_ in modified:
+        e = p_.rsplit(".", 1)[-1].lower()
+        by_ext[e] = by_ext.get(e, 0) + 1
+    print(f"{len(modified)} modified parseable files in the PR "
+          f"({', '.join(f'{v} .{k}' for k, v in sorted(by_ext.items())) or 'none'})")
 
     pair = f"{args.mainline.replace('/', '_')}-{args.divergent.replace('/', '_')}"
     pr_dir = args.out / pair / f"{args.pr}_MO"
@@ -129,7 +156,7 @@ def main() -> None:
     }, indent=1), encoding="utf-8")
 
     minted = 0
-    for path in java_modified:
+    for path in modified:
         in_target = git_ok(tgt_clone, "cat-file", "-e", f"{target_commit}:{path}")
         classification = "MO" if in_target else "NA"
         if classification == "MO" and minted >= args.max_files:
@@ -137,6 +164,7 @@ def main() -> None:
         flattened = path.replace("/", "_").replace(".", "_")
         fdir = pr_dir / classification / flattened
         name = Path(path).name
+        ext = path.rsplit(".", 1)[-1].lower()
 
         patch = git(src_clone, "diff", base, head, "--", path)
         hunks = split_hunks(patch)
@@ -153,7 +181,7 @@ def main() -> None:
             "mainline": args.mainline,
             "pr": args.pr,
             "similarityChecks": [c for i in range(len(hunks))
-                                 for c in similarity_block(i + 1)],
+                                 for c in similarity_block(i + 1, ext)],
             "generatedBy": "rcap tools/make_gacpd.py; similarity values are placeholders",
         }, indent=1), encoding="utf-8")
 
@@ -168,11 +196,11 @@ def main() -> None:
         src = fdir / "src"
         src.mkdir(exist_ok=True)
         for i, hunk in enumerate(hunks, 1):
-            (src / f"hunk_{i}_full_del.java").write_text(side(hunk, "-"), encoding="utf-8")
-            (src / f"hunk_{i}_full_add.java").write_text(side(hunk, "+"), encoding="utf-8")
-            (src / f"hunk_{i}_context.java").write_text(only(hunk, " "), encoding="utf-8")
-            (src / f"hunk_{i}_additions.java").write_text(only(hunk, "+"), encoding="utf-8")
-            (src / f"hunk_{i}_deletions.java").write_text(only(hunk, "-"), encoding="utf-8")
+            (src / f"hunk_{i}_full_del.{ext}").write_text(side(hunk, "-"), encoding="utf-8")
+            (src / f"hunk_{i}_full_add.{ext}").write_text(side(hunk, "+"), encoding="utf-8")
+            (src / f"hunk_{i}_context.{ext}").write_text(only(hunk, " "), encoding="utf-8")
+            (src / f"hunk_{i}_additions.{ext}").write_text(only(hunk, "+"), encoding="utf-8")
+            (src / f"hunk_{i}_deletions.{ext}").write_text(only(hunk, "-"), encoding="utf-8")
 
         if classification == "MO":
             minted += 1
