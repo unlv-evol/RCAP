@@ -131,7 +131,15 @@ def generate(request: AdaptationRequest, backend: Backend,
     if num_ctx and in_tok:
         pinned = in_tok == num_ctx // 2 + 2
         ratio = len(request.prompt) / in_tok
-        if pinned or ratio > CHARS_PER_TOKEN_IMPLAUSIBLE or in_tok >= num_ctx:
+        # The ratio test needs a precondition: truncation is only possible if the
+        # prompt filled the window, and it pins the reported count at
+        # num_ctx // 2 + 2, so a count far below that cannot be a truncation
+        # however unusual its ratio. Without this, ordinary short Java prompts
+        # (6.0-6.8 chars/token at ~650-1,560 tokens in a 16,384 window) were
+        # labelled truncated -- 10 of 96 limits_exceeded rows in the 477 run.
+        could_be_truncated = in_tok >= num_ctx * 0.4
+        if pinned or in_tok >= num_ctx or (
+                could_be_truncated and ratio > CHARS_PER_TOKEN_IMPLAUSIBLE):
             return record("limits_exceeded", diag=[
                 (f"runtime evaluated {in_tok} prompt tokens for a "
                  f"{len(request.prompt)}-char prompt ({ratio:.2f} chars/token, "

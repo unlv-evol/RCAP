@@ -89,10 +89,12 @@ def test_truncation_pinned_token_count_is_detected(sap_dir, pr_manifest):
 
 
 def test_implausible_chars_per_token_is_detected(sap_dir, pr_manifest):
-    """A pinned count at some other value still shows up as a chars/token ratio
-    no real code reaches."""
+    """A pinned count at some OTHER value still shows up as a chars/token ratio no
+    real code reaches -- provided the count is near the window, since truncation
+    is impossible far below it (see the precondition test below)."""
     req = _request(sap_dir, pr_manifest)
-    backend = _ctx_backend(16384, max(1, len(req.prompt) // 12))  # ~12 chars/token
+    num_ctx = max(4, len(req.prompt) // 12)      # ~12 chars/token fills this window
+    backend = _ctx_backend(num_ctx, num_ctx - 1)
     gen = generate(req, backend)
     assert gen.outcome == "limits_exceeded"
 
@@ -143,3 +145,29 @@ def test_ollama_backend_declares_default_limit():
     assert admissible_chars(16384, "scala") > admissible_chars(16384, "c")
     assert OllamaBackend(url="http://127.0.0.1:9",
                          request_limit_chars=99).request_limit_chars == 99
+
+
+def test_short_prompt_is_never_flagged_as_truncated(sap_dir, pr_manifest):
+    """Truncation is structurally impossible well below the window.
+
+    The runtime pins a truncated prompt's reported count at num_ctx // 2 + 2, so
+    a count far under that cannot be a truncation no matter how unusual its
+    chars-per-token ratio. Without this precondition, ordinary short Java prompts
+    at 6.0-6.8 chars/token were labelled truncated: 10 of 96 limits_exceeded rows
+    in the full 477 run were this false positive.
+    """
+    req = _request(sap_dir, pr_manifest)
+    num_ctx = 16384
+    in_tok = max(1, len(req.prompt) // 7)       # ~7 chars/token, past the ratio bound
+    assert in_tok < num_ctx * 0.4, "fixture must sit well below the window"
+    gen = generate(req, _ctx_backend(num_ctx, in_tok))
+    assert gen.outcome == "completion"
+
+
+def test_high_ratio_near_the_window_is_still_flagged(sap_dir, pr_manifest):
+    """The precondition must not disable the check where it does apply."""
+    req = _request(sap_dir, pr_manifest)
+    num_ctx = 200
+    in_tok = int(num_ctx * 0.6)                 # near the window, implausible ratio
+    gen = generate(req, _ctx_backend(num_ctx, in_tok))
+    assert gen.outcome == "limits_exceeded"
