@@ -63,10 +63,15 @@ def run_case(
                                  enabled=program_on, evidence_protection=semantic_on)
 
         coupling: CouplingRecord = detect_units(case)
-        units = [u for u in coupling.units if u.entity in reduction.materialize]
+        # Entities whose tau carries no change are excluded here rather than
+        # failing the case: materialize() records them and only refuses when
+        # every entity is vacuous. They are not helpers either — a helper is
+        # supporting context, whereas these have nothing to contribute at all.
+        adaptable = materialized.adaptable(reduction.materialize)
+        units = [u for u in coupling.units if u.entity in adaptable]
         # Section 9(5): retained entities beyond every unit's tau are helpers —
         # supporting program context, not transformations of their own.
-        helpers = tuple(e for e in reduction.materialize
+        helpers = tuple(e for e in adaptable
                         if e not in {u.entity for u in units})
         unit_results: list[UnitResult] = []
         if len(units) <= 1:

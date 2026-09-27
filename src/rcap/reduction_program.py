@@ -118,7 +118,19 @@ def _lines_naming(text: str, names: set[str]) -> set[int]:
 
 
 def _count_nodes(node) -> int:
-    return 1 + sum(_count_nodes(c) for c in node.children)
+    """Node count of a subtree, iteratively.
+
+    Recursion here overflowed the stack on real inputs: Kafka's KafkaConfig
+    nests deeply enough that a recursive walk raises RecursionError, which
+    crashed the case instead of producing a measurement (4 SAPs in the 477 run).
+    An explicit stack has no depth limit.
+    """
+    total, stack = 0, [node]
+    while stack:
+        n = stack.pop()
+        total += 1
+        stack.extend(n.children)
+    return total
 
 
 def _normalize(s: str) -> str:
@@ -196,9 +208,10 @@ def reduce_program(
     Program-Reduction-Only config) protects only the changed regions, mirroring
     PPatHF, so the semantic contribution to the protected set is isolable."""
     config = config or ExecutionConfig()
-    grammar = grammar_for("java")
+    grammar = grammar_for(case.language)
     if grammar is None:
-        raise ContextConstructionFailure(case.case_id, ["tree-sitter-java is not installed"])
+        raise ContextConstructionFailure(
+            case.case_id, [f"no tree-sitter grammar available for {case.language}"])
 
     record = ProgramReductionRecord(case_id=case.case_id)
     names = _evidence_identifiers(case, reduction) if evidence_protection else set()

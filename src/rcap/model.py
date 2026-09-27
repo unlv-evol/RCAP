@@ -107,6 +107,22 @@ class CaseModel(BaseModel):
     repo_state: dict[str, object] = Field(default_factory=dict)
     diagnostics: list[str] = Field(default_factory=list)
 
+    @property
+    def language(self) -> str:
+        """The source language, as the file extension the SAP itself declares.
+
+        SALP ships Java and Scala grammars and mints SAPs for both, so the
+        language is a property of the case, not of the pipeline. It is read from
+        `source_file` (falling back to `target_file`) rather than configured,
+        because those are the paths the SAP records. "java" is the fallback only
+        when neither path carries an extension, which keeps pre-existing
+        single-language behaviour byte-identical.
+        """
+        for path in (self.source_file, self.target_file):
+            if path and "." in path.rsplit("/", 1)[-1]:
+                return path.rsplit(".", 1)[-1].lower()
+        return "java"
+
     def characterization_scores(self) -> dict[str, object]:
         """Section-15 explanatory metadata: min-over-hunks Coverage/Fidelity
         scores (SALP's own aggregation rule) plus the aggregate Readiness

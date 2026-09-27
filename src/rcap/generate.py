@@ -16,9 +16,11 @@ from typing import Protocol
 from pydantic import BaseModel, Field
 from salp.structural import grammar_for, parse
 
+from rcap.backend_ollama import CHARS_PER_TOKEN_IMPLAUSIBLE, admissible_chars
+
 from rcap.request import AdaptationRequest
 
-_CODE_BLOCK = re.compile(r"```(?:java)?\s*\n(.*?)```", re.DOTALL)
+_CODE_BLOCK = re.compile(r"```[A-Za-z0-9_+-]*\s*\n(.*?)```", re.DOTALL)
 _PH = re.compile(r"/\* RCAP_PH_[^*]+\*/")
 
 
@@ -72,7 +74,13 @@ def generate(request: AdaptationRequest, backend: Backend,
     digest = getattr(backend, "model_digest", None)
     if digest:
         theta["version"] = digest
+    # The backend's own limit is language-agnostic. When it declares a context
+    # window, the bound is recomputed for the request's language, which is both
+    # tighter for dense-token languages and safer for sparse ones.
     limit_chars = getattr(backend, "request_limit_chars", None)
+    _num_ctx = params.get("num_ctx") if isinstance(params, dict) else None
+    if _num_ctx and getattr(backend, "request_limit_chars_is_explicit", False) is False:
+        limit_chars = admissible_chars(_num_ctx, getattr(request, "language", None))
     if limit_chars:
         theta["request_limit_chars"] = limit_chars
     exec_id = hashlib.sha256(
@@ -105,15 +113,31 @@ def generate(request: AdaptationRequest, backend: Backend,
     if reported:
         usage.update({k: v for k, v in reported.items() if isinstance(v, int)})
 
-    # Post-hoc runtime evidence of the same limit: a reported input-token
-    # count at (or past) the declared context window means the runtime
-    # saturated — ollama truncates the prompt silently in that case.
+    # Post-hoc runtime evidence of the same limit. The obvious test --
+    # input_tokens >= num_ctx -- CANNOT EVER FIRE: when the runtime truncates it
+    # does not report a saturated count, it reports a pinned one at
+    # num_ctx // 2 + 2, which is far below the window. Two signals that do work:
+    #
+    #   1. the mechanical signature: a count sitting exactly on that pinned
+    #      value;
+    #   2. a chars-per-token ratio too high to be real code in any language we
+    #      handle (C peaks at 3.4, Scala/Java at 4.9), which catches a pinned
+    #      count at some other value.
+    #
+    # The ratio alone is not enough and must stay language-independent: a 4.5
+    # threshold calibrated on C flags ordinary Scala prompts as truncated.
     num_ctx = params.get("num_ctx") if isinstance(params, dict) else None
-    if num_ctx and usage.get("input_tokens", 0) >= num_ctx:
-        return record("limits_exceeded", diag=[
-            (f"runtime evaluated {usage['input_tokens']} prompt tokens, "
-             f"saturating the declared context window ({num_ctx}); "
-             "the input was truncated by the runtime")])
+    in_tok = usage.get("input_tokens", 0)
+    if num_ctx and in_tok:
+        pinned = in_tok == num_ctx // 2 + 2
+        ratio = len(request.prompt) / in_tok
+        if pinned or ratio > CHARS_PER_TOKEN_IMPLAUSIBLE or in_tok >= num_ctx:
+            return record("limits_exceeded", diag=[
+                (f"runtime evaluated {in_tok} prompt tokens for a "
+                 f"{len(request.prompt)}-char prompt ({ratio:.2f} chars/token, "
+                 f"window {num_ctx}"
+                 + (", pinned at the truncation value" if pinned else "")
+                 + "); the input was truncated by the runtime")])
 
     if not raw or not raw.strip():
         return record("no_output")
@@ -123,12 +147,20 @@ def generate(request: AdaptationRequest, backend: Backend,
 
     # τ may be a bare method (probe-wrap it in a class) or, for class-level
     # changes, a whole type/compilation unit (parse it bare). Accept either.
-    grammar = grammar_for("java")
+    # The grammar is the request's language, not an assumed one: Java's grammar
+    # rejects every well-formed Scala function, which would report a language
+    # mismatch as a model failure.
+    lang = request.language or "java"
+    grammar = grammar_for(lang)
+    if grammar is None:
+        return record("unparseable",
+                      diag=[f"no tree-sitter grammar available for {lang}"])
     def parses(text: str) -> bool:
         tree = parse(text, grammar)
         return tree is not None and not tree.root_node.has_error
     if not (parses("class __RcapProbe {\n" + candidate + "\n}") or parses(candidate)):
-        diag = "candidate parses neither as a Java method nor as a compilation unit"
+        diag = (f"candidate parses neither as a {lang} method nor as a "
+                "compilation unit")
         return record("unparseable", diag=[diag])
 
     if expected_placeholders is not None:

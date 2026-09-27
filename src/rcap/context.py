@@ -93,6 +93,9 @@ class Correspondence(BaseModel):
 
 class AdaptationContext(BaseModel):
     case_id: str
+    # The case's source language, so prompt fences and every parse downstream
+    # use the grammar the SAP declares rather than an assumed one.
+    language: str = "java"
     # Section 13: the processing unit this context covers (entity, ordered
     # hunks, coupling basis/note) and the sibling units' signatures. Empty
     # unit info means a plain single-unit case.
@@ -256,7 +259,10 @@ def build_context(
     from only the first entity would silently misrepresent the case as fully
     covered, so that remains a typed failure, never a truncation."""
     if unit is None:
-        tau_entities = [e for e in reduction.materialize if e not in helpers]
+        # Vacuous entities are not part of tau: counting them would make a
+        # single-real-unit case look composite and refuse it.
+        tau_entities = [e for e in materialized.adaptable(reduction.materialize)
+                        if e not in helpers]
         if len(tau_entities) > 1:
             raise ContextValidityFailure(case.case_id, [
                 (f"composite case: {len(tau_entities)} materialized entities "
@@ -269,6 +275,10 @@ def build_context(
         if entity not in reduction.materialize:
             raise ContextValidityFailure(case.case_id, [
                 f"unit entity {entity} is not among the materialized entities"])
+        if entity in materialized.null_entities:
+            raise ContextValidityFailure(case.case_id, [
+                f"unit entity {entity} carries no change (null transformation); "
+                "it must not be built into a request"])
     if entity is None:
         raise ContextValidityFailure(case.case_id, ["no program entity to adapt"])
     arts = {a.role: a for a in program.artifacts if a.entity == entity}
@@ -354,6 +364,7 @@ def build_context(
                    if a.entity == h and a.role == "target"]
 
     return AdaptationContext(
+        language=case.language,
         case_id=case.case_id,
         unit=unit.model_dump() if unit is not None else {},
         siblings=sibling_sigs,

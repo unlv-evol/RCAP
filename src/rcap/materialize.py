@@ -28,21 +28,32 @@ _ROLES = ("source.before", "source.after", "target")
 
 
 class NullTransformationFailure(Exception):
-    """tau carries no change: source.before == source.after (RCAP ref section 14).
+    """Every tau in the case carries no change: source.before == source.after
+    (RCAP ref section 14).
 
     A vacuous transformation gives the backend an empty diff to "apply" —
     observed to produce hallucinated edits — so it is a typed evidence failure
     at materialization, never a silent completion. Root cause today is
     upstream: SALP anchoring the edit region on a context line and slicing an
     untouched neighbor function.
+
+    Raised only when NO entity in the case has a real change. A composite case
+    where some entities are vacuous and others are not records the vacuous ones
+    as a per-unit disposition (`MaterializationRecord.null_entities`) and
+    proceeds with the rest: section 13 processes units independently, so
+    refusing the whole case for one inert neighbour discarded adaptable
+    functions — measured at 13 of 22 entities across 7 refused SAPs, only one of
+    which was wholly vacuous.
     """
 
-    def __init__(self, case_id: str, entity: str):
+    def __init__(self, case_id: str, entities: list[str] | str):
         self.stage = "materialization"
+        ents = [entities] if isinstance(entities, str) else list(entities)
         self.diagnostics = [
-            f"{entity}: null transformation (source.before == source.after); no change to adapt"
-        ]
-        super().__init__(f"null transformation for {case_id} ({entity})")
+            f"{e}: null transformation (source.before == source.after); "
+            "no change to adapt" for e in ents
+        ] or ["null transformation; no change to adapt"]
+        super().__init__(f"null transformation for {case_id} ({', '.join(ents)})")
 
 
 class MaterializationFailure(Exception):
@@ -68,9 +79,17 @@ class MaterializationRecord(BaseModel):
     case_id: str
     payloads: list[MaterializedPayload] = Field(default_factory=list)
     diagnostics: list[str] = Field(default_factory=list)
+    # Entities whose tau carries no change. Excluded from processing but kept,
+    # so a partially vacuous composite is reported as such rather than silently
+    # narrowed.
+    null_entities: list[str] = Field(default_factory=list)
 
     def by_role(self, entity: str) -> dict[str, MaterializedPayload]:
         return {p.role: p for p in self.payloads if p.entity == entity}
+
+    def adaptable(self, entities) -> list[str]:
+        """The given entities minus the vacuous ones, order preserved."""
+        return [e for e in entities if e not in set(self.null_entities)]
 
 
 def materialize(case: CaseModel, reduction: SemanticReductionManifest) -> MaterializationRecord:
@@ -145,5 +164,13 @@ def materialize(case: CaseModel, reduction: SemanticReductionManifest) -> Materi
         before = roles.get("source.before")
         after = roles.get("source.after")
         if before and after and before.content == after.content:
-            raise NullTransformationFailure(case.case_id, entity)
+            record.null_entities.append(entity)
+    if record.null_entities:
+        if not record.adaptable(reduction.materialize):
+            # nothing in the case has a change: the refusal is the whole case
+            raise NullTransformationFailure(case.case_id, record.null_entities)
+        record.diagnostics.append(
+            f"{len(record.null_entities)} of {len(reduction.materialize)} entities "
+            f"carry no change and are excluded: {', '.join(record.null_entities)}"
+        )
     return record

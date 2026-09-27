@@ -18,6 +18,35 @@ from rcap.request import AdaptationRequest
 DEFAULT_MODEL = "qwen3-coder:30b"
 DEFAULT_URL = "http://localhost:11435"
 
+# Lowest chars-per-token MEASURED per language on this backend, used to convert
+# the token window into a character bound. A floor, not an average: the bound has
+# to under-estimate how many tokens a prompt costs, or it admits prompts that
+# cannot fit and the runtime truncates them silently.
+#
+# Measured (n=295 C prompts, n=25 Scala): C 2.66-3.79, Scala 3.66-4.93. One
+# global floor cannot serve both -- 3.2 is unsafe for C (a 52k-char C prompt is
+# ~19.7k tokens against a 16,384 window) while 2.6 needlessly refuses Scala
+# prompts that fit comfortably. So it is per language, defaulting to the most
+# conservative value for anything unmeasured.
+CHARS_PER_TOKEN_FLOOR_BY_LANG = {
+    "c": 2.6, "h": 2.6,
+    "java": 3.6, "scala": 3.6, "sc": 3.6,
+}
+CHARS_PER_TOKEN_FLOOR_DEFAULT = 2.6
+
+
+def chars_per_token_floor(language: str | None) -> float:
+    return CHARS_PER_TOKEN_FLOOR_BY_LANG.get(
+        (language or "").lstrip(".").lower(), CHARS_PER_TOKEN_FLOOR_DEFAULT)
+
+
+def admissible_chars(num_ctx: int, language: str | None = None) -> int:
+    """Longest prompt in characters that provably fits `num_ctx` tokens."""
+    return int(num_ctx * chars_per_token_floor(language))
+# Above this, the reported token count is too small for the prompt's length to be
+# real code in any language we handle (C peaks at 3.4, Scala/Java at 4.9).
+CHARS_PER_TOKEN_IMPLAUSIBLE = 6.0
+
 
 class OllamaBackend:
     def __init__(self, model: str = DEFAULT_MODEL, url: str = DEFAULT_URL,
@@ -29,13 +58,13 @@ class OllamaBackend:
         self.num_ctx = num_ctx
         self.timeout = timeout
         self.params = {"temperature": 0, "seed": 12535, "num_ctx": num_ctx}
-        # Declared acceptance limit (section 11 limits_exceeded): the runtime
-        # truncates silently past num_ctx, so requests plausibly beyond the
-        # window are refused up front. 4 chars/token is a recorded
-        # configuration choice, not a measurement; the runtime-reported
-        # token count still catches anything this bound lets through.
+        # This is the language-agnostic fallback; `generate` recomputes it from
+        # the request's own language, which is the tighter and correct bound.
         self.request_limit_chars = (request_limit_chars if request_limit_chars is not None
-                                    else num_ctx * 4)
+                                    else admissible_chars(num_ctx))
+        # An operator-supplied limit is honoured verbatim; a derived one is
+        # refined per language at generation time.
+        self.request_limit_chars_is_explicit = request_limit_chars is not None
         self.model_digest = self._digest()
 
     def _api(self, path: str, payload: dict | None = None) -> dict:

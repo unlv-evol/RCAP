@@ -28,13 +28,16 @@ INSTRUCTIONS = (
     "respecting every constraint. Placeholder comments of the form\n"
     "/* RCAP_PH_... */ stand for elided code: keep each one exactly where it\n"
     "is, character for character, and do not invent code for it.\n"
-    "Return ONLY the complete adapted target function in one ```java code\n"
+    "Return ONLY the complete adapted target function in one ```{lang} code\n"
     "block, with no commentary."
 )
 
 
 class AdaptationRequest(BaseModel):
     case_id: str
+    # Recorded so the response is parsed with the grammar the request was
+    # written in, instead of a language assumed at the call site.
+    language: str = "java"
     template_id: str = TEMPLATE_ID
     template_version: str = TEMPLATE_VERSION
     prompt: str
@@ -42,13 +45,16 @@ class AdaptationRequest(BaseModel):
 
 
 def synthesize(context: AdaptationContext) -> AdaptationRequest:
+    # Every fence is labelled with the case's own language: a Scala function
+    # fenced as ```java misdescribes the input and invites a Java-shaped answer.
+    lang = context.language or "java"
     sections = [
-        "## Task\n" + INSTRUCTIONS,
-        "## Source function BEFORE the change\n```java\n"
+        "## Task\n" + INSTRUCTIONS.format(lang=lang),
+        f"## Source function BEFORE the change\n```{lang}\n"
         + context.transformation["source.before"] + "```",
-        "## Source function AFTER the change\n```java\n"
+        f"## Source function AFTER the change\n```{lang}\n"
         + context.transformation["source.after"] + "```",
-        "## Target function in the fork (adapt this)\n```java\n"
+        f"## Target function in the fork (adapt this)\n```{lang}\n"
         + context.transformation["target"] + "```",
     ]
     if context.constraints:
@@ -75,7 +81,7 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
     if helper_arts:
         # Section 9(5): retained helper context (reduced, recovery maps kept in
         # the context) — supporting material, not something to adapt.
-        blocks = [f"### {a.entity} (do not modify)\n```java\n{a.reduced_text}```"
+        blocks = [f"### {a.entity} (do not modify)\n```{lang}\n{a.reduced_text}```"
                   for a in helper_arts]
         sections.append("## Related fork context (reduced helpers)\n"
                         + "\n\n".join(blocks))
@@ -88,13 +94,13 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
                          f"{len(alternatives)} plausible target functions were "
                          f"recorded; the one above is the primary candidate.")
         sections.append("## Target location\n" + "\n".join(lines))
-    sections.append("## Output\nOne ```java block containing the full adapted "
+    sections.append(f"## Output\nOne ```{lang} block containing the full adapted "
                     "target function. Nothing else.")
 
     prompt = "\n\n".join(sections) + "\n"
     request_hash = hashlib.sha256(
         f"{TEMPLATE_ID}:{TEMPLATE_VERSION}\n{prompt}".encode()).hexdigest()
-    return AdaptationRequest(case_id=context.case_id, prompt=prompt,
+    return AdaptationRequest(case_id=context.case_id, language=lang, prompt=prompt,
                              request_hash=request_hash)
 
 

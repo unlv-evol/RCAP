@@ -123,3 +123,22 @@ def test_evidence_identifier_lines_protected(enriched_pr_dir, enriched_sap_dir):
         art = rec.artifact("functions/fn-1", role)
         assert "setup(v);" in art.reduced_text
         assert all("setup(v)" not in p.original_text for p in art.placeholders)
+
+
+def test_count_nodes_survives_deep_nesting():
+    """A deeply nested AST must not overflow the stack.
+
+    Recursive counting raised RecursionError on Kafka's KafkaConfig, crashing
+    the case rather than producing a measurement.
+    """
+    from salp.structural import grammar_for
+    from salp.structural.syntax import parse
+
+    from rcap.reduction_program import _count_nodes
+
+    grammar = grammar_for("java")
+    # nesting far past the default recursion limit
+    expr = "1" + " + 1" * 4000
+    src = "class D { int f() { return " + expr + "; } }"
+    tree = parse(src, grammar)
+    assert _count_nodes(tree.root_node) > 4000

@@ -53,20 +53,60 @@ def test_oversized_request_is_refused_before_invocation(sap_dir, pr_manifest):
     assert gen.candidate is None
 
 
+def _ctx_backend(num_ctx, in_tok):
+    class Ctx(CountingBackend):
+        params: typing.ClassVar[dict] = {"temperature": 0, "num_ctx": num_ctx}
+
+    return Ctx(CANDIDATE, usage={"input_tokens": in_tok, "output_tokens": 5})
+
+
 def test_runtime_window_saturation_is_limits_exceeded(sap_dir, pr_manifest):
-    """ollama truncates silently at num_ctx; a reported input-token count at
-    the window is runtime evidence of truncation, so no completion may be
-    recorded (the model saw a different prompt than the request)."""
+    """A reported input-token count at the window is runtime evidence of
+    truncation, so no completion may be recorded (the model saw a different
+    prompt than the request).
 
-    class SaturatedBackend(CountingBackend):
-        params: typing.ClassVar[dict] = {"temperature": 0, "num_ctx": 128}
-
-    backend = SaturatedBackend(CANDIDATE, usage={"input_tokens": 128, "output_tokens": 5})
+    The window has to be large enough for the request to clear the pre-flight
+    bound, or this exercises that check instead of the runtime one."""
+    num_ctx = 16384
+    backend = _ctx_backend(num_ctx, num_ctx)
     gen = generate(_request(sap_dir, pr_manifest), backend)
     assert gen.outcome == "limits_exceeded"
-    assert backend.calls == 1
-    assert any("saturating the declared context window" in d for d in gen.diagnostics)
-    assert gen.usage["input_tokens"] == 128, "the runtime evidence itself is kept"
+    assert backend.calls == 1, "the runtime check happens after invocation"
+    assert any("truncated by the runtime" in d for d in gen.diagnostics)
+    assert gen.usage["input_tokens"] == num_ctx, "the runtime evidence itself is kept"
+
+
+def test_truncation_pinned_token_count_is_detected(sap_dir, pr_manifest):
+    """The real signature. When the runtime truncates it does NOT report a
+    saturated count -- it reports one pinned at num_ctx // 2 + 2, far below the
+    window, so a `>= num_ctx` test can never fire. This is the case that went
+    undetected in ~1,550 records."""
+    num_ctx = 16384
+    backend = _ctx_backend(num_ctx, num_ctx // 2 + 2)
+    gen = generate(_request(sap_dir, pr_manifest), backend)
+    assert gen.outcome == "limits_exceeded"
+    assert any("pinned at the truncation value" in d for d in gen.diagnostics)
+
+
+def test_implausible_chars_per_token_is_detected(sap_dir, pr_manifest):
+    """A pinned count at some other value still shows up as a chars/token ratio
+    no real code reaches."""
+    req = _request(sap_dir, pr_manifest)
+    backend = _ctx_backend(16384, max(1, len(req.prompt) // 12))  # ~12 chars/token
+    gen = generate(req, backend)
+    assert gen.outcome == "limits_exceeded"
+
+
+def test_ordinary_ratio_is_not_flagged(sap_dir, pr_manifest):
+    """Regression guard. The ratio test must stay language-independent: Scala and
+    Java run 3.7-4.9 chars/token where C peaks at 3.4, so a threshold calibrated
+    on C alone reports ordinary Scala prompts as truncated."""
+    req = _request(sap_dir, pr_manifest)
+    for chars_per_token in (3.4, 4.5, 4.9):
+        in_tok = max(1, int(len(req.prompt) / chars_per_token))
+        gen = generate(req, _ctx_backend(16384, in_tok))
+        assert gen.outcome == "completion", (
+            f"{chars_per_token} chars/token is normal code, not truncation")
 
 
 def test_within_limits_completes_unchanged(sap_dir, pr_manifest):
@@ -84,9 +124,22 @@ def test_harness_records_limits_exceeded_rows(sap_dir, pr_manifest):
 
 
 def test_ollama_backend_declares_default_limit():
-    from rcap.backend_ollama import OllamaBackend
+    from rcap.backend_ollama import OllamaBackend, admissible_chars, chars_per_token_floor
 
     backend = OllamaBackend(url="http://127.0.0.1:9", num_ctx=16384)  # no server
-    assert backend.request_limit_chars == 16384 * 4
+    assert backend.request_limit_chars == admissible_chars(16384)
+    # The bound must UNDER-estimate token cost, or it admits prompts that cannot
+    # fit and are then truncated silently. At the old 4 chars/token it was 65,536
+    # chars ~= 20.5k tokens against a 16,384 window, so ~52k-65k chars was
+    # accepted and cut.
+    assert backend.request_limit_chars < 16384 * 4
+    # Floors are per language and must not exceed that language's measured
+    # minimum (C 2.66, Scala/Java 3.66); an unmeasured language gets the
+    # most conservative value.
+    assert chars_per_token_floor("c") <= 2.66
+    assert chars_per_token_floor("scala") <= 3.66
+    assert chars_per_token_floor("java") <= 3.66
+    assert chars_per_token_floor("rust") == chars_per_token_floor(None)
+    assert admissible_chars(16384, "scala") > admissible_chars(16384, "c")
     assert OllamaBackend(url="http://127.0.0.1:9",
                          request_limit_chars=99).request_limit_chars == 99
