@@ -98,12 +98,19 @@ def main() -> None:
     ap.add_argument("--divergence", required=True)
     ap.add_argument("--max-files", type=int, default=4)
     ap.add_argument("--base", default=None,
-                    help="explicit base commit for the PR diff. Without it the "
-                         "base is merge-base(head, HEAD), which COLLAPSES TO HEAD "
-                         "itself when the PR head is already an ancestor of the "
-                         "mainline (a merged PR), yielding an empty diff and a "
-                         "silently empty SAP. Callers that know the base should "
-                         "pass it.")
+                    help="explicit base commit for the PR diff, which MUST be an "
+                         "ancestor of the PR head. Without it the base is "
+                         "merge-base(head, HEAD); that COLLAPSES TO HEAD itself "
+                         "when the head has already landed in the mainline, "
+                         "yielding an empty diff and a silently empty SAP, so a "
+                         "landed head should be passed its own first parent. "
+                         "Do NOT pass a commit on a divergent line (a fork "
+                         "divergence point, say): git diff between two such "
+                         "commits also reports, reversed, everything reachable "
+                         "from the base but not the head, which fabricates a "
+                         "large diff of files the pull request never touched. "
+                         "A base equal to head is refused below; a non-ancestor "
+                         "base cannot be detected here, so the caller owns it.")
     args = ap.parse_args()
 
     src_clone = args.cache / (args.mainline.replace("/", "__") + ".git")
