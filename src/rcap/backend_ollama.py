@@ -21,13 +21,21 @@ DEFAULT_URL = "http://localhost:11435"
 
 class OllamaBackend:
     def __init__(self, model: str = DEFAULT_MODEL, url: str = DEFAULT_URL,
-                 *, num_ctx: int = 16384, timeout: int = 600):
+                 *, num_ctx: int = 16384, timeout: int = 600,
+                 request_limit_chars: int | None = None):
         self.name = "ollama"
         self.model = model
         self.url = url
         self.num_ctx = num_ctx
         self.timeout = timeout
         self.params = {"temperature": 0, "seed": 12535, "num_ctx": num_ctx}
+        # Declared acceptance limit (section 11 limits_exceeded): the runtime
+        # truncates silently past num_ctx, so requests plausibly beyond the
+        # window are refused up front. 4 chars/token is a recorded
+        # configuration choice, not a measurement; the runtime-reported
+        # token count still catches anything this bound lets through.
+        self.request_limit_chars = (request_limit_chars if request_limit_chars is not None
+                                    else num_ctx * 4)
         self.model_digest = self._digest()
 
     def _api(self, path: str, payload: dict | None = None) -> dict:
@@ -50,10 +58,20 @@ class OllamaBackend:
             return None
 
     def generate(self, request: AdaptationRequest) -> str:
+        self.last_usage: dict[str, int] | None = None
         data = self._api("/api/chat", {
             "model": self.model,
             "messages": [{"role": "user", "content": request.prompt}],
             "stream": False,
             "options": self.params,
         })
+        # Runtime-reported token counts (section 15). prompt_eval_count is
+        # what the runtime actually evaluated — a warm prompt-prefix cache can
+        # make it lower than the full prompt length; recorded as reported.
+        usage = {}
+        if isinstance(data.get("prompt_eval_count"), int):
+            usage["input_tokens"] = data["prompt_eval_count"]
+        if isinstance(data.get("eval_count"), int):
+            usage["output_tokens"] = data["eval_count"]
+        self.last_usage = usage or None
         return data.get("message", {}).get("content", "")

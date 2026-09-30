@@ -40,6 +40,75 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def repo_pin(provenance: object) -> dict | None:
+    """The resolved repository pin out of a provenance dict, or None."""
+    if isinstance(provenance, dict):
+        pin = provenance.get("repository_pin")
+        if isinstance(pin, dict) and pin.get("repo") and pin.get("commit"):
+            return pin
+    return None
+
+
+def _bind_repo_state(evidence: dict[str, EvidenceRecord], provenance: dict,
+                     pr_manifest: dict | None) -> tuple[dict, list[str], list[str]]:
+    """Repository-state binding (RCAP ref section 3(3), section 4).
+
+    Every evidence-level pin plus the SAP-level provenance pin is grouped per
+    repository: one resolved commit per repo becomes the case binding;
+    two different commits for the same repo are evidence bound to incompatible
+    repository states — an intake failure (I2), never combined. The PR-manifest
+    commit binding is reconciled, not enforced: the evidence-level resolved pin
+    is authoritative and a lagging or UNAVAILABLE manifest binding is recorded.
+    """
+    by_repo: dict[str, dict[str, list[str]]] = {}
+
+    def add(pin: dict, source: str) -> None:
+        by_repo.setdefault(pin["repo"], {}).setdefault(pin["commit"], []).append(source)
+
+    resolved_from: dict[str, str] = {}
+    for rec in evidence.values():
+        pin = repo_pin(rec.provenance)
+        if pin:
+            add(pin, rec.object_id)
+            if pin.get("resolved_from"):
+                resolved_from.setdefault(f"{pin['repo']}@{pin['commit']}",
+                                         pin["resolved_from"])
+    sap_pin = repo_pin(provenance)
+    if sap_pin:
+        add(sap_pin, "provenance.json")
+
+    conflicts: list[str] = []
+    bindings: dict[str, dict] = {}
+    for repo, commits in sorted(by_repo.items()):
+        if len(commits) > 1:
+            detail = "; ".join(f"{c} <- {', '.join(sorted(srcs)[:3])}"
+                               for c, srcs in sorted(commits.items()))
+            conflicts.append(
+                f"evidence bound to incompatible repository states for {repo}: {detail}")
+            continue
+        commit, sources = next(iter(commits.items()))
+        bindings[repo] = {"commit": commit,
+                          "resolved_from": resolved_from.get(f"{repo}@{commit}"),
+                          "pinned_by": len(sources)}
+
+    reconciliation: list[str] = []
+    if bindings:
+        manifest_binding = (pr_manifest or {}).get("commit_binding")
+        if not isinstance(manifest_binding, dict):
+            reconciliation.append(
+                "repo-state reconciliation: PR manifest carries no commit binding "
+                "(UNAVAILABLE); evidence-level resolved pins are authoritative")
+        else:
+            for repo, binding in bindings.items():
+                declared = manifest_binding.get(repo)
+                if declared != binding["commit"]:
+                    reconciliation.append(
+                        f"repo-state reconciliation: {repo} evidence-level pin "
+                        f"{binding['commit']} is authoritative over PR-manifest "
+                        f"binding {declared!r}")
+    return bindings, reconciliation, conflicts
+
+
 def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseModel:
     """Load one SAP directory into a validated, index-level case model.
 
@@ -64,6 +133,7 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
     evidence: dict[str, EvidenceRecord] = {}
     relationships: list[RelationshipEdge] = []
     transformations: list[Transformation] = []
+    category_confidence: dict[str, float] = {}
 
     for hunk_id in manifest.get("hunks", []):
         hdir = sap_dir / "hunks" / hunk_id
@@ -107,6 +177,10 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
                     if (base / ref).is_file():
                         doc = _read_json(base / ref)
                         break
+            if doc and isinstance(doc.get("confidence"), (int, float)):
+                # Section 9(7): index confidence is metadata for ranking,
+                # never a retention gate.
+                category_confidence[f"{hunk_id}:{cat}"] = float(doc["confidence"])
             if doc and doc.get("elements"):
                 _collect_elements(doc, hunk_id, evidence)
             else:
@@ -119,10 +193,27 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
                         attributes={"reason": entry["reason"]} if entry.get("reason") else {},
                     )
 
+    # Section 13 cross-file relationships: explicit SALP-recorded semantic
+    # edges from the PR manifest. A dependency is followed only through such
+    # an edge; shared PR/commit/directory membership is never sufficient (I8)
+    # — that stays enforced by the admissible-relationship policy.
+    for edge in (pr_manifest or {}).get("cross_file_relationships") or []:
+        relationships.append(RelationshipEdge(
+            src=edge.get("from", ""), rel=edge.get("rel", ""), dst=edge.get("to", ""),
+            state=edge.get("state", "PRESENT"), evidence=edge.get("evidence"),
+            hunk_id="PR",
+        ))
+
     functions = _load_functions(sap_dir, manifest)
 
     if diagnostics and any("foundational" in d for d in diagnostics):
         raise IntakeFailure(sap_dir, diagnostics)
+
+    bindings, reconciliation, conflicts = _bind_repo_state(evidence, provenance,
+                                                           pr_manifest)
+    if conflicts:
+        raise IntakeFailure(sap_dir, diagnostics + conflicts)
+    diagnostics.extend(reconciliation)
 
     pr = pr_manifest or {}
     case = CaseModel(
@@ -142,9 +233,25 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
         evidence=evidence,
         relationships=relationships,
         characterization=characterization,
-        repo_state={"provenance": provenance.get("repository_pin")},
+        category_confidence=category_confidence,
+        repo_state={"bindings": bindings,
+                    "reconciliation": reconciliation,
+                    "provenance": provenance.get("repository_pin")},
         diagnostics=diagnostics,
     )
+
+    # Section 4: a signature string is not a valid endpoint; it is normalized
+    # to the object id of the structural element representing that method.
+    for edge in case.relationships:
+        for attr in ("src", "dst"):
+            raw = getattr(edge, attr)
+            if case.resolve_endpoint(raw) is not None or not _looks_like_signature(raw):
+                continue
+            normalized = _structural_element_for(case, raw)
+            if normalized is not None:
+                setattr(edge, attr, normalized)
+                case.diagnostics.append(
+                    f"{edge.hunk_id}: signature endpoint {raw!r} normalized to {normalized}")
 
     # Endpoint resolution: an endpoint that resolves to nothing is a recorded
     # diagnostic, never a silently dropped edge (RCAP ref section 6).
@@ -155,6 +262,21 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
                     f"{edge.hunk_id}: edge endpoint {raw!r} ({edge.rel}) resolves to nothing"
                 )
     return case
+
+
+def _looks_like_signature(raw: str) -> bool:
+    return "(" in raw
+
+
+def _structural_element_for(case: CaseModel, signature: str) -> str | None:
+    """The object id of the structural/localization element whose method
+    attribute matches the signature, or None (leaving the unresolved-endpoint
+    diagnostic to record the gap)."""
+    for rec in case.evidence.values():
+        for key in ("method", "signature"):
+            if rec.attributes.get(key) == signature:
+                return rec.object_id
+    return None
 
 
 def _fn_id_of(transformation: dict) -> str | None:

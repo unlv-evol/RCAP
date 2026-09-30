@@ -55,9 +55,39 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
         lines = [f"- [{c.kind}] {c.detail}" + (" (BLOCKING)" if c.blocking else "")
                  for c in context.constraints]
         sections.append("## Constraints from recovered evidence\n" + "\n".join(lines))
+    if context.siblings:
+        # Section 13: sibling-edit signatures, so a rename or signature change
+        # made in another unit of the same change stays consistent here.
+        lines = []
+        for s in context.siblings:
+            line = f"- {s.entity}: `{s.signature_after or s.target_signature or '?'}`"
+            if s.signature_before and s.signature_after \
+                    and s.signature_before != s.signature_after:
+                line += f" (changed from `{s.signature_before}`)"
+            lines.append(line)
+        sections.append(
+            "## Other functions edited by this same change (signatures only)\n"
+            "This change also edits the functions below; keep any shared names\n"
+            "and signatures consistent with these edits.\n" + "\n".join(lines))
+    helper_arts = [a for a in context.program_context
+                   if a.role == "target"
+                   and a.entity != context.target_localization.get("function")]
+    if helper_arts:
+        # Section 9(5): retained helper context (reduced, recovery maps kept in
+        # the context) — supporting material, not something to adapt.
+        blocks = [f"### {a.entity} (do not modify)\n```java\n{a.reduced_text}```"
+                  for a in helper_arts]
+        sections.append("## Related fork context (reduced helpers)\n"
+                        + "\n\n".join(blocks))
     if context.target_localization.get("file"):
-        sections.append("## Target location\n"
-                        f"File: {context.target_localization['file']}")
+        lines = [f"File: {context.target_localization['file']}"]
+        alternatives = context.target_localization.get("alternatives") or []
+        if alternatives:
+            # Section 9(2): ambiguity stays visible, never silently collapsed.
+            lines.append(f"NOTE: localization is ambiguous — "
+                         f"{len(alternatives)} plausible target functions were "
+                         f"recorded; the one above is the primary candidate.")
+        sections.append("## Target location\n" + "\n".join(lines))
     sections.append("## Output\nOne ```java block containing the full adapted "
                     "target function. Nothing else.")
 
@@ -66,3 +96,14 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
         f"{TEMPLATE_ID}:{TEMPLATE_VERSION}\n{prompt}".encode()).hexdigest()
     return AdaptationRequest(case_id=context.case_id, prompt=prompt,
                              request_hash=request_hash)
+
+
+def untraceable_lines(prompt: str, context: AdaptationContext) -> list[str]:
+    """Section 17 mapping test: every request fact must originate in the
+    context. Synthesis is deterministic (R = Psi(C, I)), so the reference
+    rendering of the context is the complete set of legitimate lines; any
+    non-empty line of the given prompt outside it has no context origin —
+    invented evidence."""
+    legitimate = set(synthesize(context).prompt.splitlines())
+    return [line for line in prompt.splitlines()
+            if line.strip() and line not in legitimate]
