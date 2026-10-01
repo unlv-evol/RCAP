@@ -13,11 +13,13 @@ it is metadata only here, since refactoring detection is off.
 
 Usage: mint_477.py <out-dir> [--only-non-kafka] [--max-files N]
 """
-import argparse, json, subprocess, sys, collections
+import argparse, json, os, subprocess, sys, collections
 from pathlib import Path
 
 DATA = Path("/home/adam/Documents/work/validation-study/validation-data/dataset.jsonl")
-CACHE = Path("/home/adam/Documents/work/SALP/data/repos")
+# SALP checkout whose repo cache is read; override with SALP_HOME.
+SALP_HOME = Path(os.environ.get("SALP_HOME", "/home/adam/Documents/work/SALP"))
+CACHE = SALP_HOME / "data/repos"
 RCAP = Path("/home/adam/Documents/work/rcap-class-project/rcap")
 PY_BIN = RCAP / ".venv/bin/python"
 

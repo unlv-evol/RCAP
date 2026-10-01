@@ -30,13 +30,13 @@ Compilers stop after an error phase, so a PREREQ row may still hide model errors
 rows are an UPPER bound on what supplying prerequisites would recover.
 Usage: classify_buildfail.py        (writes buildfail-classified.jsonl + prints a summary)
 """
-import collections, functools, json, re, subprocess
+import collections, functools, json, os, re, subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 V = Path("/home/adam/Documents/work/rcap-class-project/run477/validate")
 FORK = V / "fork-linkedin-kafka"; FORK_REV = "fdb9fd013a"
-UP = Path("/home/adam/Documents/work/SALP/data/repos/apache__kafka.git")
+UP = Path(os.environ.get("SALP_HOME", "/home/adam/Documents/work/SALP")) / "data/repos/apache__kafka.git"
 MINT = V.parent / "mint_477_log.jsonl"
 OUT = V / "buildfail-classified.jsonl"
 

@@ -9,7 +9,7 @@ import json, glob, os, subprocess, collections, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from classify_mo import meaningful, patch_lines
 RUN = "/home/adam/Documents/work/rcap-class-project/run477"
-CACHE = "/home/adam/Documents/work/SALP/data/repos"
+CACHE = os.environ.get("SALP_HOME", "/home/adam/Documents/work/SALP") + "/data/repos"
 lab = {json.loads(l)["key"]: json.loads(l) for l in open(f"{RUN}/mo-relabel/labels_final.jsonl")}
 def git(g, *a):
     r = subprocess.run(["git", "--git-dir", g, *a], capture_output=True, text=True, errors="replace")
