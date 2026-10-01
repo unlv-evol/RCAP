@@ -38,7 +38,10 @@ def gradle(*tasks, timeout):
     return sh([GRADLE, "--offline", "-q", "-Dorg.gradle.java.home=/usr/lib/jvm/java-11-openjdk-amd64",
                # 8 cores shared with the LLM run: cap test JVMs
                "-PmaxParallelForks=" + os.environ.get("MAX_FORKS", "3"), *tasks, "-x", "checkstyleMain", "-x", "checkstyleTest",
-               "-x", "spotbugsMain", "-x", "spotbugsTest"], timeout)
+               "-x", "spotbugsMain", "-x", "spotbugsTest",
+               # streams-scala's test depends on :spotlessScala, which fails in a reused daemon
+               # ("Cannot add a configuration with name 'spotless-…'"): formatting only, like checkstyle
+               "-x", "spotlessScala"], timeout)
 
 def project_of(path):
     return ":" + path.split("/src/")[0].replace("/", ":") if "/src/" in path else None

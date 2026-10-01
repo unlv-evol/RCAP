@@ -16,6 +16,11 @@ outside the repo in `rcap-class-project/run477/`; the paths are absolute there.
 | 5. Did the fork later port it? | `later_ported.py` | `mo-relabel/later_ported.jsonl` |
 | 6. Regenerate MO completions, keeping candidates | `run_persist.py` | `validate/candidates/` |
 | 7. Splice → build → test each candidate | `validate.py`, `validate_loop.sh` | `validate/verdicts-*.jsonl` |
+| 8. Rebuild BUILD_FAILs keeping full compiler logs | `rebuild_logs.py` (`--shard I/N`, one fork clone per shard) | `validate/build-logs/` |
+| 9. Attribute each BUILD_FAIL (prerequisite vs import vs model) | `classify_buildfail.py` | `validate/buildfail-classified.jsonl` |
+| 10. Split VALID into code / import-only / comment-only | `classify_valid.py` (rcap venv) | `validate/valid-classified.jsonl` |
+| 11. Merge verdicts + analyses, relabel INCONCLUSIVE | `merge_v2.py` | `validate/verdicts-*.v2.jsonl` |
+| 12. PR-level: splice all of a PR's candidates, then build/test | `validate_pr.py` | `validate/verdicts-pr-*.jsonl` |
 
 `probe_units.py` runs the pipeline up to request synthesis without an LLM.
 
@@ -39,3 +44,8 @@ outside the repo in `rcap-class-project/run477/`; the paths are absolute there.
   Gradle setting.
 - **Completion is not correctness.** Steps 6–7 exist to test candidates; a
   completion only means the output passed RCAP's structural checks.
+- **Second fork copy.** Kafka's `build.gradle` reads git through JGit, which
+  rejects `git worktree` checkouts ("Bare Repository has neither a working tree,
+  nor an index"). Use `git clone --shared` for a second build tree.
+- **`-x spotlessScala`.** `:streams:streams-scala:test` depends on it, and it
+  fails in a reused Gradle daemon; it is formatting only.
