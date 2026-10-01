@@ -62,6 +62,20 @@ class GenerationRecord(BaseModel):
     executed_at: str = ""
 
 
+def effective_limit_chars(backend: Backend, language: str | None) -> int | None:
+    """The request-size bound `generate` enforces for this backend and language.
+
+    The backend's own limit is language-agnostic. When it declares a context
+    window, the bound is recomputed for the request's language, which is both
+    tighter for dense-token languages and safer for sparse ones."""
+    params = getattr(backend, "params", None)
+    limit_chars = getattr(backend, "request_limit_chars", None)
+    _num_ctx = params.get("num_ctx") if isinstance(params, dict) else None
+    if _num_ctx and getattr(backend, "request_limit_chars_is_explicit", False) is False:
+        limit_chars = admissible_chars(_num_ctx, language)
+    return limit_chars
+
+
 def generate(request: AdaptationRequest, backend: Backend,
              *, expected_placeholders: set[str] | None = None) -> GenerationRecord:
     # θ must make a weight change distinguishable from an evidence change
@@ -74,13 +88,7 @@ def generate(request: AdaptationRequest, backend: Backend,
     digest = getattr(backend, "model_digest", None)
     if digest:
         theta["version"] = digest
-    # The backend's own limit is language-agnostic. When it declares a context
-    # window, the bound is recomputed for the request's language, which is both
-    # tighter for dense-token languages and safer for sparse ones.
-    limit_chars = getattr(backend, "request_limit_chars", None)
-    _num_ctx = params.get("num_ctx") if isinstance(params, dict) else None
-    if _num_ctx and getattr(backend, "request_limit_chars_is_explicit", False) is False:
-        limit_chars = admissible_chars(_num_ctx, getattr(request, "language", None))
+    limit_chars = effective_limit_chars(backend, getattr(request, "language", None))
     if limit_chars:
         theta["request_limit_chars"] = limit_chars
     exec_id = hashlib.sha256(
