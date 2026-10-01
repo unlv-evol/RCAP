@@ -34,13 +34,14 @@ ap.add_argument("--sample", required=True); ap.add_argument("--salp-out", requir
 ap.add_argument("--fork", required=True); ap.add_argument("--out", required=True)
 ap.add_argument("--baseline", required=True)
 ap.add_argument("--k", type=int, default=10)
+ap.add_argument("--echo-policy", default="feedback", choices=["feedback", "retry"])
 ap.add_argument("--gradle-bin-file", default=str(RUN / "validate/gradle_bin.txt"))
 ap.add_argument("--old-verdicts", default=str(RUN / "validate/verdicts-linkedin__kafka.v2.jsonl"))
 ap.add_argument("--old-candidates", default=str(RUN / "validate/candidates"))
 ap.add_argument("--only"); ap.add_argument("--limit", type=int)
 a = ap.parse_args()
 
-FORK = Path(a.fork).resolve(); OUT = Path(a.out); ATT = OUT.parent / "attempts"
+FORK = Path(a.fork).resolve(); OUT = Path(a.out); ATT = OUT.parent / ("attempts" if a.echo_policy == "feedback" else f"attempts-echo-{a.echo_policy}")
 GRADLE = Path(a.gradle_bin_file).read_text().strip()
 BASE = Path(a.baseline); baseline = json.loads(BASE.read_text()) if BASE.exists() else {}
 TEST_TIMEOUT = int(os.environ.get("TEST_TIMEOUT", "1800")); BUILD_TIMEOUT = 1800
@@ -254,7 +255,7 @@ for n, s in enumerate(todo, 1):
         (case_dir / "target_original.json").write_text(json.dumps(
             [{"unit": u.index, "entity": u.entity, "target_original": u.target_original} for u in units], indent=1))
         rec = run_reprompt_loop(units, backend, make_validator(case_dir, sap["target_file"], units, lambda: current["raw"]),
-                                k=a.k, on_attempt=on_attempt)
+                                k=a.k, echo_policy=a.echo_policy, on_attempt=on_attempt)
         if rec["attempts"]:
             for u in rec["attempts"][0]["units"]: u["gen_seconds"] = round(gen1 / max(1, len(units)), 1)
         row.update(rec)

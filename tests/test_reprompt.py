@@ -237,6 +237,23 @@ def test_echo_is_never_a_success(sap_dir, pr_manifest):
     assert rec["first_success_attempt"] == 3
 
 
+def test_echo_retry_policy_restates_the_failing_candidate(sap_dir, pr_manifest):
+    backend = ScriptedBackend([FIRST])
+    units = _units(sap_dir, pr_manifest, backend)
+    echo = "```java\n" + units[0].context.transformation["target"] + "```"
+    backend = ScriptedBackend([FIRST, echo, _fn("check(c); fixed(c);")])
+    units = _units(sap_dir, pr_manifest, backend)
+    rec = run_reprompt_loop(units, backend, _failing([]), k=3, echo_policy="retry")
+    third = backend.requests[2].prompt
+    assert rec["attempts"][1]["verdict"] == "ECHO"
+    assert FIRST_BODY in third, "the failing candidate, not the echo, is restated"
+    assert "## Previous attempt (attempt 1; it FAILED)" in third
+    assert "symbol: method missing(Config)" in third, "with its diagnostics"
+    assert "returned the ORIGINAL target function unchanged" in third
+    assert third != backend.requests[1].prompt
+    assert rec["attempts"][1]["reprompt_basis"].startswith("last failing candidate")
+
+
 def test_suspicious_shrink_is_flagged_not_a_clean_win(sap_dir, pr_manifest):
     big = "```java\nvoid validate(Config c) {\n/* RCAP_PH_target.1 */\n" + "".join(
         f"    assertEquals({i}, c.get({i}));\n" for i in range(10)) + "}\n```"

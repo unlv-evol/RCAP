@@ -135,7 +135,8 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
     if feedback is not None:
         previous = feedback.previous_candidate
         sections.append(
-            f"## Previous attempt (attempt {feedback.attempt - 1}; it FAILED)\n"
+            f"## Previous attempt (attempt "
+            f"{feedback.previous_attempt or feedback.attempt - 1}; it FAILED)\n"
             f"```{lang}\n" + previous + ("" if previous.endswith("\n") else "\n")
             + "```")
         body = feedback.error_text.rstrip("\n")

@@ -49,6 +49,10 @@ ECHO_MESSAGE = (
     "The previous attempt is identical to the ORIGINAL target function: the "
     "source change was not applied at all. Apply the change shown in the "
     "before/after pair to the target function.")
+ECHO_RETRY_NOTE = (
+    "Note: a repair attempt for these diagnostics returned the ORIGINAL target "
+    "function unchanged. That is rejected: the source change must still be applied.")
+ECHO_POLICIES = ("feedback", "retry")
 
 _WS = re.compile(r"\s+")
 _TOKEN = re.compile(r"[A-Za-z_$][\w$]*|\d+|\S")
@@ -63,6 +67,7 @@ class RepairFeedback(BaseModel):
     attempt: int                 # the attempt this feedback is FOR (2..k)
     kind: str                    # build | test | echo
     previous_candidate: str      # the failing candidate, as the model wrote it
+    previous_attempt: int | None = None  # attempt that produced it (default: attempt - 1)
     error_text: str              # rendered diagnostics, possibly truncated
     truncated: bool = False
     full_chars: int = 0          # length of the diagnostics before truncation
@@ -208,7 +213,7 @@ _STOP_FOR_OUTCOME = {
 def run_reprompt_loop(
     units: list[UnitState], backend: Backend,
     validate: Callable[[int, list[str]], Validation],
-    *, k: int = DEFAULT_K,
+    *, k: int = DEFAULT_K, echo_policy: str = "feedback",
     on_attempt: Callable[[int, list[dict[str, object]]], None] | None = None,
 ) -> dict[str, object]:
     """Run the loop for one case and return its record.
@@ -217,10 +222,19 @@ def run_reprompt_loop(
     unit, placeholders expanded), builds, tests and restores, and is called
     after EVERY attempt. `on_attempt(attempt, unit_artifacts)` lets the driver
     persist each attempt's prompt and candidate before validation.
+
+    `echo_policy` says what follows an ECHO (the model returned the unmodified
+    target). "feedback": the echo becomes the current candidate and the next
+    request only says the change was not applied — memoryless, as in the
+    paper, so the original diagnostics are gone. "retry": the echo is
+    discarded; the next request restates the last FAILING candidate and its
+    diagnostics plus a note that reverting was rejected.
     """
+    if echo_policy not in ECHO_POLICIES:
+        raise ValueError(f"echo_policy must be one of {ECHO_POLICIES}")
     attempts: list[dict[str, object]] = []
     record: dict[str, object] = {
-        "k": k, "units": len(units), "attempts": attempts,
+        "k": k, "echo_policy": echo_policy, "units": len(units), "attempts": attempts,
         "first_success_attempt": None, "stop_reason": None, "final_verdict": None,
         "success_class": None,
     }
@@ -234,6 +248,7 @@ def run_reprompt_loop(
     first_expanded: list[str] | None = None
     seen: list[tuple[str, ...]] = []
     limit = None
+    last_failing: tuple[list[str | None], Validation, int] | None = None
 
     for attempt in range(1, k + 1):
         row: dict[str, object] = {
@@ -317,6 +332,18 @@ def run_reprompt_loop(
             record["stop_reason"] = "k_exhausted"
             break
 
+        basis, basis_attempt = list(raw), attempt
+        if validation.verdict == "ECHO":
+            if echo_policy == "retry" and last_failing is not None:
+                basis, failed, basis_attempt = last_failing
+                validation = failed.model_copy(update={
+                    "feedback": failed.feedback.rstrip("\n") + "\n" + ECHO_RETRY_NOTE,
+                    "unit_feedback": {i: t.rstrip("\n") + "\n" + ECHO_RETRY_NOTE
+                                      for i, t in failed.unit_feedback.items()}})
+                row["reprompt_basis"] = "last failing candidate (echo discarded)"
+        else:
+            last_failing = (list(raw), validation, attempt)
+
         # ---- re-prompt: a fresh single-turn request per unit that needs one
         targets = validation.units_with_errors or list(range(len(units)))
         row["reprompt_units"] = targets
@@ -330,7 +357,7 @@ def run_reprompt_loop(
                 limit = effective_limit_chars(backend, u.request.language)
             fb = RepairFeedback(
                 attempt=attempt + 1, kind=validation.kind or "build",
-                previous_candidate=raw[i],
+                previous_candidate=basis[i], previous_attempt=basis_attempt,
                 error_text=validation.unit_feedback.get(i, validation.feedback))
             ctx, request = fit_feedback(u.context, fb, limit)
             t0 = time.time()
