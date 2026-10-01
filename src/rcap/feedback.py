@@ -46,6 +46,7 @@ class CompileError:
     path: str            # as printed by the compiler
     line: int
     message: str
+    col: int | None = None
     body: list[str] = field(default_factory=list)  # source line, caret, symbol:, location:
     in_edited_file: bool = False
     unit: int | None = None        # index of the unit whose span holds the line
@@ -81,7 +82,8 @@ def parse_compile_errors(log: str) -> list[CompileError]:
             if msg.startswith("error:"):
                 msg = msg[len("error:"):].strip()
             current = CompileError(path=m.group("path"), line=int(m.group("line")),
-                                   message=msg)
+                                   message=msg,
+                                   col=int(m.group("col")) if m.group("col") else None)
             errors.append(current)
             continue
         if current is None:
@@ -161,6 +163,7 @@ def extract_build_feedback(
     log: str, edited_file: str, unit_spans: Sequence[tuple[int, int]] = (),
     *, root: str | None = None, max_errors: int = MAX_ERRORS, max_chars: int = MAX_CHARS,
     unit_line: Callable[[int, int], int | None] | None = None,
+    edited_source: str | None = None,
 ) -> Feedback:
     """Feedback from a full compiler log.
 
@@ -170,10 +173,18 @@ def extract_build_feedback(
     first; an error inside a span is attributed to that unit and its line is
     also given relative to the candidate the model wrote. `unit_line(unit,
     line_in_spliced_candidate)` translates that line when the spliced text is
-    not the text the model wrote (expanded placeholders); None suppresses it."""
+    not the text the model wrote (expanded placeholders); None suppresses it.
+    `edited_source` is the spliced file's text: some compilers (javac driven by
+    zinc in a mixed Scala/Java project) print only `file:line:col: error: msg`,
+    and the offending line is then quoted from it."""
     errors = parse_compile_errors(log)
+    source_lines = edited_source.splitlines() if edited_source is not None else []
     for e in errors:
         e.in_edited_file = e.path.endswith("/" + edited_file) or e.path == edited_file
+        if e.in_edited_file and not e.body and 0 < e.line <= len(source_lines):
+            e.body = [source_lines[e.line - 1]]
+            if e.col:
+                e.body.append(" " * (e.col - 1) + "^")
         if e.in_edited_file:
             for idx, (first, last) in enumerate(unit_spans):
                 if first <= e.line <= last:

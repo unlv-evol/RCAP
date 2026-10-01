@@ -331,6 +331,14 @@ def test_build_feedback_caps_and_falls_back():
     assert none.n_total == 0 and "boom" in none.text
 
 
+def test_bare_error_line_is_completed_from_the_spliced_source():
+    log = "/repo/core/src/test/java/k/T.java:2:15:  error: cannot find symbol\n\nFAILURE: x\n"
+    fb = extract_build_feedback(log, "core/src/test/java/k/T.java", [(1, 3)], root="/repo",
+                                edited_source="int id() {\n    return a.nodeId();\n}\n")
+    assert "    return a.nodeId();" in fb.text and fb.text.splitlines()[2].endswith("^")
+    assert fb.text.splitlines()[2].index("^") - 4 == 14
+
+
 SCALAC_LOG = """\
 [Error] /repo/core/src/main/scala/kafka/A.scala:12:5: not found: value foo
 [Warn] /repo/core/src/main/scala/kafka/A.scala:3: unused import

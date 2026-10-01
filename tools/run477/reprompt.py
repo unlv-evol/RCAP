@@ -151,7 +151,7 @@ def make_validator(case_dir, path, units, raws):
             if rc != 0:
                 mappers = [line_mapper(raws()[i], u.art) for i, u in enumerate(units)]
                 fb = extract_build_feedback(log, path, spans, root=str(FORK),
-                                            unit_line=lambda i, n: mappers[i](n))
+                                            unit_line=lambda i, n: mappers[i](n), edited_source=text)
                 detail["feedback"] = {"errors_total": fb.n_total, "errors_shown": fb.n_shown,
                                       "chars": len(fb.text), "mappable": fb.mappable}
                 (case_dir / f"{tag}.feedback.txt").write_text(fb.text + "\n")
