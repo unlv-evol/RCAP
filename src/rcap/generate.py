@@ -22,6 +22,8 @@ from rcap.request import AdaptationRequest
 
 _CODE_BLOCK = re.compile(r"```[A-Za-z0-9_+-]*\s*\n(.*?)```", re.DOTALL)
 _PH = re.compile(r"/\* RCAP_PH_[^*]+\*/")
+# Typed refusal (repair requests only): `CANNOT_ADAPT: needs <symbol> from <file>`.
+_DECLINE = re.compile(r"^[\s`*>-]*CANNOT_ADAPT\b\s*:?\s*(.*?)[\s`*]*$", re.MULTILINE)
 
 
 class Backend(Protocol):
@@ -77,7 +79,12 @@ def effective_limit_chars(backend: Backend, language: str | None) -> int | None:
 
 
 def generate(request: AdaptationRequest, backend: Backend,
-             *, expected_placeholders: set[str] | None = None) -> GenerationRecord:
+             *, expected_placeholders: set[str] | None = None,
+             allow_decline: bool = False) -> GenerationRecord:
+    """`allow_decline` (repair requests): an answer `CANNOT_ADAPT: ...` instead
+    of code is the distinct outcome `needs_cochange` -- a typed refusal, not an
+    unparseable answer and not a completion. Off by default, so the ordinary
+    pipeline's outcomes are unchanged."""
     # θ must make a weight change distinguishable from an evidence change
     # (sections 10-12): record generation params and model version when the
     # backend exposes them, not just its name.
@@ -159,6 +166,14 @@ def generate(request: AdaptationRequest, backend: Backend,
         return record("no_output")
 
     match = _CODE_BLOCK.search(raw)
+    if allow_decline:
+        declined = _DECLINE.search(raw)
+        # A refusal is the answer when it stands alone or opens the answer; a
+        # code block that merely mentions the token in a comment is still code.
+        if declined and (match is None or raw.lstrip(" \t\r\n`*>-").startswith("CANNOT_ADAPT")):
+            detail = declined.group(1).strip()
+            return record("needs_cochange",
+                          diag=["CANNOT_ADAPT: " + detail if detail else "CANNOT_ADAPT"])
     candidate = (match.group(1) if match else raw).strip() + "\n"
 
     # τ may be a bare method (probe-wrap it in a class) or, for class-level

@@ -125,10 +125,10 @@ def test_feedback_is_in_the_prompt_and_traceable(sap_dir, pr_manifest):
     assert "cannot find symbol" in second.prompt
     assert "symbol: method missing(Config)" in second.prompt
     assert FIRST_BODY in second.prompt
-    assert "ADAPT, do not re-implement" in second.prompt
-    # single turn: the source pair and the fork target are all restated
+    assert "The previous attempt is the code to fix" in second.prompt
+    # single turn: the source pair and the fork's original are all restated
     for heading in ("## Source function BEFORE", "## Source function AFTER",
-                    "## Target function in the fork"):
+                    "## ORIGINAL function in the fork, before the port"):
         assert heading in second.prompt
     # traceability: the feedback lives in the context, so nothing is untraceable
     fb = RepairFeedback(attempt=2, kind="build",
@@ -229,11 +229,11 @@ def test_echo_is_never_a_success(sap_dir, pr_manifest):
         return Validation(verdict="VALID" if "fixed" in expanded[0] else "BUILD_FAIL",
                           kind="build", feedback="- F.java:3: cannot find symbol")
 
-    rec = run_reprompt_loop(units, backend, validate, k=5)
+    rec = run_reprompt_loop(units, backend, validate, k=5, echo_policy="feedback")
     a2 = rec["attempts"][1]
     assert a2["echo"] is True and a2["verdict"] == "ECHO"
     assert calls == [1, 3], "an echo is not built: it would trivially pass"
-    assert "identical to the ORIGINAL target function" in backend.requests[2].prompt
+    assert "identical to the ORIGINAL function" in backend.requests[2].prompt
     assert rec["first_success_attempt"] == 3
 
 
@@ -243,13 +243,13 @@ def test_echo_retry_policy_restates_the_failing_candidate(sap_dir, pr_manifest):
     echo = "```java\n" + units[0].context.transformation["target"] + "```"
     backend = ScriptedBackend([FIRST, echo, _fn("check(c); fixed(c);")])
     units = _units(sap_dir, pr_manifest, backend)
-    rec = run_reprompt_loop(units, backend, _failing([]), k=3, echo_policy="retry")
+    rec = run_reprompt_loop(units, backend, _failing([]), k=3)   # retry is the default
     third = backend.requests[2].prompt
     assert rec["attempts"][1]["verdict"] == "ECHO"
     assert FIRST_BODY in third, "the failing candidate, not the echo, is restated"
-    assert "## Previous attempt (attempt 1; it FAILED)" in third
+    assert "## PREVIOUS ATTEMPT (attempt 1): the code to fix" in third
     assert "symbol: method missing(Config)" in third, "with its diagnostics"
-    assert "returned the ORIGINAL target function unchanged" in third
+    assert "returned the ORIGINAL function unchanged" in third
     assert third != backend.requests[1].prompt
     assert rec["attempts"][1]["reprompt_basis"].startswith("last failing candidate")
 
@@ -267,7 +267,7 @@ def test_suspicious_shrink_is_flagged_not_a_clean_win(sap_dir, pr_manifest):
     assert rec["stop_reason"] == "success" and rec["success_class"] == "suspicious_shrink"
     assert win["suspicious_shrink"] and win["metrics"]["vs_attempt1"]["assertions_delta"] == -10
     assert any("assertion" in r for r in win["shrink_reasons"])
-    assert "## Test failures caused by the previous attempt" in backend.requests[1].prompt
+    assert "## Test failures with the previous attempt applied" in backend.requests[1].prompt
 
 
 JAVAC_LOG = """\

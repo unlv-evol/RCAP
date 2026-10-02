@@ -36,35 +36,74 @@ INSTRUCTIONS = (
 # Re-prompt (repair) template. Used only when the context carries repair
 # feedback (rcap.reprompt.RepairContext); a plain AdaptationContext never
 # reaches it, so the default request stays byte-identical.
-REPAIR_TEMPLATE_ID = "rcap-reprompt-v1"
-REPAIR_TEMPLATE_VERSION = "1"
+#
+# v2 (round 2). v1 told the model to "use only what the fork demonstrably has"
+# AND to "keep applying the source change": for a change whose new names live
+# in a co-change, the only answer satisfying both is the fork's original
+# function, and that is what it returned. v2 removes the contradiction (names
+# from APPLIED co-changes are allowed and listed), makes the previous attempt
+# the thing to fix and the original a labelled reference, gives a way to
+# decline (CANNOT_ADAPT), and repeats the no-revert rule where the answer is
+# specified.
+REPAIR_TEMPLATE_ID = "rcap-reprompt-v2"
+REPAIR_TEMPLATE_VERSION = "2"
+DECLINE_TOKEN = "CANNOT_ADAPT"
 
 REPAIR_INSTRUCTIONS = (
-    "You are repairing a previous attempt at adapting a source-side code\n"
-    "change into a diverged fork.\n"
-    "Below is the change as a before/after pair from the source project, the\n"
-    "ORIGINAL target function from the fork, your previous adapted version of\n"
-    "that function, and the diagnostics it produced when it was built and\n"
-    "tested inside the fork.\n"
-    "ADAPT, do not re-implement: keep applying the same source change, and make\n"
-    "the smallest edit to the previous attempt that resolves the diagnostics.\n"
-    "Use only classes, methods and fields the fork demonstrably has (those\n"
-    "visible in the original target function or named in the diagnostics); do\n"
-    "not invent APIs. Do NOT silence the diagnostics by dropping the change,\n"
-    "deleting logic, tests or assertions, or returning the original target\n"
-    "function unchanged.\n"
+    "You are fixing a previous attempt at porting a source-side code change\n"
+    "into a diverged fork. The port is done one function at a time; the other\n"
+    "parts of the same upstream change (its co-changes) are ported separately.\n"
+    "Below: the change as a before/after pair from the source project; the\n"
+    "fork's ORIGINAL function from before the port (reference only); the\n"
+    "co-changes and whether each one is applied in the fork for this build;\n"
+    "the PREVIOUS ATTEMPT; and the diagnostics it produced when it was built\n"
+    "and tested inside the fork.\n"
+    "The previous attempt is the code to fix: keep the source change applied\n"
+    "and make the smallest edit to the previous attempt that resolves the\n"
+    "diagnostics.\n"
+    "You may use whatever the fork already has (the original function, the\n"
+    "fork-side context and the diagnostics show what exists) and the names\n"
+    "introduced by co-changes marked APPLIED. Do not use names that exist only\n"
+    "in the source project or in co-changes marked NOT APPLIED; where the fork\n"
+    "names something differently, use the fork's name. Do not invent APIs.\n"
+    "Do NOT resolve the diagnostics by undoing the change: an answer equal to\n"
+    "the ORIGINAL function is rejected automatically, and so is one that\n"
+    "deletes logic, tests or assertions.\n"
+    "If no edit to this one function can work, because it depends on something\n"
+    "that is neither in the fork nor in an APPLIED co-change (a declaration it\n"
+    "must call, or, for a test, the behaviour it checks), do not return code and\n"
+    "do not return the original. Answer with this single line instead:\n"
+    "{decline}: needs <symbol or change> from <file>\n"
     "Placeholder comments of the form /* RCAP_PH_... */ stand for elided code:\n"
     "keep each one exactly where it is, character for character, and do not\n"
     "invent code for it.\n"
-    "Return ONLY the complete adapted target function in one ```{lang} code\n"
+    "Otherwise return ONLY the complete fixed function in one ```{lang} code\n"
     "block, with no commentary."
 )
 
 _FEEDBACK_HEADINGS = {
     "build": "## Compiler diagnostics for the previous attempt",
-    "test": "## Test failures caused by the previous attempt",
+    "test": "## Test failures with the previous attempt applied",
     "echo": "## Problem with the previous attempt",
 }
+MAX_CHANGE_DIFF_LINES = 40
+
+
+def _change_diff(before: str, after: str) -> str:
+    """The source change as a compact diff: restated in every repair round
+    so the thing being ported stays in view (UTFix, OOPSLA'25)."""
+    import difflib
+    import re
+    # Placeholder ids differ between the two sides by construction
+    # (source.before.N / source.after.N); that is not part of the change.
+    ph = re.compile(r"/\* RCAP_PH_source\.(?:before|after)\.(\d+) \*/")
+    lines = [ln.rstrip("\n") for ln in difflib.unified_diff(
+        ph.sub("/* elided */", before).splitlines(),
+        ph.sub("/* elided */", after).splitlines(), lineterm="", n=1)][2:]
+    if len(lines) > MAX_CHANGE_DIFF_LINES:
+        omitted = len(lines) - MAX_CHANGE_DIFF_LINES
+        lines = lines[:MAX_CHANGE_DIFF_LINES] + [f"[... {omitted} more diff lines omitted]"]
+    return "\n".join(lines)
 
 
 class AdaptationRequest(BaseModel):
@@ -86,15 +125,26 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
     # afterwards), so every feedback line stays traceable (section 17).
     feedback = getattr(context, "feedback", None)
     sections = [
-        "## Task\n" + (REPAIR_INSTRUCTIONS if feedback is not None
-                       else INSTRUCTIONS).format(lang=lang),
+        "## Task\n" + (INSTRUCTIONS.format(lang=lang) if feedback is None else
+                       REPAIR_INSTRUCTIONS.format(lang=lang, decline=DECLINE_TOKEN)),
         f"## Source function BEFORE the change\n```{lang}\n"
         + context.transformation["source.before"] + "```",
         f"## Source function AFTER the change\n```{lang}\n"
         + context.transformation["source.after"] + "```",
-        f"## Target function in the fork (adapt this)\n```{lang}\n"
-        + context.transformation["target"] + "```",
     ]
+    if feedback is None:
+        sections.append(f"## Target function in the fork (adapt this)\n```{lang}\n"
+                        + context.transformation["target"] + "```")
+    else:
+        diff = _change_diff(context.transformation["source.before"],
+                            context.transformation["source.after"])
+        if diff:
+            sections.append("## The change to port (diff of BEFORE -> AFTER)\n```diff\n"
+                            + diff + "\n```")
+        sections.append(
+            "## ORIGINAL function in the fork, before the port (reference only; "
+            f"returning it unchanged is NOT an acceptable answer)\n```{lang}\n"
+            + context.transformation["target"] + "```")
     if context.constraints:
         lines = [f"- [{c.kind}] {c.detail}" + (" (BLOCKING)" if c.blocking else "")
                  for c in context.constraints]
@@ -133,20 +183,58 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
                          f"recorded; the one above is the primary candidate.")
         sections.append("## Target location\n" + "\n".join(lines))
     if feedback is not None:
+        # Co-changes: what else the same upstream change does, and whether it
+        # is in the fork for this build. This is what lifts the "only what the
+        # fork has" rule for names the change itself introduces.
+        if feedback.cochanges:
+            lines = [f"- [{c.status}] {c.path}: {c.summary}" for c in feedback.cochanges]
+            if feedback.cochanges_omitted:
+                lines.append(f"({feedback.cochanges_omitted} more co-change hunks not listed: "
+                             "none of them is applied)")
+            if feedback.allowed_symbols:
+                lines.append("Names introduced by APPLIED co-changes (you may use these): "
+                             + ", ".join(feedback.allowed_symbols))
+            sections.append("## Co-changes of the same upstream change\n" + "\n".join(lines))
+        elif feedback.cochanges_omitted:
+            sections.append("## Co-changes of the same upstream change\n"
+                            f"None applied ({feedback.cochanges_omitted} co-change hunks of the "
+                            "upstream change are not in the fork and are not listed).")
+        elif feedback.pr_context:
+            sections.append("## Co-changes of the same upstream change\n"
+                            "None: the upstream change touches nothing outside this "
+                            "function.")
+        else:
+            sections.append("## Co-changes of the same upstream change\n"
+                            "None applied: only this function is changed in the fork "
+                            "for this build.")
+        if feedback.fork_context:
+            sections.append("## Fork-side context (what the fork declares; do not modify)\n"
+                            + "\n".join(feedback.fork_context))
         previous = feedback.previous_candidate
         sections.append(
-            f"## Previous attempt (attempt "
-            f"{feedback.previous_attempt or feedback.attempt - 1}; it FAILED)\n"
+            f"## PREVIOUS ATTEMPT (attempt "
+            f"{feedback.previous_attempt or feedback.attempt - 1}): the code to fix\n"
             f"```{lang}\n" + previous + ("" if previous.endswith("\n") else "\n")
             + "```")
         body = feedback.error_text.rstrip("\n")
         if feedback.truncated:
             body += ("\n[diagnostics truncated to fit the request limit: "
                      f"{len(feedback.error_text)} of {feedback.full_chars} chars shown]")
+        for note in feedback.notes:
+            body += "\n" + note
         sections.append(_FEEDBACK_HEADINGS.get(feedback.kind, _FEEDBACK_HEADINGS["build"])
                         + "\n" + body)
-    sections.append(f"## Output\nOne ```{lang} block containing the full adapted "
-                    "target function. Nothing else.")
+        sections.append(
+            f"## Output\nEither one ```{lang} block containing the complete fixed function: "
+            "the previous attempt with the diagnostics resolved and the source change still "
+            "applied. Returning the ORIGINAL function unchanged is rejected.\n"
+            "Or, if this function cannot be fixed because it depends on something that is in "
+            "neither the fork nor an APPLIED co-change, exactly one line:\n"
+            f"{DECLINE_TOKEN}: needs <symbol or change> from <file>\n"
+            "Nothing else.")
+    else:
+        sections.append(f"## Output\nOne ```{lang} block containing the full adapted "
+                        "target function. Nothing else.")
 
     prompt = "\n\n".join(sections) + "\n"
     if feedback is None:

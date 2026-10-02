@@ -39,6 +39,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
+from rcap.cochange import CoChangeNote
 from rcap.context import AdaptationContext
 from rcap.generate import Backend, GenerationRecord, effective_limit_chars, generate
 from rcap.request import AdaptationRequest, synthesize
@@ -46,13 +47,19 @@ from rcap.request import AdaptationRequest, synthesize
 DEFAULT_K = 10
 SHRINK_LINE_RATIO = 0.70   # flag when < 70% of attempt 1's lines remain (> 30% dropped)
 ECHO_MESSAGE = (
-    "The previous attempt is identical to the ORIGINAL target function: the "
-    "source change was not applied at all. Apply the change shown in the "
-    "before/after pair to the target function.")
+    "The previous attempt is identical to the ORIGINAL function: the source "
+    "change was not applied at all. Apply the change shown in the before/after "
+    "pair to the function.")
 ECHO_RETRY_NOTE = (
-    "Note: a repair attempt for these diagnostics returned the ORIGINAL target "
-    "function unchanged. That is rejected: the source change must still be applied.")
-ECHO_POLICIES = ("feedback", "retry")
+    "Note: a repair attempt for these diagnostics returned the ORIGINAL function "
+    "unchanged. That answer is rejected. Fix the previous attempt shown above. If "
+    "the original really is the only version of this function that can work in the "
+    "fork, then the change cannot be ported here: answer with the CANNOT_ADAPT line.")
+# "retry" (default since round 2): the echo is discarded and the next request
+# restates the last FAILING candidate WITH its diagnostics. "feedback" is the
+# paper's memoryless variant, which loses the diagnostics after an echo.
+ECHO_POLICIES = ("retry", "feedback")
+_DECLINE_DETAIL = re.compile(r"needs\s+(?P<symbol>.+?)\s+from\s+(?P<file>\S.*)$")
 
 _WS = re.compile(r"\s+")
 _TOKEN = re.compile(r"[A-Za-z_$][\w$]*|\d+|\S")
@@ -71,6 +78,15 @@ class RepairFeedback(BaseModel):
     error_text: str              # rendered diagnostics, possibly truncated
     truncated: bool = False
     full_chars: int = 0          # length of the diagnostics before truncation
+    # Round 2. All of it is context, so all of it is traceable and all of it
+    # counts against the request limit.
+    cochanges: list[CoChangeNote] = Field(default_factory=list)
+    cochanges_omitted: int = 0
+    allowed_symbols: list[str] = Field(default_factory=list)
+    fork_context: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)   # e.g. the echo-retry note
+    pr_context: bool = False     # validated with the PR's other changes applied
+    context_truncated: list[str] = Field(default_factory=list)  # what was cut to fit
 
 
 class RepairContext(AdaptationContext):
@@ -170,9 +186,11 @@ def shrink_reasons(vs_attempt1: dict[str, object]) -> list[str]:
 
 def fit_feedback(context: AdaptationContext, feedback: RepairFeedback,
                  limit_chars: int | None) -> tuple[RepairContext, AdaptationRequest]:
-    """Build the repair context/request, truncating the FEEDBACK (never the
-    code) so the request fits `limit_chars`. If the code alone exceeds the
-    limit the request is returned oversized and `generate` refuses it."""
+    """Build the repair context/request, cutting supporting material (never
+    the code) so the request fits `limit_chars`: first the fork-side context,
+    then the co-change list from its low-priority end, then the diagnostics.
+    If the code alone exceeds the limit the request is returned oversized and
+    `generate` refuses it."""
     full = feedback.error_text
     feedback = feedback.model_copy(update={"full_chars": len(full)})
 
@@ -183,6 +201,20 @@ def fit_feedback(context: AdaptationContext, feedback: RepairFeedback,
     ctx, request = build(feedback)
     if not limit_chars or len(request.prompt) <= limit_chars:
         return ctx, request
+    cut: list[str] = []
+    while feedback.fork_context and len(request.prompt) > limit_chars:
+        feedback = feedback.model_copy(update={"fork_context": feedback.fork_context[:-1]})
+        if "fork_context" not in cut:
+            cut.append("fork_context")
+        ctx, request = build(feedback.model_copy(update={"context_truncated": cut}))
+    while feedback.cochanges and len(request.prompt) > limit_chars:
+        feedback = feedback.model_copy(update={
+            "cochanges": feedback.cochanges[:-1],
+            "cochanges_omitted": feedback.cochanges_omitted + 1})
+        if "cochanges" not in cut:
+            cut.append("cochanges")
+        ctx, request = build(feedback.model_copy(update={"context_truncated": cut}))
+    feedback = feedback.model_copy(update={"context_truncated": cut})
     # The truncation note costs a line itself, so cut with a margin and at a
     # line boundary; two passes settle it.
     for _ in range(3):
@@ -190,17 +222,29 @@ def fit_feedback(context: AdaptationContext, feedback: RepairFeedback,
         if over <= 0:
             break
         keep = max(0, len(feedback.error_text) - over - 160)
-        cut = full[:keep]
-        if "\n" in cut:
-            cut = cut[:cut.rfind("\n")]
-        feedback = feedback.model_copy(update={"error_text": cut, "truncated": True})
+        text = full[:keep]
+        if "\n" in text:
+            text = text[:text.rfind("\n")]
+        feedback = feedback.model_copy(update={"error_text": text, "truncated": True})
         ctx, request = build(feedback)
         if keep == 0:
             break
     return ctx, request
 
 
+def parse_decline(diagnostics: list[str]) -> dict[str, str | None]:
+    """`CANNOT_ADAPT: needs <symbol> from <file>` -> its parts (None when the
+    model did not follow the shape; the raw line is kept either way)."""
+    line = next((d for d in diagnostics if "CANNOT_ADAPT" in d), "")
+    m = _DECLINE_DETAIL.search(line)
+    return {"line": line,
+            "symbol": m.group("symbol").strip("`'\" ") if m else None,
+            "file": m.group("file").strip("`'\" .") if m else None}
+
+
 _STOP_FOR_OUTCOME = {
+    # the model declined: a typed refusal, neither a parse failure nor a success
+    "needs_cochange": "needs_cochange",
     "limits_exceeded": "limits",
     "unparseable": "unparseable",
     # the paper breaks on any extraction failure; these are the same class
@@ -213,8 +257,10 @@ _STOP_FOR_OUTCOME = {
 def run_reprompt_loop(
     units: list[UnitState], backend: Backend,
     validate: Callable[[int, list[str]], Validation],
-    *, k: int = DEFAULT_K, echo_policy: str = "feedback",
+    *, k: int = DEFAULT_K, echo_policy: str = "retry",
     on_attempt: Callable[[int, list[dict[str, object]]], None] | None = None,
+    precheck: Callable[[int, Validation], list[dict[str, object]]] | None = None,
+    repair_extras: Callable[[int, Validation], dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Run the loop for one case and return its record.
 
@@ -229,6 +275,14 @@ def run_reprompt_loop(
     paper, so the original diagnostics are gone. "retry": the echo is
     discarded; the next request restates the last FAILING candidate and its
     diagnostics plus a note that reverting was rejected.
+
+    `precheck(unit_index, validation)` is the deterministic co-change check:
+    it returns the evidence for every missing name whose co-change is NOT
+    available; a non-empty answer ends the loop with `needs_cochange` and no
+    model call. `repair_extras(unit_index, validation)` supplies the round-2
+    request context (`cochanges`, `allowed_symbols`, `fork_context`, ...).
+    A model answer `CANNOT_ADAPT: ...` also ends the loop with
+    `needs_cochange` (`needs_cochange_source` says which of the two it was).
     """
     if echo_policy not in ECHO_POLICIES:
         raise ValueError(f"echo_policy must be one of {ECHO_POLICIES}")
@@ -276,6 +330,11 @@ def run_reprompt_loop(
             row["verdict"] = "NO_CANDIDATE"
             record["stop_reason"] = _STOP_FOR_OUTCOME.get(bad, "unparseable")
             record["stop_detail"] = bad
+            if bad == "needs_cochange":
+                row["verdict"] = "DECLINED"
+                record["needs_cochange_source"] = "model"
+                record["needs_cochange"] = [
+                    parse_decline(g.diagnostics) for g in gens if g.outcome == bad]
             break
 
         expanded = [u.expand(raw[i]) for i, u in enumerate(units)]
@@ -333,19 +392,27 @@ def run_reprompt_loop(
             break
 
         basis, basis_attempt = list(raw), attempt
+        echo_notes: list[str] = []
         if validation.verdict == "ECHO":
             if echo_policy == "retry" and last_failing is not None:
-                basis, failed, basis_attempt = last_failing
-                validation = failed.model_copy(update={
-                    "feedback": failed.feedback.rstrip("\n") + "\n" + ECHO_RETRY_NOTE,
-                    "unit_feedback": {i: t.rstrip("\n") + "\n" + ECHO_RETRY_NOTE
-                                      for i, t in failed.unit_feedback.items()}})
+                # (f) the follow-up to an echo keeps the diagnostics: the echo
+                # is discarded and the failing candidate is restated with them.
+                basis, validation, basis_attempt = last_failing
+                echo_notes = [ECHO_RETRY_NOTE]
                 row["reprompt_basis"] = "last failing candidate (echo discarded)"
         else:
             last_failing = (list(raw), validation, attempt)
 
         # ---- re-prompt: a fresh single-turn request per unit that needs one
         targets = validation.units_with_errors or list(range(len(units)))
+        if precheck is not None and validation.kind == "build":
+            unavailable = [e for i in targets for e in precheck(i, validation)]
+            if unavailable:
+                row["precheck"] = unavailable
+                record["stop_reason"] = "needs_cochange"
+                record["needs_cochange_source"] = "precheck"
+                record["needs_cochange"] = unavailable
+                break
         row["reprompt_units"] = targets
         row["reprompt_mapping"] = ("errors mapped to unit spans"
                                    if validation.units_with_errors else
@@ -358,11 +425,14 @@ def run_reprompt_loop(
             fb = RepairFeedback(
                 attempt=attempt + 1, kind=validation.kind or "build",
                 previous_candidate=basis[i], previous_attempt=basis_attempt,
-                error_text=validation.unit_feedback.get(i, validation.feedback))
+                error_text=validation.unit_feedback.get(i, validation.feedback),
+                notes=echo_notes,
+                **(repair_extras(i, validation) if repair_extras else {}))
             ctx, request = fit_feedback(u.context, fb, limit)
             t0 = time.time()
             gens[i] = generate(request, backend,
-                               expected_placeholders=u.expected_placeholders)
+                               expected_placeholders=u.expected_placeholders,
+                               allow_decline=True)
             gen_seconds[i] = round(time.time() - t0, 1)
             requests[i] = request
             truncated[i] = ctx.feedback.truncated
@@ -376,7 +446,7 @@ def run_reprompt_loop(
     # The final verdict is that of the last attempt that was actually judged:
     # a cycle or an unusable re-prompt leaves the previous verdict standing.
     judged = [a["verdict"] for a in attempts
-              if a.get("verdict") not in (None, "CYCLE", "NO_CANDIDATE")]
+              if a.get("verdict") not in (None, "CYCLE", "NO_CANDIDATE", "DECLINED")]
     record["final_verdict"] = judged[-1] if judged else "NO_CANDIDATE"
     record["attempts_run"] = len(attempts)
     return record
