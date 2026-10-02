@@ -54,6 +54,7 @@ ap.add_argument("--mech-hunks", action="store_true",
                 help="also apply, with plain `git apply`, PR hunks that no SAP unit covers")
 ap.add_argument("--gradle-bin-file", default=str(RUN / "validate/gradle_bin.txt"))
 ap.add_argument("--old-candidates", default=str(RUN / "validate/candidates"))
+ap.add_argument("--old-results", default=str(RUN / "results-477-v2.jsonl"))
 ap.add_argument("--only", action="append"); ap.add_argument("--limit", type=int)
 a = ap.parse_args()
 
@@ -157,9 +158,16 @@ class CachingBackend:
         self.inner = inner; self.replay = replay; self.sources = collections.Counter()
         for k in ("name", "model", "params", "model_digest", "request_limit_chars", "request_limit_chars_is_explicit"):
             setattr(self, k, getattr(inner, k))
-        self.last_usage = None; self.last_source = None
+        self.last_usage = None; self.last_source = None; self.expected = []
     def generate(self, request):
         h = sha(request.prompt); f = GENCACHE / f"{h}.json"
+        if self.expected:
+            # outcomes the 477 run recorded for this SAP's units, in order (no prompt hash was kept
+            # for failures, so identity is checked by prompt length)
+            outcome, chars = self.expected.pop(0)
+            if outcome != "completion" and chars == len(request.prompt) and h not in self.replay and not f.exists():
+                self.sources["stored-477-failure"] += 1
+                raise RuntimeError("stored-477 outcome: " + outcome)
         if h in self.replay and self.replay[h].get("failed"):
             # The 477 run already got a non-candidate for this very prompt (e.g. a placeholder
             # violation after a multi-minute generation). Deterministic backend: not regenerated.
@@ -290,6 +298,11 @@ def run_pr(pair, pr, backend, sample_keys):
     def src_text(rev, path):
         return sgit("show", f"{rev}:{path}") if rev and path else None
 
+    old_rows = {}
+    if Path(a.old_results).exists():
+        for l in open(a.old_results):
+            if f'/{pr}/' in l[:200]:
+                r = json.loads(l); old_rows[r["sap"]] = r
     # ---- attempt 1 for every SAP; regions for every function of every SAP
     units, regions, missing = [], [], []
     t_gen = time.time()
@@ -315,6 +328,8 @@ def run_pr(pair, pr, backend, sample_keys):
                 old_source_file=old_path.get(sap["source_file"]),
                 after_span=cc.locate(at, head_src) if head_src else None,
                 before_span=cc.locate(bt, base_src) if base_src else None, after_text=at, before_text=bt))
+        o = old_rows.get(name, {})
+        backend.expected = list(zip(o.get("unit_outcomes") or [], o.get("prompt_chars") or []))
         try:
             res = run_case(sdir, manifest, backend)          # attempt 1: the normal pipeline, unchanged
         except Exception as exc:
@@ -340,6 +355,7 @@ def run_pr(pair, pr, backend, sample_keys):
                         expand=expand, expected_placeholders=_expected_placeholders(u.context),
                         is_test="/src/test/" in sap["target_file"])
             st.art = art; units.append(st); srow["units"].append(key)
+        backend.expected = []
     row["attempt1_generation"] = {"seconds": round(time.time() - t_gen, 1), "sources": dict(backend.sources)}
     region_of = {r.key: r for r in regions}
     by_key = {u.key: u for u in units}
