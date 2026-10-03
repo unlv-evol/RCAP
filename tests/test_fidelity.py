@@ -108,3 +108,10 @@ def test_invented_code_is_partial():
     cand = "void f() {\n    a();\n    b();\n    if (flag) { reset(counter, other); }\n}\n"
     f = judge(before, cand, before, after)
     assert f.label == PARTIAL and any("novel share" in r for r in f.reasons)
+
+
+def test_comment_only_upstream_change_is_no_change_with_reason():
+    before = "void f() {\n    // a the b\n    a();\n}\n"
+    after = "void f() {\n    // a b\n    a();\n}\n"
+    f = judge(before, after, before, after)
+    assert f.label == NO_CHANGE and "comment/layout-only" in f.reasons[0]

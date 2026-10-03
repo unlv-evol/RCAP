@@ -263,6 +263,9 @@ def judge(fork_original: str, candidate: str, upstream_before: str, upstream_aft
     tf, tc = tokens(fork_original), tokens(candidate)
     tb, ta = tokens(upstream_before), tokens(upstream_after)
     if tf == tc:
+        if tb == ta:
+            # upstream changes only comments / layout here, and so does (or not) the candidate
+            return Fidelity(NO_CHANGE, reasons=["comment/layout-only: upstream changes no code token in this unit either"])
         return Fidelity(NO_CHANGE, recall=0.0, reasons=["candidate is the fork's code"])
     up_add, up_rem = (_significant(x) for x in _delta(tb, ta))
     c_add, c_rem = (_significant(x) for x in _delta(tf, tc))
