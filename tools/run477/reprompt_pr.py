@@ -18,7 +18,7 @@ recorded as missing siblings. A deterministic pre-check (rcap.cochange) classifi
 NEEDS_COCHANGE, without a model call, when a name it cannot resolve is introduced by the upstream
 PR outside the unit and that co-change is not applied.
 
-  reprompt_pr.py --sample sample.json --salp-out DIR --fork DIR --baseline baseline-tests.json
+  reprompt_pr.py --sample sample.json (a SAP list, or {"pair", "prs"}) --salp-out DIR --fork DIR --baseline baseline-tests.json
                  --repo-cache DIR --out-dir DIR --tag k10 [--k 10] [--mech-hunks] [--only PR-N]
 
 One JSON row per PR in <out-dir>/<tag>/pr-results.jsonl; prompts/candidates under
@@ -55,11 +55,12 @@ ap.add_argument("--mech-hunks", action="store_true",
 ap.add_argument("--gradle-bin-file", default=str(RUN / "validate/gradle_bin.txt"))
 ap.add_argument("--old-candidates", default=str(RUN / "validate/candidates"))
 ap.add_argument("--old-results", default=str(RUN / "results-477-v2.jsonl"))
+ap.add_argument("--gen-cache", help="generation cache dir (default: <out-dir>/gen-cache); share it across rounds")
 ap.add_argument("--only", action="append"); ap.add_argument("--limit", type=int)
 a = ap.parse_args()
 
 FORK = Path(a.fork).resolve(); OUTD = Path(a.out_dir).resolve() / a.tag; OUT = OUTD / "pr-results.jsonl"
-GENCACHE = Path(a.out_dir).resolve() / "gen-cache"; GENCACHE.mkdir(parents=True, exist_ok=True)
+GENCACHE = Path(a.gen_cache).resolve() if a.gen_cache else Path(a.out_dir).resolve() / "gen-cache"; GENCACHE.mkdir(parents=True, exist_ok=True)
 SRC = Path(a.repo_cache).resolve() / a.source_repo
 GRADLE = Path(a.gradle_bin_file).read_text().strip()
 BASE = Path(a.baseline); baseline = json.loads(BASE.read_text()) if BASE.exists() else {}
@@ -670,6 +671,9 @@ def run_pr(pair, pr, backend, sample_keys):
 
 # ------------------------------------------------------------------ main
 sample = json.loads(Path(a.sample).read_text())
+if isinstance(sample, dict):
+    # a PR sample ({"pair": ..., "prs": [...]}, round 3): every SAP of each PR, in the drawn order
+    sample = [{"new_dir": f"{sample['pair']}/PR-{p}", "old_key": f"{sample['pair']}/PR-{p}"} for p in sample["prs"]]
 prs = collections.OrderedDict()
 for s in sample:
     pair, pr = s["new_dir"].split("/")[:2]
