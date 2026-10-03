@@ -130,3 +130,9 @@ def test_unrelated_edit_is_partial_and_says_so():
     cand = "import a.{b}\nput(K, \"y\")\n"
     f = judge(before, cand, before, after)
     assert f.label == PARTIAL and f.reasons[0].startswith("UNRELATED")
+
+
+def test_excerpts_with_hunk_headers_and_cut_comments():
+    before = "@@ -1,3 +1,3 @@ class A\n  /**\n   * a the b\n\n@@ -9,3 +9,3 @@ class A\n   * x a y\n   */\n  def f() = 1\n"
+    after = before.replace("a the b", "a b").replace("x a y", "x an y")
+    assert tokens(before) == tokens(after) == ["def", "f", "(", ")", "=", "1"]

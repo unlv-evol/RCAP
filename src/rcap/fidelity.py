@@ -43,13 +43,15 @@ RECALL_FAITHFUL = 0.9
 EXTRA_FAITHFUL = 0.2
 
 _TOKEN = re.compile(r'''
-    (?P<comment>//[^\n]*|/\*.*?\*/)
+    (?P<comment>//[^\n]*|/\*.*?(?:\*/|\Z))
   | (?P<string>"""(?:.|\n)*?"""|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])')
   | (?P<number>\b\d[\w.]*(?:[eE][+-]?\d+)?[fFdDlL]?)
   | (?P<ident>[A-Za-z_$][\w$]*)
   | (?P<op>->|=>|::|<<=|>>>=|>>=|<=|>=|==|!=|&&|\|\||\+\+|--|[-+*/%&|^]=|<-|.)
 ''', re.DOTALL | re.VERBOSE)
 _PUNCT = frozenset("(){}[];,.@")
+# SAP unit texts made of diff excerpts separate them with hunk headers
+_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@[^\n]*$", re.MULTILINE)
 _ASSERT_NAME = re.compile(r"^(?:assert\w*|expect\w*|fail|intercept|verify)$")
 _CONST = re.compile(r"^[A-Z][A-Z0-9_]*[A-Z0-9]$")
 _LITERAL_WORDS = frozenset({"true", "false", "null"})
@@ -58,8 +60,15 @@ _LITERAL_WORDS = frozenset({"true", "false", "null"})
 def tokens(code: str) -> list[str]:
     """Code tokens, comments dropped, `X . class` folded into `X.class`."""
     out: list[str] = []
-    code = code or ""
-    # a unit's text may start inside a doc comment (its region begins below the `/**`)
+    for seg in _HUNK_HEADER.split(code or ""):
+        out += _segment_tokens(seg)
+    return out
+
+
+def _segment_tokens(code: str) -> list[str]:
+    out: list[str] = []
+    # an excerpt may start inside a doc comment (its region begins below the `/**`) and end
+    # inside one (an unterminated `/*` runs to the end: see _TOKEN)
     close, open_ = code.find("*/"), code.find("/*")
     if close >= 0 and (open_ < 0 or close < open_):
         code = code[close + 2:]
