@@ -305,6 +305,9 @@ def judge(fork_original: str, candidate: str, upstream_before: str, upstream_aft
         return f
     if recall is None:
         f.reasons.append("upstream changes no code token in this unit (comment/layout only, or already in the fork)")
+    elif recall == 0 and c_add and extra_share == 1.0:
+        f.reasons.append("UNRELATED: the candidate's change shares no token with the upstream change "
+                         f"(adds {' '.join(f.extra_tokens[:8])}; upstream needs {' '.join(f.missing_tokens[:8])})")
     elif recall < RECALL_FAITHFUL:
         f.reasons.append(f"recall {recall} < {RECALL_FAITHFUL}: missing {' '.join(f.missing_tokens[:12])}")
     if novel_share > EXTRA_FAITHFUL:

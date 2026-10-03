@@ -122,3 +122,11 @@ def test_text_starting_inside_a_doc_comment():
     after = "   * a b\n   */\n  def f(): Unit = g()\n"
     assert tokens(before) == tokens(after)
     assert judge(before, after, before, after).label == NO_CHANGE
+
+
+def test_unrelated_edit_is_partial_and_says_so():
+    before = "import a.{b}\nput(K, \"x\")\n"
+    after = "import a.{b, c}\nput(K, \"x\")\n"
+    cand = "import a.{b}\nput(K, \"y\")\n"
+    f = judge(before, cand, before, after)
+    assert f.label == PARTIAL and f.reasons[0].startswith("UNRELATED")
