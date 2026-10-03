@@ -115,3 +115,10 @@ def test_comment_only_upstream_change_is_no_change_with_reason():
     after = "void f() {\n    // a b\n    a();\n}\n"
     f = judge(before, after, before, after)
     assert f.label == NO_CHANGE and "comment/layout-only" in f.reasons[0]
+
+
+def test_text_starting_inside_a_doc_comment():
+    before = "   * a the b\n   */\n  def f(): Unit = g()\n"
+    after = "   * a b\n   */\n  def f(): Unit = g()\n"
+    assert tokens(before) == tokens(after)
+    assert judge(before, after, before, after).label == NO_CHANGE

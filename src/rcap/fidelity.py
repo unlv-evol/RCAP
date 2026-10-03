@@ -58,7 +58,12 @@ _LITERAL_WORDS = frozenset({"true", "false", "null"})
 def tokens(code: str) -> list[str]:
     """Code tokens, comments dropped, `X . class` folded into `X.class`."""
     out: list[str] = []
-    for m in _TOKEN.finditer(code or ""):
+    code = code or ""
+    # a unit's text may start inside a doc comment (its region begins below the `/**`)
+    close, open_ = code.find("*/"), code.find("/*")
+    if close >= 0 and (open_ < 0 or close < open_):
+        code = code[close + 2:]
+    for m in _TOKEN.finditer(code):
         kind = m.lastgroup
         if kind == "comment":
             continue
