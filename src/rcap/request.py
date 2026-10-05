@@ -81,6 +81,59 @@ REPAIR_INSTRUCTIONS = (
     "block, with no commentary."
 )
 
+# Placeholder repair (one retry, opt-in). The original request is kept verbatim
+# and a single section is appended, so everything the first request said still
+# holds and the only new information is what was wrong with the placeholders.
+PLACEHOLDER_REPAIR_TEMPLATE_ID = "rcap-placeholder-repair-v1"
+PLACEHOLDER_REPAIR_TEMPLATE_VERSION = "1"
+
+
+def synthesize_placeholder_repair(request: "AdaptationRequest", expected: list[str],
+                                  report: dict[str, list[str]]) -> "AdaptationRequest":
+    """The retry request for an answer rejected for its placeholder comments.
+
+    `expected`: the placeholder comments of the target function; they are
+    listed in the order they stand in the request. `report`: `missing`,
+    `duplicated`, `unknown` as rcap.generate.placeholder_report names them."""
+    ordered = sorted(expected, key=lambda ph: (request.prompt.rfind(ph) < 0, request.prompt.rfind(ph)))
+    lines = ["## Placeholder check FAILED on your previous answer",
+             "Your previous answer to this exact request was rejected automatically, before it "
+             "was built, because of its placeholder comments:"]
+    if report.get("missing"):
+        lines.append("- missing (must appear, but was absent): " + ", ".join(report["missing"]))
+    if report.get("duplicated"):
+        lines.append("- appeared more than once (must appear exactly once): "
+                     + ", ".join(report["duplicated"]))
+    if report.get("unknown"):
+        lines.append("- not a placeholder of the target function (you must not write it): "
+                     + ", ".join(report["unknown"]))
+    if ordered:
+        lines.append(f"The target function contains exactly {len(ordered)} placeholder comment(s), "
+                     "in this order:")
+        lines += [f"  {ph}" for ph in ordered]
+        lines.append(
+            "Answer the request again, applying the same change. Your answer must contain each of "
+            "these comments exactly once, character for character, at the place where it stands in "
+            "the target function, and no other /* RCAP_PH_... */ comment.")
+    else:
+        lines.append("The target function contains no placeholder comment. Answer the request "
+                     "again, applying the same change; your answer must contain no "
+                     "/* RCAP_PH_... */ comment at all.")
+    lines.append(
+        "A placeholder stands for code that is still there: do not delete it, do not write the "
+        "code it stands for, and do not replace any other code with a placeholder.")
+    lines.append(f"Return ONLY the complete adapted target function in one ```{request.language} "
+                 "code block, with no commentary.")
+    prompt = request.prompt + "\n" + "\n".join(lines) + "\n"
+    request_hash = hashlib.sha256(
+        f"{PLACEHOLDER_REPAIR_TEMPLATE_ID}:{PLACEHOLDER_REPAIR_TEMPLATE_VERSION}\n{prompt}"
+        .encode()).hexdigest()
+    return AdaptationRequest(case_id=request.case_id, language=request.language,
+                             template_id=PLACEHOLDER_REPAIR_TEMPLATE_ID,
+                             template_version=PLACEHOLDER_REPAIR_TEMPLATE_VERSION,
+                             prompt=prompt, request_hash=request_hash)
+
+
 _FEEDBACK_HEADINGS = {
     "build": "## Compiler diagnostics for the previous attempt",
     "test": "## Test failures with the previous attempt applied",

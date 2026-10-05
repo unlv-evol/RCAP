@@ -11,7 +11,7 @@ from __future__ import annotations
 from rcap.config import ExecutionConfig
 from rcap.context import AdaptationContext, build_context
 from rcap.coupling import CouplingRecord, detect_units
-from rcap.generate import Backend, generate
+from rcap.generate import Backend, generate, generate_with_placeholder_retry
 from rcap.intake import load_case
 from rcap.materialize import materialize
 from rcap.package import AdaptationPackage, build_package
@@ -29,6 +29,8 @@ class UnitResult:
         self.context = context
         self.request = request
         self.generation = generation
+        # Set only when the opt-in placeholder retry was issued for this unit.
+        self.placeholder_retry: dict[str, object] | None = None
 
 
 class CaseResult:
@@ -49,7 +51,12 @@ def _expected_placeholders(context: AdaptationContext) -> set[str]:
 def run_case(
     sap_dir, pr_manifest: dict | None, backend: Backend,
     config: ExecutionConfig | None = None,
+    *, placeholder_retry: bool = False,
 ) -> CaseResult:
+    """`placeholder_retry` (default OFF): when a unit's answer is rejected for
+    its placeholder comments, issue ONE targeted repair request
+    (rcap.generate.generate_with_placeholder_retry). Off, the requests and
+    outcomes are exactly those of the plain pipeline."""
     config = config or ExecutionConfig()
     semantic_on = config.mode.semantic_reduction
     program_on = config.mode.program_reduction
@@ -106,8 +113,13 @@ def run_case(
         raise
 
     for ur in unit_results:
-        ur.generation = generate(ur.request, backend,
-                                 expected_placeholders=_expected_placeholders(ur.context))
+        if placeholder_retry:
+            ur.generation, ur.placeholder_retry = generate_with_placeholder_retry(
+                ur.request, backend,
+                expected_placeholders=_expected_placeholders(ur.context))
+        else:
+            ur.generation = generate(ur.request, backend,
+                                     expected_placeholders=_expected_placeholders(ur.context))
 
     package: AdaptationPackage | None = None
     if all(ur.generation.outcome == "completion" for ur in unit_results):

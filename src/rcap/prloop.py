@@ -37,7 +37,13 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 
 from rcap.context import AdaptationContext
-from rcap.generate import Backend, GenerationRecord, effective_limit_chars, generate
+from rcap.generate import (
+    Backend,
+    GenerationRecord,
+    effective_limit_chars,
+    generate,
+    has_placeholder_leak,
+)
 from rcap.reprompt import (
     _STOP_FOR_OUTCOME,
     DEFAULT_K,
@@ -169,7 +175,14 @@ def run_pr_loop(
         if on_attempt:
             on_attempt(u, 1, {"prompt": u.request.prompt, "candidate_raw": u.raw,
                               "candidate_expanded": u.expanded})
-        if is_echo(u.expanded, u.target_original):
+        if has_placeholder_leak(u.expanded):
+            # A placeholder marker survives expansion: it would be written into
+            # the fork as a stray comment. Never applied, and never an "echo".
+            u.status, u.reason = "not_applied", "placeholder_leak"
+            row["placeholder_leak"] = True
+            row["verdicts"].append({"round": 1, "verdict": "PLACEHOLDER_LEAK"})
+            u.last_verdict = u.round1_verdict = "PLACEHOLDER_LEAK"
+        elif is_echo(u.expanded, u.target_original):
             # Nothing to apply: the attempt-1 answer is the fork's own code.
             u.status, u.reason = "not_applied", "echo_attempt1"
             row["echo"] = True
@@ -336,6 +349,13 @@ def run_pr_loop(
                     actions.append({"unit": u.key, "action": "dropped", "reason": reason})
                     break
                 assert expanded is not None
+                if has_placeholder_leak(expanded):
+                    arow["placeholder_leak"] = True
+                    arow["verdicts"].append({"round": rnd, "verdict": "PLACEHOLDER_LEAK"})  # type: ignore[union-attr]
+                    drop(u, "placeholder_leak", rnd)
+                    actions.append({"unit": u.key, "action": "dropped",
+                                    "reason": "placeholder_leak"})
+                    break
                 if is_echo(expanded, u.target_original):
                     u.echoes += 1
                     arow["echo"] = True

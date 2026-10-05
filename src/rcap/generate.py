@@ -22,8 +22,37 @@ from rcap.request import AdaptationRequest
 
 _CODE_BLOCK = re.compile(r"```[A-Za-z0-9_+-]*\s*\n(.*?)```", re.DOTALL)
 _PH = re.compile(r"/\* RCAP_PH_[^*]+\*/")
+# Any mention of the placeholder prefix, however it is written (`/*RCAP_PH_1*/`,
+# `// RCAP_PH_1`): outside the exact comment form it is still a leak.
+_PH_ANY = re.compile(r"RCAP_PH_[\w.]*")
 # Typed refusal (repair requests only): `CANNOT_ADAPT: needs <symbol> from <file>`.
 _DECLINE = re.compile(r"^[\s`*>-]*CANNOT_ADAPT\b\s*:?\s*(.*?)[\s`*]*$", re.MULTILINE)
+
+
+def placeholder_report(candidate: str, expected: set[str]) -> dict[str, list[str]]:
+    """How a candidate handles its placeholder comments.
+
+    `missing`: expected, absent. `duplicated`: expected, more than once (only
+    the first is expanded; the others would stay in the fork as comments).
+    `unknown`: placeholder comments the target does not have (invented), and
+    mentions of the prefix that are not a well-formed placeholder comment."""
+    got = _PH.findall(candidate)
+    counts: dict[str, int] = {}
+    for g in got:
+        counts[g] = counts.get(g, 0) + 1
+    unknown = sorted(set(counts) - expected)
+    loose = len(_PH_ANY.findall(candidate)) - len(got)
+    if loose > 0:
+        unknown.append(f"{loose} malformed mention(s) of RCAP_PH_")
+    return {"missing": sorted(expected - set(counts)),
+            "duplicated": sorted(g for g, n in counts.items() if n > 1 and g in expected),
+            "unknown": unknown}
+
+
+def has_placeholder_leak(text: str | None) -> bool:
+    """A placeholder marker in text that is about to be written into the fork
+    (i.e. AFTER expansion) is never acceptable."""
+    return bool(text) and "RCAP_PH_" in text
 
 
 class Backend(Protocol):
@@ -195,10 +224,61 @@ def generate(request: AdaptationRequest, backend: Backend,
         return record("unparseable", diag=[diag])
 
     if expected_placeholders is not None:
-        got = set(_PH.findall(candidate))
-        missing = expected_placeholders - got
-        if missing:
+        report = placeholder_report(candidate, expected_placeholders)
+        if report["missing"]:
+            # wording unchanged since the 477 run, so stored outcomes stay comparable
             return record("placeholder_violation",
-                          diag=[f"missing placeholders: {sorted(missing)}"])
+                          diag=[f"missing placeholders: {report['missing']}"])
+        if report["duplicated"] or report["unknown"]:
+            # A hard rejection: an unknown or repeated placeholder is not
+            # expanded and would be written into the fork as a stray comment
+            # (or stand where the model deleted code).
+            return record("placeholder_violation", diag=[
+                f"{kind} placeholders: {report[kind]}"
+                for kind in ("duplicated", "unknown") if report[kind]])
 
     return record("completion", candidate)
+
+
+def generate_with_placeholder_retry(
+    request: AdaptationRequest, backend: Backend, *,
+    expected_placeholders: set[str] | None = None,
+) -> tuple[GenerationRecord, dict[str, object] | None]:
+    """`generate`, plus ONE targeted retry when the answer is rejected only for
+    its placeholders.
+
+    The retry is a new single-turn request: the original request followed by
+    the exact list of what was wrong (missing / duplicated / unknown) and the
+    rule (each original placeholder exactly once, no new one). It is issued
+    once; if its answer is anything but a completion the ORIGINAL refusal is
+    returned unchanged. Returns (record, retry info or None when no retry was
+    issued). Deterministic given a deterministic backend."""
+    from rcap.request import synthesize_placeholder_repair
+
+    first = generate(request, backend, expected_placeholders=expected_placeholders)
+    if first.outcome != "placeholder_violation" or expected_placeholders is None:
+        return first, None
+    report = _report_from_diagnostics(first.diagnostics, expected_placeholders)
+    repair = synthesize_placeholder_repair(request, sorted(expected_placeholders), report)
+    second = generate(repair, backend, expected_placeholders=expected_placeholders)
+    info: dict[str, object] = {
+        "template_id": repair.template_id, "request_hash": repair.request_hash,
+        "prompt_chars": len(repair.prompt), "first_diagnostics": list(first.diagnostics),
+        "report": report, "retry_outcome": second.outcome,
+        "retry_diagnostics": list(second.diagnostics), "retry_usage": dict(second.usage),
+        "fixed": second.outcome == "completion",
+    }
+    return (second if second.outcome == "completion" else first), info
+
+
+def _report_from_diagnostics(diags: list[str], expected: set[str]) -> dict[str, list[str]]:
+    """The violation lists as `generate` recorded them (the record keeps no
+    candidate for a rejected answer)."""
+    import ast
+
+    out: dict[str, list[str]] = {"missing": [], "duplicated": [], "unknown": []}
+    for d in diags:
+        m = re.match(r"^(missing|duplicated|unknown) placeholders: (\[.*\])$", d)
+        if m:
+            out[m.group(1)] = list(ast.literal_eval(m.group(2)))
+    return out
