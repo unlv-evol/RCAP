@@ -112,3 +112,12 @@ def test_spans_in_the_merged_text_follow_the_edits():
     assert lines[first - 1].strip() == "int a() {" and last - first == 3
     hl = r.hunk_lines()
     assert [o for _, _, o in hl] == [["a"], ["b"]] and lines[hl[1][0] - 1].strip() == "return 20;"
+
+
+def test_priority_beats_specificity():
+    # a small mechanical hunk (priority -1) never overrides the unit that contains it
+    mech = UnitEdit("mech", "        return 2;\n", "        return 222;\n", priority=-1)
+    unit = UnitEdit("unit", B, B.replace("return 2", "return 20"))
+    r = merge_units(FILE, [mech, unit])
+    assert "return 20;" in r.text and "222" not in r.text
+    assert r.units["mech"].status == CONFLICT and r.units["mech"].lost[0]["lost_to"] == ["unit"]

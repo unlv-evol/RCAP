@@ -43,6 +43,10 @@ class UnitEdit:
     key: str
     original: str
     candidate: str
+    # Higher wins a conflict regardless of span size. The PR-level driver gives
+    # mechanically applied upstream hunks -1: a unit the model ported
+    # deliberately is never overridden by text nobody adapted.
+    priority: int = 0
 
 
 @dataclass
@@ -171,7 +175,8 @@ def merge_units(original: str, edits: Sequence[UnitEdit]) -> MergeResult:
         units[e.key] = um
 
     # most specific unit first: its hunks are accepted before an enclosing unit's
-    ranked = sorted(hunks, key=lambda k: (units[k].span[1] - units[k].span[0], order[k]))
+    prio = {e.key: e.priority for e in edits}
+    ranked = sorted(hunks, key=lambda k: (-prio[k], units[k].span[1] - units[k].span[0], order[k]))
     accepted: list[Hunk] = []
     for key in ranked:
         um = units[key]
@@ -198,7 +203,7 @@ def merge_units(original: str, edits: Sequence[UnitEdit]) -> MergeResult:
             um.status = CONFLICT
             um.reason = (f"{len(um.lost)} of {um.hunks} hunk(s) left out: they change text that "
                          f"{', '.join(sorted({w for x in um.lost for w in x['lost_to']}))} "
-                         "(a more specific unit) changes differently")
+                         "(a more specific or higher-priority change) changes differently")
 
     accepted.sort(key=lambda h: (h.start, h.end))
     parts: list[str] = []
