@@ -289,6 +289,7 @@ def _assertion_check(fork: str, cand: str, before: str, after: str) -> tuple[lis
 
 
 _IDENT_TOKEN = re.compile(r"^[A-Za-z_$][\w$]*$")
+_NEAR = 3              # code tokens on each side within which an upstream rewrite exempts a fork-only token
 _MOVE_WINDOW = 12      # tokens around a rewritten block in which a fork-only token counts as kept
 
 
@@ -340,7 +341,7 @@ def fork_regressions(fork_original: str, candidate: str, upstream_before: str,
     side of the upstream change. It must stay where it is (or at least inside
     the block that replaces its surroundings) unless upstream itself deletes or
     rewrites the code it sits in: the before-tokens the fork-only run replaces,
-    or the nearest code token before or after it. An upstream INSERTION next to
+    or one of the `_NEAR` code tokens before or after it. An upstream INSERTION next to
     it is not an exemption: the port has to keep both. The exemption is
     deliberately wide (precision over recall): a displaced fork token right next
     to a token upstream rewrites is not reported."""
@@ -364,9 +365,9 @@ def fork_regressions(fork_original: str, candidate: str, upstream_before: str,
             continue
         inner = any(changed_b[j] for j in range(j1, j2))
         # nearest code tokens around it (punctuation aligns too freely to mean anything)
-        left = next((j for j in range(j1 - 1, -1, -1) if tb[j] not in _PUNCT), None)
-        right = next((j for j in range(j2, len(tb)) if tb[j] not in _PUNCT), None)
-        around = (left is not None and changed_b[left]) or (right is not None and changed_b[right])
+        left = [j for j in range(j1 - 1, -1, -1) if tb[j] not in _PUNCT][:_NEAR]
+        right = [j for j in range(j2, len(tb)) if tb[j] not in _PUNCT][:_NEAR]
+        around = any(changed_b[j] for j in left + right)
         if inner or around:
             exempt.update(range(i1, i2))
     out: list[str] = []

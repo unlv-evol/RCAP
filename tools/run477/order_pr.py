@@ -60,7 +60,7 @@ ap.add_argument("--old-candidates", default=str(RUN / "validate/candidates"))
 ap.add_argument("--old-results", default=str(RUN / "results-477-v2.jsonl"))
 ap.add_argument("--gen-cache", required=True); ap.add_argument("--gen-cache-ro", action="append", default=[])
 ap.add_argument("--only", action="append"); ap.add_argument("--limit", type=int)
-ap.add_argument("--max-bisect", type=int, default=6)
+ap.add_argument("--max-bisect", type=int, default=10)
 ap.add_argument("--plan-only", action="store_true", help="stop after the dependency graph: no build, no test")
 a = ap.parse_args()
 
@@ -392,6 +392,19 @@ def run_pr(pair, pr, backend):
         for p in touched:
             if p not in tracked and (FORK / p).exists(): (FORK / p).unlink()
 
+    _decl = {}
+    def decl_names(m):
+        """Names a change declares OR un-declares (its own signature, added and removed lines): an error
+        elsewhere that cannot resolve or apply one of them is charged to this change, not to its whole file."""
+        if m not in _decl:
+            if m in units:
+                u = units[m]
+                lines = [u.target_original.split("{")[0].replace("\n", " "), u.expanded.split("{")[0].replace("\n", " ")] \
+                    + po.added_lines(u.target_original, u.expanded) + po.added_lines(u.expanded, u.target_original)
+            else: lines = mech[m]["added"] + mech[m]["removed"]
+            _decl[m] = tuple(dict.fromkeys(cc.declared_names(lines)))
+        return _decl[m]
+
     merge_log = {}
     def apply_state(gids):
         """Write the state; -> (spans by file, sources, per-member merge record)."""
@@ -421,9 +434,7 @@ def run_pr(pair, pr, backend):
                         merge_log.setdefault("imports", {})[path] = fx.as_dict()
             sh = lambda n: n + sum(1 for x in shift_at if x <= n)  # noqa: E731
             (FORK / path).write_text(text, encoding="utf-8"); sources[path] = text
-            names = {m: tuple(dict.fromkeys(cc.declared_names(
-                [units[m].target_original.split("{")[0].replace("\n", " "), units[m].expanded.split("{")[0].replace("\n", " ")] if m in units else mech[m]["added"])))
-                for m in ms}
+            names = {m: decl_names(m) for m in ms}
             for first, last, owners in mr.hunk_lines():   # the changed lines themselves, most specific owner first
                 for o in owners[:1]: spans[path].append(Span(o, sh(first), sh(last), "unit" if o in units else "mech", names[o]))
             for m in sorted((m for m in ms if mr.units[m].new_span), key=lambda m: mr.units[m].new_span[1] - mr.units[m].new_span[0]):
@@ -449,7 +460,13 @@ def run_pr(pair, pr, backend):
         if rc == "timeout": return False, {}, ["build timeout"], rec
         errors = attribute_errors(parse_compile_errors(log), spans, root=str(FORK), sources=sources)
         charged, unattr = {}, []
+        live_members = [m for gid in gids for m in by_id[gid].ids]
         for e in errors:
+            if not e.keys:
+                # no span, name, file or owner: charge the changes that (un)declare a name the message mentions
+                said = set(re.findall(r"[A-Za-z_$][\w$]*", e.message + " " + " ".join(getattr(e, "body", None) or [])))
+                hit = sorted(m for m in live_members if said & set(decl_names(m)))
+                if hit: e.keys, e.how = hit, "message-name"
             line = f"{e.rel}:{e.line}: {e.message} ({e.how})"
             if not e.keys: unattr.append(line)
             for k in e.keys: charged.setdefault(gid_of(k), line[:300])
