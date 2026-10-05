@@ -20,6 +20,18 @@ WEAKENED   an expectation (assertion / expected exception / literal inside an
            (fork original / upstream before) or a value present in neither; or an
            assertion that upstream keeps was removed;
 NO_CHANGE  the candidate is the fork's code (comments and layout ignored).
+PLACEHOLDER_LEAK  the candidate carries an `RCAP_PH_` marker into the fork. Checked
+           first: comments are otherwise ignored, so a candidate that only adds a stray
+           placeholder comment used to look like NO_CHANGE.
+FORK_REGRESSION  a fork-only token (in the fork's original unit, in neither side of the
+           upstream change) was removed or replaced although upstream does not change
+           the code it sits in: the port displaced fork code. Token overlap cannot see
+           this (every token may exist upstream or in the fork), so it is positional.
+NOTHING_TO_PORT / NOTHING_TO_PORT_IN_ISOLATION  the upstream change of this unit is a
+           pure rename of names declared outside the unit, and the candidate keeps the
+           fork's names. Validated alone (or when the rename cannot be completed across
+           the PR) the unchanged function is the correct answer, not an echo. Only
+           given when the caller says so (`rename_context`).
 
 Pure text processing: comments are ignored, string literals are single tokens,
 punctuation does not count in the token shares. Mechanically applied hunks are
@@ -30,7 +42,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
@@ -38,6 +50,10 @@ FAITHFUL = "FAITHFUL"
 PARTIAL = "PARTIAL"
 WEAKENED = "WEAKENED"
 NO_CHANGE = "NO_CHANGE"
+PLACEHOLDER_LEAK = "PLACEHOLDER_LEAK"
+FORK_REGRESSION = "FORK_REGRESSION"
+NOTHING_TO_PORT = "NOTHING_TO_PORT"
+NOTHING_TO_PORT_IN_ISOLATION = "NOTHING_TO_PORT_IN_ISOLATION"
 
 RECALL_FAITHFUL = 0.9
 EXTRA_FAITHFUL = 0.2
@@ -272,14 +288,132 @@ def _assertion_check(fork: str, cand: str, before: str, after: str) -> tuple[lis
     return list(dict.fromkeys(weak)), list(dict.fromkeys(notes))
 
 
-def judge(fork_original: str, candidate: str, upstream_before: str, upstream_after: str) -> Fidelity:
-    """Fidelity of `candidate` (a port of upstream_before -> upstream_after onto fork_original)."""
+_IDENT_TOKEN = re.compile(r"^[A-Za-z_$][\w$]*$")
+_MOVE_WINDOW = 12      # tokens around a rewritten block in which a fork-only token counts as kept
+
+
+def pure_rename(upstream_before: str, upstream_after: str) -> list[tuple[str, str]] | None:
+    """[(old, new)] when the upstream change of a unit is nothing but a consistent
+    renaming of identifiers (same token sequence otherwise), else None."""
+    tb, ta = tokens(upstream_before), tokens(upstream_after)
+    if len(tb) != len(ta) or tb == ta:
+        return None
+    fwd: dict[str, str] = {}
+    for b, a in zip(tb, ta):
+        if b == a:
+            continue
+        if not (_IDENT_TOKEN.match(b) and _IDENT_TOKEN.match(a)) or fwd.setdefault(b, a) != a:
+            return None
+    if len(set(fwd.values())) != len(fwd):
+        return None
+    # consistent: an old name that is renamed is renamed everywhere
+    if any(b in fwd and a == b for b, a in zip(tb, ta)):
+        return None
+    return sorted(fwd.items())
+
+
+def declared_locally(code: str, name: str) -> bool:
+    """Is `name` a local variable, parameter or lambda parameter of this unit
+    (as opposed to the unit's own name or a name declared elsewhere)?"""
+    ts = tokens(code)
+    for i, t in enumerate(ts):
+        if t != name:
+            continue
+        nxt = ts[i + 1] if i + 1 < len(ts) else ""
+        prev = ts[i - 1] if i else ""
+        if nxt in ("->", "=>"):
+            return True
+        if prev in ("val", "var") or (nxt == ":" and prev in ("(", ",")):
+            return True                        # Scala local / parameter
+        if nxt in ("=", ";", ",", ")", ":") and (
+                _IDENT_TOKEN.match(prev) or prev in (">", "]")) \
+                and prev not in ("return", "new", "throw", "case", "else"):
+            return True                        # Java `Type name` (local or parameter)
+    return False
+
+
+def fork_regressions(fork_original: str, candidate: str, upstream_before: str,
+                     upstream_after: str) -> list[str]:
+    """Evidence lines for fork-only code the candidate displaced.
+
+    A token is fork-only when it is in the fork's original unit and on neither
+    side of the upstream change. It must stay where it is (or at least inside
+    the block that replaces its surroundings) unless upstream itself deletes or
+    rewrites the code it sits in: the before-tokens the fork-only run replaces,
+    or the nearest code token before or after it. An upstream INSERTION next to
+    it is not an exemption: the port has to keep both. The exemption is
+    deliberately wide (precision over recall): a displaced fork token right next
+    to a token upstream rewrites is not reported."""
+    tf, tc = tokens(fork_original), tokens(candidate)
+    tb, ta = tokens(upstream_before), tokens(upstream_after)
+    if not tb or tf == tc:
+        return []
+    vocab = set(tb) | set(ta)
+    fork_only = {i for i, t in enumerate(tf) if t not in vocab and t not in _PUNCT
+                 and (_IDENT_TOKEN.match(t) or t[:1] in "\"'" or t[:1].isdigit())}
+    if not fork_only:
+        return []
+    changed_b = [False] * (len(tb) + 1)
+    for op, i1, i2, _, _ in SequenceMatcher(None, tb, ta, autojunk=False).get_opcodes():
+        if op in ("replace", "delete"):
+            for i in range(i1, i2):
+                changed_b[i] = True
+    exempt: set[int] = set()
+    for op, i1, i2, j1, j2 in SequenceMatcher(None, tf, tb, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        inner = any(changed_b[j] for j in range(j1, j2))
+        # nearest code tokens around it (punctuation aligns too freely to mean anything)
+        left = next((j for j in range(j1 - 1, -1, -1) if tb[j] not in _PUNCT), None)
+        right = next((j for j in range(j2, len(tb)) if tb[j] not in _PUNCT), None)
+        around = (left is not None and changed_b[left]) or (right is not None and changed_b[right])
+        if inner or around:
+            exempt.update(range(i1, i2))
+    out: list[str] = []
+    for op, i1, i2, j1, j2 in SequenceMatcher(None, tf, tc, autojunk=False).get_opcodes():
+        if op == "equal":
+            continue
+        # "still there" = anywhere in the replacing block or right around it (a moved argument)
+        block = tc[max(0, j1 - _MOVE_WINDOW):j2 + _MOVE_WINDOW]
+        lost = [tf[i] for i in range(i1, i2) if i in fork_only and i not in exempt and tf[i] not in block]
+        if not lost:
+            continue
+        out.append(
+            f"fork-only `{'`, `'.join(dict.fromkeys(lost))}` (on neither side of the upstream change) "
+            f"removed: fork `{' '.join(tf[max(0, i1 - 4):i2 + 2])}` -> candidate "
+            f"`{' '.join(tc[max(0, j1 - 4):j2 + 2])}`; upstream does not change the code around it")
+    return out
+
+
+def judge(fork_original: str, candidate: str, upstream_before: str, upstream_after: str,
+          *, rename_context: str | None = None,
+          fork_has: Callable[[str], bool] | None = None) -> Fidelity:
+    """Fidelity of `candidate` (a port of upstream_before -> upstream_after onto fork_original).
+
+    `rename_context`: "isolation" (the unit was validated alone) or "pr" (the PR's
+    rename could not be completed); only then may an unchanged unit whose upstream
+    change is a pure rename be labelled NOTHING_TO_PORT(_IN_ISOLATION). `fork_has(name)`
+    lets the caller veto that when the fork already declares the new name."""
+    if "RCAP_PH_" in (candidate or ""):
+        lines = [ln.strip()[:200] for ln in candidate.splitlines() if "RCAP_PH_" in ln]
+        return Fidelity(PLACEHOLDER_LEAK, reasons=[f"{len(lines)} line(s) carry a placeholder marker into the fork"],
+                        evidence=lines[:5])
     tf, tc = tokens(fork_original), tokens(candidate)
     tb, ta = tokens(upstream_before), tokens(upstream_after)
     if tf == tc:
         if tb == ta:
             # upstream changes only comments / layout here, and so does (or not) the candidate
             return Fidelity(NO_CHANGE, reasons=["comment/layout-only: upstream changes no code token in this unit either"])
+        pairs = pure_rename(upstream_before, upstream_after) if rename_context else None
+        if pairs and not any(declared_locally(upstream_after, new) for _, new in pairs) \
+                and not (fork_has and any(fork_has(new) for _, new in pairs)):
+            label = NOTHING_TO_PORT_IN_ISOLATION if rename_context == "isolation" else NOTHING_TO_PORT
+            shown = ", ".join(f"{o} -> {n}" for o, n in pairs)
+            return Fidelity(label, recall=0.0, reasons=[
+                f"upstream only renames {shown} (declared outside this unit); keeping the fork's "
+                "name is the correct result " + ("when the unit is validated alone" if rename_context == "isolation"
+                                                 else "because the rename is not completed in the fork")],
+                evidence=[f"rename {o} -> {n}" for o, n in pairs])
         return Fidelity(NO_CHANGE, recall=0.0, reasons=["candidate is the fork's code"])
     up_add, up_rem = (_significant(x) for x in _delta(tb, ta))
     c_add, c_rem = (_significant(x) for x in _delta(tf, tc))
@@ -311,6 +445,12 @@ def judge(fork_original: str, candidate: str, upstream_before: str, upstream_aft
     if weak:
         f.label = WEAKENED
         f.reasons.append(f"{len(weak)} weakened expectation(s)")
+        return f
+    regress = fork_regressions(fork_original, candidate, upstream_before, upstream_after)
+    if regress:
+        f.label = FORK_REGRESSION
+        f.reasons.append(f"{len(regress)} fork-only expression(s) displaced")
+        f.evidence = regress + f.evidence
         return f
     if recall is None:
         f.reasons.append("upstream changes no code token in this unit (comment/layout only, or already in the fork)")
