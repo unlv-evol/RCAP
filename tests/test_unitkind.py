@@ -252,3 +252,25 @@ def test_repair_request_of_a_whole_file_unit_speaks_of_the_file(sap_dir, pr_mani
     declined = generate(req, StubBackend("CANNOT_ADAPT: needs check from Validator.java"),
                         allow_decline=True)
     assert declined.outcome == "needs_cochange"
+
+
+def test_answer_written_past_the_context_window_is_not_a_completion(sap_dir, pr_manifest):
+    res = run_case(sap_dir, pr_manifest, StubBackend("```java\n" + F_T + "```"))
+
+    class Windowed(StubBackend):
+        params = {"num_ctx": 1000}
+        request_limit_chars = None
+        request_limit_chars_is_explicit = True
+
+        def __init__(self, response, usage):
+            super().__init__(response)
+            self.last_usage = usage
+
+    answer = "```java\n" + res.context.transformation["target"] + "```"
+    fits = generate(res.request, Windowed(answer, {"input_tokens": 300, "output_tokens": 200}),
+                    expected_placeholders=_expected_placeholders(res.context))
+    assert fits.outcome == "completion"
+    over = generate(res.request, Windowed(answer, {"input_tokens": 300, "output_tokens": 701}),
+                    expected_placeholders=_expected_placeholders(res.context))
+    assert over.outcome == "limits_exceeded" and over.candidate is None
+    assert "exceed the 1000-token window" in over.diagnostics[0]

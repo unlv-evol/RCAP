@@ -194,6 +194,18 @@ def generate(request: AdaptationRequest, backend: Backend,
                  + (", pinned at the truncation value" if pinned else "")
                  + "); the input was truncated by the runtime")])
 
+    # The same limit on the way out. The window holds the prompt AND the answer:
+    # when their sum passes it the runtime shifts the context while it is still
+    # generating (it drops part of the prompt) and keeps going, so the answer
+    # was written without the text it answers. Seen on whole-file units only
+    # (15 of 1,110 stored unit candidates of the 477 run, no function unit);
+    # e.g. a 997-line file came back 513 lines shorter.
+    out_tok = usage.get("output_tokens", 0)
+    if num_ctx and in_tok and out_tok and in_tok + out_tok > num_ctx:
+        return record("limits_exceeded", diag=[
+            (f"prompt ({in_tok} tokens) plus answer ({out_tok} tokens) exceed the {num_ctx}-token "
+             "window; the runtime shifted the context while answering")])
+
     if not raw or not raw.strip():
         return record("no_output")
 
