@@ -68,6 +68,38 @@ _TEST_METHOD = re.compile(r"@(?:Test|ParameterizedTest|RepeatedTest|TestTemplate
 _ASSERTION = re.compile(r"\b(?:assert\w*|verify\w*|fail|intercept|expectThrows)\s*[(\[{]")
 
 
+class SymbolContext(BaseModel):
+    """What ONE name the build could not resolve is, for the context-aware
+    repair request (rcap.adaptctx builds it; rcap.request renders it).
+
+    `origin`: added_by_change (declared on an added line of the same upstream
+    change, outside the unit), renamed_by_change (the change renames `old_name`
+    to it and the fork still declares `old_name`), predates_change (declared
+    in the source project before the change; absent from the fork in this
+    form), unknown (neither)."""
+
+    symbol: str
+    owner: str | None = None
+    origin: str = "unknown"
+    usage: str = ""                 # the offending source line of the previous attempt
+    upstream_file: str | None = None
+    upstream_line: int | None = None
+    upstream_text: str = ""         # definition: signature + body, or javadoc + signature
+    upstream_signature: str = ""    # declaration header only (the cut-down form)
+    upstream_complete: bool = False  # upstream_text holds the whole body
+    upstream_lines: int = 0         # length of the full definition
+    show_body: bool = True          # False once cut to the signature to fit the limit
+    old_name: str | None = None     # renamed_by_change
+    # added_by_change, body shown: what inlining it into the unit would need
+    names_checked: bool = False     # the two lists below were computed
+    missing_in_fork: list[str] = Field(default_factory=list)   # names it uses, nowhere in the fork
+    qualify: list[str] = Field(default_factory=list)  # types it uses that the unit's file does not import
+    fork_heading: str = ""          # e.g. "The fork's ApiKeys (path) declares"
+    fork_members: list[str] = Field(default_factory=list)   # fork-side signatures
+    hints: list[str] = Field(default_factory=list)          # e.g. the screen's equivalent
+    why: dict[str, object] = Field(default_factory=dict)    # recorded, not rendered
+
+
 class RepairFeedback(BaseModel):
     """What one failed attempt feeds forward into the next request."""
 
@@ -87,6 +119,9 @@ class RepairFeedback(BaseModel):
     notes: list[str] = Field(default_factory=list)   # e.g. the echo-retry note
     pr_context: bool = False     # validated with the PR's other changes applied
     context_truncated: list[str] = Field(default_factory=list)  # what was cut to fit
+    # Context-aware repair (v3 template). Empty = the v2 request, unchanged.
+    symbol_context: list[SymbolContext] = Field(default_factory=list)
+    symbol_context_omitted: int = 0
 
 
 class RepairContext(AdaptationContext):
@@ -214,6 +249,29 @@ def fit_feedback(context: AdaptationContext, feedback: RepairFeedback,
         if "cochanges" not in cut:
             cut.append("cochanges")
         ctx, request = build(feedback.model_copy(update={"context_truncated": cut}))
+    # Symbol context last among the supporting material (it is what the v3
+    # request is for): bodies are cut to their declaration first, largest
+    # first; then whole entries from the end.
+    while len(request.prompt) > limit_chars:
+        bodies = [i for i, sc in enumerate(feedback.symbol_context)
+                  if sc.show_body and sc.upstream_text and sc.upstream_signature
+                  and len(sc.upstream_text) > len(sc.upstream_signature)]
+        if not bodies:
+            break
+        i = max(bodies, key=lambda j: len(feedback.symbol_context[j].upstream_text))
+        scs = list(feedback.symbol_context)
+        scs[i] = scs[i].model_copy(update={"show_body": False})
+        feedback = feedback.model_copy(update={"symbol_context": scs})
+        if "symbol_bodies" not in cut:
+            cut.append("symbol_bodies")
+        ctx, request = build(feedback.model_copy(update={"context_truncated": cut}))
+    while len(feedback.symbol_context) > 1 and len(request.prompt) > limit_chars:
+        feedback = feedback.model_copy(update={
+            "symbol_context": feedback.symbol_context[:-1],
+            "symbol_context_omitted": feedback.symbol_context_omitted + 1})
+        if "symbol_context" not in cut:
+            cut.append("symbol_context")
+        ctx, request = build(feedback.model_copy(update={"context_truncated": cut}))
     feedback = feedback.model_copy(update={"context_truncated": cut})
     # The truncation note costs a line itself, so cut with a margin and at a
     # line boundary; two passes settle it.
@@ -247,6 +305,7 @@ _STOP_FOR_OUTCOME = {
     "needs_cochange": "needs_cochange",
     "limits_exceeded": "limits",
     "unparseable": "unparseable",
+    "shape_mismatch": "unparseable",
     # the paper breaks on any extraction failure; these are the same class
     "placeholder_violation": "unparseable",
     "no_output": "unparseable",
