@@ -19,6 +19,7 @@ from rcap.reduction_program import reduce_program
 from rcap.reduction_semantic import reduce_semantic
 from rcap.request import synthesize
 from rcap.selection import select
+from rcap.unitkind import narrow_targets
 
 
 class UnitResult:
@@ -51,9 +52,15 @@ def _expected_placeholders(context: AdaptationContext) -> set[str]:
 def run_case(
     sap_dir, pr_manifest: dict | None, backend: Backend,
     config: ExecutionConfig | None = None,
-    *, placeholder_retry: bool = False,
+    *, placeholder_retry: bool = False, narrow_whole_file_targets: bool = True,
 ) -> CaseResult:
-    """`placeholder_retry` (default OFF): when a unit's answer is rejected for
+    """`narrow_whole_file_targets` (default ON): a unit whose source payloads are
+    one function but whose target payload is the fork's whole file is narrowed
+    to the function's counterpart when the file declares exactly one
+    (rcap.unitkind.narrow_targets). Units whose target is already a function
+    are never touched, so their requests are byte-identical either way.
+
+    `placeholder_retry` (default OFF): when a unit's answer is rejected for
     its placeholder comments, issue ONE targeted repair request
     (rcap.generate.generate_with_placeholder_retry). Off, the requests and
     outcomes are exactly those of the plain pipeline."""
@@ -66,6 +73,8 @@ def run_case(
         selection = select(case)
         reduction = reduce_semantic(case, selection, enabled=semantic_on)
         materialized = materialize(case, reduction)
+        if narrow_whole_file_targets:
+            narrow_targets(case, materialized)
         program = reduce_program(case, reduction, materialized, config,
                                  enabled=program_on, evidence_protection=semantic_on)
 

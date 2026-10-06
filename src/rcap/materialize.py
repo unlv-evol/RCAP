@@ -73,6 +73,10 @@ class MaterializedPayload(BaseModel):
     # None when the case records no binding for the role's repository.
     repository_pin: dict[str, object] | None = None
     fidelity_flags_available: bool = False
+    # Set only when RCAP derived this content from the SAP payload instead of
+    # using it verbatim (rcap.unitkind.narrow_targets); `ref` still names the
+    # SAP payload it was derived from, `sha256` is of the content used.
+    derivation: str | None = None
 
 
 class MaterializationRecord(BaseModel):
@@ -83,6 +87,9 @@ class MaterializationRecord(BaseModel):
     # so a partially vacuous composite is reported as such rather than silently
     # narrowed.
     null_entities: list[str] = Field(default_factory=list)
+    # Entities whose whole-file target payload was examined for narrowing to
+    # the source function's counterpart (rcap.unitkind), hit or miss.
+    narrowed: dict[str, dict[str, object]] = Field(default_factory=dict)
 
     def by_role(self, entity: str) -> dict[str, MaterializedPayload]:
         return {p.role: p for p in self.payloads if p.entity == entity}

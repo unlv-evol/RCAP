@@ -19,6 +19,7 @@ from salp.structural import grammar_for, parse
 from rcap.backend_ollama import CHARS_PER_TOKEN_IMPLAUSIBLE, admissible_chars
 
 from rcap.request import AdaptationRequest
+from rcap.unitkind import FILE, FUNCTION, TYPE, WHOLE_KINDS, text_kind
 
 _CODE_BLOCK = re.compile(r"```[A-Za-z0-9_+-]*\s*\n(.*?)```", re.DOTALL)
 _PH = re.compile(r"/\* RCAP_PH_[^*]+\*/")
@@ -77,7 +78,9 @@ class StubBackend:
 
 class GenerationRecord(BaseModel):
     case_id: str
-    outcome: str  # completion | no_output | unparseable | placeholder_violation | limits_exceeded | backend_error
+    # completion | no_output | unparseable | shape_mismatch | placeholder_violation |
+    # limits_exceeded | backend_error | needs_cochange (repair requests only)
+    outcome: str
     candidate: str | None = None
     diagnostics: list[str] = Field(default_factory=list)
     generation_config: dict[str, object] = Field(default_factory=dict)  # theta
@@ -222,6 +225,20 @@ def generate(request: AdaptationRequest, backend: Backend,
         diag = (f"candidate parses neither as a {lang} method nor as a "
                 "compilation unit")
         return record("unparseable", diag=[diag])
+
+    # Answer shape. A request whose target is the fork's whole file (or a whole
+    # type) is answered by the whole file (type). An answer that is one function
+    # or an excerpt parses fine, and splicing it would replace the whole file
+    # with it: a typed failure, never a completion. Function requests are not
+    # checked (answer_kind defaults to "function").
+    wanted = getattr(request, "answer_kind", FUNCTION)
+    if wanted in WHOLE_KINDS:
+        got = text_kind(candidate, lang)
+        if not (got == FILE or (wanted == TYPE and got == TYPE)):
+            return record("shape_mismatch", diag=[
+                f"the target is a whole {'file' if wanted == FILE else 'type'} but the answer "
+                f"is {'one function' if got == FUNCTION else 'not a complete ' + wanted} "
+                f"({candidate.count(chr(10))} lines, kind {got})"])
 
     if expected_placeholders is not None:
         report = placeholder_report(candidate, expected_placeholders)

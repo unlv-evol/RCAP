@@ -150,6 +150,17 @@ def _localization(case: CaseModel, retained: set[str], entity: str) -> dict[str,
     return loc
 
 
+def _with_narrowing(loc: dict[str, object], materialized: MaterializationRecord,
+                    entity: str) -> dict[str, object]:
+    """Record that the target is RCAP's narrowing of a whole-file payload
+    (rcap.unitkind). The key is added only for such units, so every other
+    unit's context is unchanged."""
+    info = getattr(materialized, "narrowed", {}).get(entity)
+    if info:
+        loc["narrowing"] = dict(info)
+    return loc
+
+
 def _localization_confidence(case: CaseModel, retained: set[str]) -> dict[str, object]:
     for rec in _retained_by_tail(case, retained, "alignment_confidence"):
         if rec.state == "PRESENT":
@@ -370,7 +381,8 @@ def build_context(
         siblings=sibling_sigs,
         transformation={role: arts[role].reduced_text for role in arts},
         edit_regions=unit_edit_regions,
-        target_localization=_localization(case, retained, entity),
+        target_localization=_with_narrowing(_localization(case, retained, entity),
+                                            materialized, entity),
         confidence={"category": dict(case.category_confidence),
                     "localization": _localization_confidence(case, retained)},
         relationships=relationships,
