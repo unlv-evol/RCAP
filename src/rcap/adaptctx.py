@@ -310,6 +310,10 @@ def _describe(m: MissingSymbol, usage: str, c: _Ctx) -> SymbolContext:
     owner = (owner_types(m.owner) or [None])[0] or inferred or c.owners.get(name)
     owner_how = ("compiler" if m.owner else "inferred from the offending line" if inferred
                  else "supplied by the caller" if c.owners.get(name) else None)
+    if owner and not owner[:1].isupper():
+        owner, owner_how = None, None        # a package segment, not a type
+    if m.kind in ("class", "import") and name[:1].isupper():
+        owner, owner_how = None, None        # the missing name is itself a type
     if owner is None and m.kind == "signature" and name[:1].isupper():
         owner, owner_how = name, "constructor of the named type"
     is_type = owner is None and name[:1].isupper() and "." not in name
@@ -329,11 +333,24 @@ def _describe(m: MissingSymbol, usage: str, c: _Ctx) -> SymbolContext:
                                        if d.kind != "type"][:MAX_FORK_MEMBERS] \
                         or [d.signature for d in declarations(text, path, name)][:1]
                     return
-            if paths:
+            # how the source file gets the type, and whether the fork could get it the same way
+            fqn = next((m_.group(2) for m_ in _IMPORT.finditer(c.sources.upstream_after(c.source_file) or "")
+                        if not m_.group(1) and m_.group(2).rsplit(".", 1)[-1] == name), None)
+            sc.why["upstream_import"] = fqn
+            here = [p for p in paths if fqn and _package(p) == fqn.rsplit(".", 1)[0]]
+            if fqn and (fqn.startswith(("java.", "javax.", "scala.")) or here):
+                sc.fork_heading = (
+                    f"The source file imports it as `{fqn}`. That type is available to the fork ("
+                    + ("JDK / Scala library" if not here else here[0])
+                    + "), but this file does not import it: write it fully qualified.")
+            elif paths:
                 sc.fork_heading = f"The fork declares a type `{name}` in"
                 sc.fork_members = [f"{_package(p)} ({p})" for p in paths[:MAX_FORK_MEMBERS]]
+                if fqn:
+                    sc.fork_members.append(f"(the source file imports it as {fqn}, which the fork lacks)")
             else:
-                sc.fork_heading = f"The fork declares no type named `{name}`."
+                sc.fork_heading = f"The fork declares no type named `{name}`." + (
+                    f" The source file imports it as `{fqn}`." if fqn else "")
             return
         if owner is None:
             sc.fork_heading = ("The receiver type of this name could not be determined, so the "
@@ -369,6 +386,36 @@ def _describe(m: MissingSymbol, usage: str, c: _Ctx) -> SymbolContext:
             sc.fork_members = olds[:2]
             return sc
 
+    # 2b. a type the same change moves (file renamed, or deleted here and added
+    # there) while the fork still has it at the old place; or a type it adds
+    if is_type:
+        stem = lambda p: (p or "").rsplit("/", 1)[-1].split(".")[0]   # noqa: E731
+        new_files = [f for f in c.files if f.status in ("A", "R") and stem(f.new_path) == name]
+        if new_files:
+            f = new_files[0]
+            fork_paths = c.sources.fork_type_files(name)
+            moved = f.status == "R" or any(g.status == "D" and stem(g.old_path) == name
+                                           for g in c.files)
+            sc.upstream_file = f.new_path
+            if moved and fork_paths:
+                sc.origin = "moved_by_change"
+                sc.old_name = _package(fork_paths[0]) + "." + name
+                sc.fork_heading = f"The fork declares `{name}` in"
+                sc.fork_members = [f"{_package(p)} ({p})" for p in fork_paths[:MAX_FORK_MEMBERS]]
+                return sc
+            sc.origin = "added_by_change"
+            d = next((x for x in declarations(c.sources.upstream_after(f.new_path), f.new_path, name)
+                      if x.kind == "type"), None)
+            if d is not None:
+                doc = "\n".join(d.doc.splitlines()[:MAX_DOC_LINES])
+                sc.upstream_text = sc.upstream_signature = (doc + "\n" if doc else "") + d.signature
+                sc.upstream_lines = d.lines
+                sc.why["declaration_kind"] = "type"
+            fork_side()
+            if not sc.fork_members:
+                sc.fork_heading = ""
+            return sc
+
     # 2. declared on an added line of the same change, outside the unit
     ev = cc.find_evidence([name], c.files, c.region).get(name, [])
     decls = [e for e in ev if e.declaration]
@@ -402,36 +449,6 @@ def _describe(m: MissingSymbol, usage: str, c: _Ctx) -> SymbolContext:
                                    "different declaration")
                 sc.fork_members = same[:MAX_FORK_MEMBERS]
         return sc
-
-    # 2b. a type the same change moves (file renamed, or deleted here and added
-    # there) while the fork still has it at the old place; or a type it adds
-    if is_type:
-        stem = lambda p: (p or "").rsplit("/", 1)[-1].split(".")[0]   # noqa: E731
-        new_files = [f for f in c.files if f.status in ("A", "R") and stem(f.new_path) == name]
-        if new_files:
-            f = new_files[0]
-            fork_paths = c.sources.fork_type_files(name)
-            moved = f.status == "R" or any(g.status == "D" and stem(g.old_path) == name
-                                           for g in c.files)
-            sc.upstream_file = f.new_path
-            if moved and fork_paths:
-                sc.origin = "moved_by_change"
-                sc.old_name = _package(fork_paths[0]) + "." + name
-                sc.fork_heading = f"The fork declares `{name}` in"
-                sc.fork_members = [f"{_package(p)} ({p})" for p in fork_paths[:MAX_FORK_MEMBERS]]
-                return sc
-            sc.origin = "added_by_change"
-            d = next((x for x in declarations(c.sources.upstream_after(f.new_path), f.new_path, name)
-                      if x.kind == "type"), None)
-            if d is not None:
-                doc = "\n".join(d.doc.splitlines()[:MAX_DOC_LINES])
-                sc.upstream_text = sc.upstream_signature = (doc + "\n" if doc else "") + d.signature
-                sc.upstream_lines = d.lines
-                sc.why["declaration_kind"] = "type"
-            fork_side()
-            if not sc.fork_members:
-                sc.fork_heading = ""
-            return sc
 
     # 3. declared upstream before the change
     before_paths = c.sources.upstream_type_files(name if is_type else (owner or ""))

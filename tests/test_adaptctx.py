@@ -442,3 +442,20 @@ def test_placeholder_leak_in_the_repair_answer_is_rejected(sap_dir, pr_manifest)
                             k=2, repair_extras=_extras([]))
     assert seen == [1] and rec["stop_reason"] == "unparseable"
     assert rec["stop_detail"] == "placeholder_violation" and rec["first_success_attempt"] is None
+
+
+def test_jdk_type_the_file_does_not_import_is_to_be_qualified():
+    errs = _javac(UNIT, 8, "cannot find symbol", "        Optional<String> x = Optional.empty();",
+                  "  symbol:   class Optional", "  location: class StandaloneHerder")
+    up = UP_HERDER.replace("import java.util.Map;", "import java.util.Map;\nimport java.util.Optional;")
+    (sc,), _ = _build(errs, source_file=HERDER, sources=_sources(upstream_after={HERDER: up}.get))
+    assert sc.owner is None and sc.fork_members == []
+    assert "imports it as `java.util.Optional`" in sc.fork_heading
+    assert "write it fully qualified" in sc.fork_heading
+
+
+def test_a_package_segment_is_not_an_owner_type():
+    errs = _javac(UNIT, 3, "cannot find symbol", "import org.apache.kafka.connect.runtime.rest.entities.ConnectorType;",
+                  "  symbol:   class ConnectorType", "  location: package org.apache.kafka.connect.runtime.rest.entities")
+    (sc,), _ = _build(errs)
+    assert sc.owner is None and sc.fork_heading.startswith("The fork declares a type `ConnectorType` in")
