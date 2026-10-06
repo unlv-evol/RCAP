@@ -459,3 +459,15 @@ def test_a_package_segment_is_not_an_owner_type():
                   "  symbol:   class ConnectorType", "  location: package org.apache.kafka.connect.runtime.rest.entities")
     (sc,), _ = _build(errs)
     assert sc.owner is None and sc.fork_heading.startswith("The fork declares a type `ConnectorType` in")
+
+
+def test_decline_line_per_name_can_be_left_out(sap_dir, pr_manifest):
+    unit = _units(sap_dir, pr_manifest, ScriptedBackend([FIRST]))[0]
+    fb = RepairFeedback(attempt=2, kind="build", previous_candidate=unit.generation.candidate,
+                        error_text="- F.java:8: cannot find symbol", symbol_context=_contexts(),
+                        decline_prefill=False)
+    ctx, req = fit_feedback(unit.context, fb, None)
+    names = req.prompt.split("## The names the previous attempt uses")[1].split("## Output")[0]
+    assert "CANNOT_ADAPT" not in names and "(for a constant, use its value)." in names
+    assert "CANNOT_ADAPT: needs <symbol or change> from <file>" in req.prompt.split("## Output")[1]
+    assert untraceable_lines(req.prompt, ctx) == []

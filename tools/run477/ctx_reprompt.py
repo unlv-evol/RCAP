@@ -19,6 +19,7 @@ Per sampled row (a SAP of the 477 run that was BUILD_FAIL standalone):
   unit that has errors, temperature 0, no further attempt. B: the v2 repair request with the
   diagnostics only. C: the same plus `symbol_context` (rcap.adaptctx), which selects the v3
   request. Echo, decline, placeholder and shape guards are the loop's and generate's.
+  C2 (exploratory, added after C was seen): C without the ready-made decline line per name.
 * every final candidate gets a fidelity label (rcap.fidelity, rename_context="isolation").
 
 Resumable by key per arm. Writes only under --out-dir, the baseline file and the fork clone's
@@ -45,7 +46,7 @@ from rcap.request import unit_kinds  # noqa: E402
 
 RUN = Path("/home/adam/Documents/work/rcap-class-project/run477")
 ap = argparse.ArgumentParser()
-ap.add_argument("--sample", required=True); ap.add_argument("--arm", required=True, choices=["A", "B", "C"])
+ap.add_argument("--sample", required=True); ap.add_argument("--arm", required=True, choices=["A", "B", "C", "C2"])
 ap.add_argument("--fork", required=True); ap.add_argument("--out-dir", required=True)
 ap.add_argument("--baseline", required=True)
 ap.add_argument("--salp-out", default=str(RUN / "salp-477-out"))
@@ -405,7 +406,8 @@ for n, s in enumerate(todo, 1):
                                        "fork_members": len(x.fork_members), "hints": len(x.hints), "why": x.why,
                                        "missing_in_fork": x.missing_in_fork, "qualify": x.qualify} for x in scs],
                           "omitted": omitted}
-            return {"symbol_context": scs, "symbol_context_omitted": omitted} if scs else {}
+            if not scs: return {}
+            return {"symbol_context": scs, "symbol_context_omitted": omitted, "decline_prefill": a.arm != "C2"}
 
         if a.arm == "A":
             raw = [u.generation.candidate for u in units]; current["raw"] = raw
@@ -416,7 +418,7 @@ for n, s in enumerate(todo, 1):
             (case_dir / "attempt-01.feedback.txt").write_text(v.feedback + "\n")
         else:
             rec = run_reprompt_loop(units, backend, validate, k=2, echo_policy="retry", on_attempt=on_attempt,
-                                    repair_extras=repair_extras if a.arm == "C" else None)
+                                    repair_extras=repair_extras if a.arm in ("C", "C2") else None)
             row.update(rec); row["symbol_context"] = ctx_log
             # fidelity of what each unit ends with (attempt 2 when it produced a candidate, else attempt 1)
             last = current.get("raw") or [u.generation.candidate for u in units]

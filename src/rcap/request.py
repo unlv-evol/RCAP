@@ -199,7 +199,7 @@ _ORIGIN_LINE = {
 }
 
 
-def render_symbol_context(sc, lang: str, noun: str = "function") -> str:
+def render_symbol_context(sc, lang: str, noun: str = "function", prefill: bool = True) -> str:
     """One missing name as the v3 request shows it (rcap.reprompt.SymbolContext)."""
     head = f"### `{sc.symbol}`" + (f" (on `{sc.owner}`)" if sc.owner else "")
     lines = [head]
@@ -232,8 +232,9 @@ def render_symbol_context(sc, lang: str, noun: str = "function") -> str:
         lines.append(
             f"What to do: if this is a small helper whose body only needs what the fork has, "
             f"inline its logic into this {noun} instead of using `{sc.symbol}`"
-            " (for a constant, use its value); otherwise answer "
-            f"{DECLINE_TOKEN}: needs {sc.symbol} from {sc.upstream_file or '<file>'}")
+            " (for a constant, use its value)"
+            + (f"; otherwise answer {DECLINE_TOKEN}: needs {sc.symbol} from "
+               f"{sc.upstream_file or '<file>'}" if prefill else "."))
     elif sc.origin == "renamed_by_change":
         lines.append(f"{_ORIGIN_LINE[sc.origin]}{where}: `{sc.old_name}` becomes `{sc.symbol}`. "
                      f"The rename is not applied in the fork, which still declares `{sc.old_name}`.")
@@ -263,9 +264,9 @@ def render_symbol_context(sc, lang: str, noun: str = "function") -> str:
         lines += [f"  {h}" for h in sc.hints]
         if sc.origin == "predates_change":
             lines.append(f"What to do: express the source change with the fork's API as declared "
-                         f"above. Keep fork-only arguments and behaviour the change does not touch. "
-                         f"If the fork offers nothing equivalent, answer {DECLINE_TOKEN}: needs "
-                         f"{sc.symbol} from {sc.upstream_file or '<file>'}")
+                         f"above. Keep fork-only arguments and behaviour the change does not touch."
+                         + (f" If the fork offers nothing equivalent, answer {DECLINE_TOKEN}: needs "
+                            f"{sc.symbol} from {sc.upstream_file or '<file>'}" if prefill else ""))
         elif sc.origin == "unknown":
             lines.append("What to do: do not use this name; use what the fork declares.")
     return "\n".join(lines)
@@ -532,7 +533,8 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
         sections.append(_FEEDBACK_HEADINGS.get(feedback.kind, _FEEDBACK_HEADINGS["build"])
                         + "\n" + body)
         if v3:
-            blocks = [render_symbol_context(sc, lang, noun) for sc in symbols]
+            blocks = [render_symbol_context(sc, lang, noun, getattr(feedback, "decline_prefill", True))
+                      for sc in symbols]
             omitted = getattr(feedback, "symbol_context_omitted", 0)
             if omitted:
                 blocks.append(f"({omitted} more missing name(s) not described: cut to fit the "

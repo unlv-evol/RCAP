@@ -122,6 +122,11 @@ class RepairFeedback(BaseModel):
     # Context-aware repair (v3 template). Empty = the v2 request, unchanged.
     symbol_context: list[SymbolContext] = Field(default_factory=list)
     symbol_context_omitted: int = 0
+    # True (default): each described name ends with the ready-made decline line
+    # for it. False: the decline is offered once, in the task and the output
+    # section only (variant added after the pre-filled line was seen to be
+    # copied back for an inlinable helper).
+    decline_prefill: bool = True
 
 
 class RepairContext(AdaptationContext):
