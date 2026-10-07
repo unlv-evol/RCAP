@@ -21,7 +21,12 @@ Here every unit is an edit against the ORIGINAL file:
 4. the surviving hunks are applied in one pass.
 
 Nothing is dropped silently: every unit ends `merged`, `conflict` (with each
-lost hunk and the unit it lost to) or `unspliceable` (with the reason).
+lost hunk and the unit it lost to), `unspliceable` or `shape_mismatch` (with
+the reason).
+Every merge is checked afterwards (`check_invariants`): no hunk applied twice,
+the merged file differs from the original by exactly the applied hunks, and an
+undisturbed unit reads as its candidate. `MergeResult.violations` is empty
+for a sound merge; drivers refuse to build a file with a violation.
 Pure text processing; no parser, no build system.
 """
 
@@ -34,6 +39,8 @@ from difflib import SequenceMatcher
 MERGED = "merged"
 CONFLICT = "conflict"
 UNSPLICEABLE = "unspliceable"
+SHAPE_MISMATCH = "shape_mismatch"   # never applied: one function offered for a whole-file unit
+NOT_APPLIED = frozenset({UNSPLICEABLE, SHAPE_MISMATCH})
 
 
 @dataclass(frozen=True)
@@ -90,6 +97,7 @@ class MergeResult:
     units: dict[str, UnitMerge]
     applied: list[Hunk]             # in file order
     original: str
+    violations: list[str] = field(default_factory=list)   # check_invariants(); empty = sound
 
     def lines_of(self, key: str) -> tuple[int, int] | None:
         """1-based inclusive line span of the unit in the merged text."""
@@ -140,21 +148,47 @@ def unit_hunks(key: str, original: str, candidate: str, offset: int) -> list[Hun
 
 
 def _overlap(a: Hunk, b: Hunk) -> bool:
+    """Do the two hunks claim the same place in the original?
+
+    An insertion AT THE START of a replaced range overlaps it: a line diff
+    reports "insert X before line L" for one unit and "replace line L by X + L'"
+    for another, and applying both writes X twice (PR-16421 SaslChannelBuilder:
+    the same import twice; PR-15486 Errors: the same loop twice). An insertion
+    at the END of a replaced range is a different place (after the range) and
+    stays independent unless the replacement already ends with it (`_subsumes`)."""
     a_ins, b_ins = a.start == a.end, b.start == b.end
     if a_ins and b_ins:
         return a.start == b.start
     if a_ins:
-        return b.start < a.start < b.end
+        return b.start <= a.start < b.end
     if b_ins:
-        return a.start < b.start < a.end
+        return a.start <= b.start < a.end
     return a.start < b.end and b.start < a.end
 
 
-def merge_units(original: str, edits: Sequence[UnitEdit]) -> MergeResult:
+def _subsumes(big: Hunk, small: Hunk) -> bool:
+    """`small` is an insertion at an edge of the range `big` replaces, and
+    `big`'s replacement text already begins (ends) with the inserted text: the
+    two say the same thing there, and `big` says more."""
+    if small.start != small.end or big.start == big.end or not small.text:
+        return False
+    if small.start == big.start:
+        return big.text.startswith(small.text)
+    if small.start == big.end:
+        return big.text.endswith(small.text)
+    return False
+
+
+def merge_units(original: str, edits: Sequence[UnitEdit], *, language: str | None = None) -> MergeResult:
     """Apply every unit's candidate to `original` (see the module docstring).
 
     Units are given in application order; that order only breaks ties between
-    two units with the same span (the earlier one wins)."""
+    two units with the same span (the earlier one wins).
+
+    `language` switches the shape guard on: a candidate whose shape does not
+    match its unit's target (one function for a whole-file unit) ends
+    `shape_mismatch` and is not applied. Without it nothing is checked, as
+    before; function units are never affected either way."""
     units: dict[str, UnitMerge] = {}
     order: dict[str, int] = {}
     hunks: dict[str, list[Hunk]] = {}
@@ -166,6 +200,13 @@ def merge_units(original: str, edits: Sequence[UnitEdit]) -> MergeResult:
                    f"original text found {found} times in the unmodified file")
             units[e.key] = UnitMerge(e.key, UNSPLICEABLE, why)
             continue
+        if language is not None and e.priority >= 0:
+            from rcap.unitkind import shape_mismatch
+
+            why = shape_mismatch(e.original, e.candidate, language)
+            if why:
+                units[e.key] = UnitMerge(e.key, SHAPE_MISMATCH, why)
+                continue
         pos = original.find(e.original)
         um = UnitMerge(e.key, MERGED, span=(pos, pos + len(e.original)))
         hunks[e.key] = unit_hunks(e.key, e.original, e.candidate, pos)
@@ -187,6 +228,24 @@ def merge_units(original: str, edits: Sequence[UnitEdit]) -> MergeResult:
                 same.owners.append(key)
                 um.applied += 1
                 um.shared += 1
+                continue
+            # an insertion another unit's replacement already contains at that very edge
+            # (or the reverse) is the same change stated twice: it is applied once
+            inside = next((x for x in accepted if x.unit != key and _subsumes(x, h)), None)
+            if inside is not None:
+                inside.owners.append(key)
+                um.applied += 1
+                um.shared += 1
+                continue
+            covered = [x for x in accepted if x.unit != key and _subsumes(h, x)]
+            if covered and not any(x.unit != key and x not in covered and _overlap(x, h) for x in accepted):
+                for x in covered:
+                    accepted.remove(x)
+                    h.owners += [o for o in x.owners if o not in h.owners]
+                    for o in x.owners:
+                        units[o].shared += 1
+                accepted.append(h)
+                um.applied += 1
                 continue
             clash = [x for x in accepted if x.unit != key and _overlap(x, h)]
             if clash:
@@ -223,7 +282,57 @@ def merge_units(original: str, edits: Sequence[UnitEdit]) -> MergeResult:
         de = sum(len(h.text) - (h.end - h.start) for h in accepted
                  if h.start < e or (h.start == e and key_in(h, um.key)))
         um.new_span = (s + ds, e + de)
-    return MergeResult(text=text, units=units, applied=accepted, original=original)
+    result = MergeResult(text=text, units=units, applied=accepted, original=original)
+    result.violations = check_invariants(result, {e.key: e for e in edits})
+    return result
+
+
+def check_invariants(result: "MergeResult", edits: dict[str, UnitEdit] | None = None) -> list[str]:
+    """Post-merge invariants; an empty list means the merge is sound.
+
+    1. No two applied hunks claim the same original text, and no insertion sits
+       on the edge of a replaced range whose replacement repeats it (a hunk
+       applied twice).
+    2. The merged file re-diffed against the original accounts for exactly the
+       applied hunks: undoing them, last first, gives the original back, and
+       the size of the merged file is the original's plus their deltas.
+    3. A unit with every hunk applied as its own (none shared with or subsumed
+       by another unit's) and no other unit's hunk inside its span reads, in the merged file, exactly as its candidate does."""
+    out: list[str] = []
+    hs = sorted(result.applied, key=lambda h: (h.start, h.end))
+    for a, b in zip(hs, hs[1:]):
+        if _overlap(a, b) or a.end > b.start:
+            out.append(f"hunks of {a.owners} and {b.owners} overlap at offset {b.start}")
+        elif _subsumes(a, b) or _subsumes(b, a):
+            out.append(f"an insertion at offset {b.start} is repeated by the adjacent replacement "
+                       f"({a.owners} / {b.owners}): applied twice")
+    text, shift, spans = result.text, 0, []
+    for h in hs:
+        spans.append((h.start + shift, h.start + shift + len(h.text), h))
+        shift += len(h.text) - (h.end - h.start)
+    if len(text) != len(result.original) + shift:
+        out.append("merged size is not the original's plus the applied hunks' deltas")
+    undone = text
+    for s, e, h in reversed(spans):
+        if undone[s:e] != h.text:
+            out.append(f"hunk of {h.owners} at offset {h.start} is not in the merged file as applied")
+            break
+        undone = undone[:s] + result.original[h.start:h.end] + undone[e:]
+    else:
+        if undone != result.original:
+            out.append("undoing the applied hunks does not give the original file back")
+    for key, um in result.units.items():
+        if um.status != MERGED or um.span is None or um.new_span is None or um.applied != um.hunks \
+                or um.shared or not edits:
+            continue
+        s, e = um.span
+        if any(key not in h.owners and h.start < e and h.end > s or
+               (key not in h.owners and h.start == h.end and s <= h.start <= e) for h in hs):
+            continue
+        want = _align_trailing_newline(edits[key].original, edits[key].candidate)
+        if text[um.new_span[0]:um.new_span[1]] != want:
+            out.append(f"unit {key}: its region in the merged file differs from its candidate")
+    return out
 
 
 def key_in(h: Hunk, key: str) -> bool:

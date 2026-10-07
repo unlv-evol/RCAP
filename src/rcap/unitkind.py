@@ -100,6 +100,27 @@ def text_kind(text: str | None, language: str | None) -> str:
     return OTHER
 
 
+def shape_mismatch(target_text: str | None, candidate: str | None, language: str | None) -> str | None:
+    """Why `candidate` cannot stand in for `target_text`, or None when it can.
+
+    The same rule `generate` applies to a fresh answer, for a candidate that is
+    already stored: a unit whose target is the fork's whole file (or a whole
+    type) is answered by a whole file (type). One function, or an excerpt,
+    spliced over it replaces the WHOLE FILE with that function (PR-17720
+    ConnectWorkerIntegrationTest: 1 method written over the file). Targets of
+    any other shape are not checked."""
+    wanted = text_kind(target_text, language)
+    if wanted not in WHOLE_KINDS:
+        return None
+    got = text_kind(candidate, language)
+    if got == FILE or (wanted == TYPE and got == TYPE):
+        return None
+    return (f"the target is a whole {'file' if wanted == FILE else 'type'} "
+            f"({(target_text or '').count(chr(10))} lines) but the candidate is "
+            f"{'one function' if got == FUNCTION else 'not a complete ' + wanted} "
+            f"({(candidate or '').count(chr(10))} lines, kind {got})")
+
+
 def function_name(text: str, language: str | None) -> tuple[str, int] | None:
     """(name, parameter count) of a payload that is one function, else None."""
     grammar = grammar_for((language or "java").lstrip("."))
