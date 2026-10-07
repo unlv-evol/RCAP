@@ -24,6 +24,7 @@ RUN = Path("/home/adam/Documents/work/rcap-class-project/run477")
 ap = argparse.ArgumentParser()
 ap.add_argument("--keys", required=True); ap.add_argument("--out-dir", required=True)
 ap.add_argument("--gen-cache"); ap.add_argument("--salp-out", default=str(RUN / "salp-477-out"))
+ap.add_argument("--gen-cache-ro", action="append", default=[], help="read-only cache directories of earlier runs")
 ap.add_argument("--limit", type=int)
 a = ap.parse_args()
 OUTD = Path(a.out_dir); CAND = OUTD / "candidates"; CAND.mkdir(parents=True, exist_ok=True)
@@ -32,7 +33,7 @@ keys = [k.strip() for k in Path(a.keys).read_text().splitlines() if k.strip()]
 done = {json.loads(l)["key"] for l in open(OUT)} if OUT.exists() else set()
 todo = [k for k in keys if k not in done]
 if a.limit: todo = todo[:a.limit]
-backend = CachedBackend(OllamaBackend(), a.gen_cache or OUTD / "gen-cache")
+backend = CachedBackend(OllamaBackend(), a.gen_cache or OUTD / "gen-cache", a.gen_cache_ro)
 PROV = run_provenance(backend, driver="placeholder_retry.py", k=1, placeholder_retry=True)
 print(f"backend {backend.model} digest={backend.model_digest} params={backend.params}; {len(todo)} to run ({len(done)} done)", flush=True)
 

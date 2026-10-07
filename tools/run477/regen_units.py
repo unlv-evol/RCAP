@@ -29,6 +29,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--keys", required=True); ap.add_argument("--out-dir", required=True)
 ap.add_argument("--salp-out", default=str(RUN / "salp-477-out"))
 ap.add_argument("--gen-cache"); ap.add_argument("--no-narrow", action="store_true")
+ap.add_argument("--gen-cache-ro", action="append", default=[], help="read-only cache directories of earlier runs")
 ap.add_argument("--limit", type=int)
 a = ap.parse_args()
 
@@ -43,7 +44,7 @@ todo = [k for k in keys if not fname(k).exists()]
 if a.limit: todo = todo[:a.limit]
 backend = OllamaBackend()
 num_ctx = backend.params.get("num_ctx")
-if a.gen_cache: backend = CachedBackend(backend, a.gen_cache)
+if a.gen_cache: backend = CachedBackend(backend, a.gen_cache, a.gen_cache_ro)
 PROV = run_provenance(backend, driver="regen_units.py", k=1, narrow=not a.no_narrow)
 print(f"backend {backend.model} digest={backend.model_digest} params={backend.params}; "
       f"{len(todo)} to run ({len(keys) - len(todo)} done); narrow={not a.no_narrow}", flush=True)
