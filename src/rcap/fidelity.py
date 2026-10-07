@@ -16,11 +16,13 @@ FAITHFUL_CODE  the upstream change is reproduced (recall >= RECALL_FAITHFUL) and
            in upstream's after-side, is reported too), no expectation was weakened,
            AND the candidate changes code where upstream changes code. Only this
            label is a code port. (`FAITHFUL` is kept as an alias of it.)
-IMPORT_ONLY  what the candidate changes, or what upstream changes in this unit, is
-           import statements only. Never reported as a code port, however complete:
-           of 40 units the first guard called FAITHFUL, 16 were this or COMMENT_ONLY.
-           `flags` says when the import change is incomplete or comes with a code
-           edit upstream does not make here (`unrequested_code_edit`).
+IMPORT_ONLY  the candidate changes import statements and nothing else. Never
+           reported as a code port, however complete: of 40 units the first guard
+           called FAITHFUL, 16 were this or COMMENT_ONLY. `flags` says when the
+           import change is incomplete or upstream also changes code here. An
+           import unit whose candidate ALSO edits code is PARTIAL with the flag
+           `unrequested_code_edit`, unless the upstream file shows the edit is
+           upstream's (see `upstream_file`).
 COMMENT_ONLY  code tokens equal the fork's; the candidate changes comments the way
            upstream does in this unit (javadoc, typo in a comment).
 PARTIAL    something is missing or extra; `reasons` says what;
@@ -572,7 +574,7 @@ def judge(fork_original: str, candidate: str, upstream_before: str, upstream_aft
     import of a change into one unit and its code into a sibling; a whole-file
     candidate of the import unit then carries the sibling's code too. With the file
     texts that code is recognised as upstream's (flag `code_of_sibling_unit`,
-    FAITHFUL_CODE); without them such a unit is IMPORT_ONLY + `unrequested_code_edit`."""
+    FAITHFUL_CODE); without them such a unit is PARTIAL + `unrequested_code_edit`."""
     marks = placeholder_marks(candidate)
     if marks:
         lines = [ln.strip()[:200] for ln in candidate.splitlines() if "RCAP_PH" in ln]
@@ -644,10 +646,15 @@ def judge(fork_original: str, candidate: str, upstream_before: str, upstream_aft
     # adaptation, not an invention; only tokens in neither text count against FAITHFUL
     novel = extra - Counter(_significant(tf))
     novel_share = round(sum(novel.values()) / len(c_add), 3) if c_add else 0.0
+    ref_before, ref_after = upstream_before, upstream_after
     if upstream_file is not None and up_kind != "code" and kind == "code":
-        # the unit's own upstream text holds no code change (an import unit), but the candidate
-        # edits code: its expectations are compared with the upstream FILE, where that code is
-        weak, notes = _assertion_check(fork_original, candidate, upstream_file[0], upstream_file[1])
+        # The unit's own upstream text holds no code change (an import unit), but the candidate
+        # edits code: that code is judged against the upstream FILE, where its change is. What
+        # the file changes elsewhere and this unit does not port is not held against it.
+        ref_before, ref_after = upstream_file
+        weak, notes = _assertion_check(fork_original, candidate, ref_before, ref_after)
+        weak = [w for w in weak if not w.startswith("kept the old expectation")]
+        notes = []
     else:
         weak, notes = _assertion_check(fork_original, candidate, upstream_before, upstream_after)
     if not adapted and Counter(c_add) == Counter(up_add) and Counter(c_rem) == Counter(up_rem):
@@ -665,7 +672,7 @@ def judge(fork_original: str, candidate: str, upstream_before: str, upstream_aft
         f.label = WEAKENED
         f.reasons.append(f"{len(weak)} weakened expectation(s)")
         return f
-    regress = fork_regressions(fork_original, candidate, upstream_before, upstream_after)
+    regress = fork_regressions(fork_original, candidate, ref_before, ref_after)
     if regress:
         f.label = FORK_REGRESSION
         f.reasons.append(f"{len(regress)} fork-only expression(s) displaced")
@@ -699,25 +706,33 @@ def judge(fork_original: str, candidate: str, upstream_before: str, upstream_aft
         shares = bool((imp_up & imp_c) - Counter({"import": 10 ** 6, "static": 10 ** 6})) or bool(
             (rem_up & rem_c) - Counter({"import": 10 ** 6, "static": 10 ** 6}))
         if kind == "code" and upstream_file is not None:
-            mine = Counter(code_lines(without_imports(candidate))) - Counter(code_lines(without_imports(fork_original)))
-            theirs = Counter(code_lines(without_imports(upstream_file[1]))) - Counter(code_lines(without_imports(upstream_file[0])))
-            gone = Counter(code_lines(without_imports(fork_original))) - Counter(code_lines(without_imports(candidate)))
-            theirs_gone = Counter(code_lines(without_imports(upstream_file[0]))) - Counter(code_lines(without_imports(upstream_file[1])))
+            # token bags of the whole files (imports aside): layout and line breaks do not matter
+            bag = lambda text: Counter(_significant(tokens(without_imports(text))))  # noqa: E731
+            fork_bag, cand_bag = bag(fork_original), bag(candidate)
+            before_bag, after_bag = bag(upstream_file[0]), bag(upstream_file[1])
+            mine, gone = cand_bag - fork_bag, fork_bag - cand_bag
+            theirs, theirs_gone = after_bag - before_bag, before_bag - after_bag
+            # a token upstream removes and the fork never had cannot be removed here
             n = sum(mine.values()) + sum(gone.values())
             hit = sum((mine & theirs).values()) + sum((gone & theirs_gone).values())
-            if n and hit / n >= RECALL_FAITHFUL:
+            # ... and it must ADD something upstream adds: dropping two tokens upstream also
+            # drops somewhere in the file (PR-14628: an argument label) proves nothing
+            if n and hit / n >= RECALL_FAITHFUL and (mine & theirs):
                 f.label = FAITHFUL_CODE
                 f.flags.append("code_of_sibling_unit")
                 f.reasons = [f"this unit's own upstream change is {up_kind}-only; the candidate's code edit "
-                             f"({hit} of {n} changed lines) is one upstream makes elsewhere in the same file"]
+                             f"({hit} of {n} changed tokens) is one upstream makes elsewhere in the same file"]
                 return f
+        if kind == "code":
+            # not "import only": the row would hide an edit nobody asked for behind a harmless name
+            f.flags.append("unrequested_code_edit")
+            f.reasons.append("upstream changes only imports/comments in this unit; the candidate also edits code"
+                             + ("" if upstream_file is not None else " (upstream file not given: it may be a sibling unit's change)"))
+            return f
         if kind == "import" or shares:
             if f.reasons:
                 f.flags.append("import_change_incomplete_or_extra")
-            if kind == "code":
-                f.flags.append("unrequested_code_edit")
-                f.reasons.append("upstream changes only imports/comments in this unit; the candidate also edits code")
-            elif up_kind == "code":
+            if up_kind == "code":
                 f.flags.append("code_not_ported")
                 f.reasons.append("upstream also changes code in this unit; the candidate changes imports only")
             f.label = IMPORT_ONLY

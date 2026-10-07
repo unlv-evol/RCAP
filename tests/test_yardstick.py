@@ -208,7 +208,7 @@ def test_code_of_a_sibling_unit_needs_the_upstream_file():
     f = judge("sibling_code_15149")
     assert f.label == fd.FAITHFUL_CODE and "code_of_sibling_unit" in f.flags
     g = fd.judge(c["fork_original"], c["candidate"], c["upstream_before"], c["upstream_after"], language="java")
-    assert g.label == fd.IMPORT_ONLY and "unrequested_code_edit" in g.flags
+    assert g.label == fd.PARTIAL and "unrequested_code_edit" in g.flags
 
 
 def test_fork_regression_true_cases_and_value_equivalent_rewrites():
@@ -216,9 +216,10 @@ def test_fork_regression_true_cases_and_value_equivalent_rewrites():
     assert f.label == fd.FORK_REGRESSION and "paginateTopics" in f.evidence[0]
     assert judge("fr_saslchannelbuildertest").label == fd.FORK_REGRESSION
     # TimeUnit.NANOSECONDS.convert(1, HOURS) -> HOURS.toNanos(1); MetaProperties(clusterId = x) -> MetaProperties(x)
+    # no regression; the rewrite next to the import is an edit nobody asked for, so not IMPORT_ONLY either
     for name in ("fr_false_13089", "fr_false_14628"):
         f = judge(name)
-        assert f.label == fd.IMPORT_ONLY and "unrequested_code_edit" in f.flags, (name, f.label, f.evidence[:1])
+        assert f.label == fd.PARTIAL and "unrequested_code_edit" in f.flags, (name, f.label, f.evidence[:1])
     # what counts as fork state
     ts = fd.tokens("x = TimeUnit.NANOSECONDS.convert(1, u); client.setFollow(false); f(name = v, w); g().h; helper();")
     state = {t: fd._is_fork_state(ts, i) for i, t in enumerate(ts)}
