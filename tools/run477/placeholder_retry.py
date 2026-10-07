@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gencache import CachedBackend  # noqa: E402
 from rcap.backend_ollama import OllamaBackend  # noqa: E402
 from rcap.pipeline import run_case  # noqa: E402
+from rcap.provenance import run_provenance  # noqa: E402
 from rcap.reduction_program import PLACEHOLDER, recover  # noqa: E402
 
 RUN = Path("/home/adam/Documents/work/rcap-class-project/run477")
@@ -32,6 +33,7 @@ done = {json.loads(l)["key"] for l in open(OUT)} if OUT.exists() else set()
 todo = [k for k in keys if k not in done]
 if a.limit: todo = todo[:a.limit]
 backend = CachedBackend(OllamaBackend(), a.gen_cache or OUTD / "gen-cache")
+PROV = run_provenance(backend, driver="placeholder_retry.py", k=1, placeholder_retry=True)
 print(f"backend {backend.model} digest={backend.model_digest} params={backend.params}; {len(todo)} to run ({len(done)} done)", flush=True)
 
 def expand(c, art):
@@ -42,7 +44,7 @@ def expand(c, art):
 t0 = time.time()
 for i, key in enumerate(todo, 1):
     sdir = Path(a.salp_out) / key; t = time.time()
-    rec = {"key": key, "units": []}; row = {"key": key}
+    rec = {"key": key, "units": [], "provenance": PROV}; row = {"key": key, "provenance": PROV}
     try:
         manifest = json.loads((sdir.parent / "pr.json").read_text()); sap = json.loads((sdir / "sap.json").read_text())
         rec.update(target_repo=manifest["target_repo"], target_file=sap["target_file"], source_file=sap["source_file"])

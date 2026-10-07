@@ -37,6 +37,7 @@ from rcap.feedback import (Span, TestFailure, _fallback, attribute_errors, attri
                            parse_junit_failures, rank_members, render_errors_for,
                            render_test_failures)
 from rcap.pipeline import _expected_placeholders, run_case
+from rcap.provenance import run_provenance
 from rcap.prloop import PRUnit, PRValidation, UnitDiagnostic, run_pr_loop
 from rcap.reduction_program import PLACEHOLDER, recover
 
@@ -686,6 +687,7 @@ if a.limit: todo = todo[:a.limit]
 dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=FORK, capture_output=True, text=True).stdout.strip()
 if dirty: sys.exit(f"fork clone is not clean:\n{dirty}")
 backend = CachingBackend(OllamaBackend(), {})
+PROV = run_provenance(backend, driver="reprompt_pr.py", k=a.k, mech_hunks=a.mech_hunks)
 print(f"backend {backend.model} digest={backend.model_digest} params={backend.params}; k={a.k} mech={a.mech_hunks}; "
       f"{len(todo)} PR(s) to run ({len(done)} done)", flush=True)
 for n, ((pair, pr), keys) in enumerate(todo, 1):
@@ -694,6 +696,7 @@ for n, ((pair, pr), keys) in enumerate(todo, 1):
     except Exception as exc:
         row = {"pr": pr, "pair": pair, "error": f"{type(exc).__name__}: {exc}"[:400], "traceback": traceback.format_exc()[-1500:]}
         subprocess.run(["git", "checkout", "-q", "--", "."], cwd=FORK)
+    row["provenance"] = PROV
     with OUT.open("a") as fh: fh.write(json.dumps(row, default=str) + "\n")
     us = row.get("units", {})
     print(f"[{n}/{len(todo)}] {pr}: attempt-1 PR verdict {row.get('attempt1_verdict')} -> final {row.get('final_verdict')} "

@@ -33,18 +33,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gencache import CachedBackend, load_replay  # noqa: E402
-from harness import Harness  # noqa: E402
+from harness import Harness, lang_of, screen_unit  # noqa: E402
 from rcap import cochange as cc  # noqa: E402
 from rcap import prorder as po  # noqa: E402
 from rcap.backend_ollama import OllamaBackend  # noqa: E402
 from rcap.feedback import (Span, TestFailure, _fallback, attribute_errors, attribute_test_failures,  # noqa: E402
                            parse_compile_errors, parse_junit_failures)
-from rcap.generate import has_placeholder_leak  # noqa: E402
+from rcap.provenance import run_provenance  # noqa: E402
 from rcap.imports import fix_imports, unused_import_fails_build  # noqa: E402
 from rcap.pipeline import run_case  # noqa: E402
 from rcap.reduction_program import PLACEHOLDER, recover  # noqa: E402
 from rcap.reprompt import code_equal, is_echo  # noqa: E402
-from rcap.splice import CONFLICT, UNSPLICEABLE, UnitEdit, merge_units  # noqa: E402
+from rcap.splice import CONFLICT, NOT_APPLIED, UnitEdit, merge_units  # noqa: E402
 
 RUN = Path("/home/adam/Documents/work/rcap-class-project/run477")
 ap = argparse.ArgumentParser()
@@ -128,7 +128,7 @@ def run_pr(pair, pr, backend):
     backend.replay = load_replay(a.old_candidates, pr); backend.sources.clear()
     saps, old_root, new_root = sap_dirs(pair, pr)
     row = {"pr": pr, "pair": pair, "placeholder_retry": a.placeholder_retry, "fix_imports": not a.no_fix_imports,
-           "mech": not a.no_mech, "saps": [], "build_facts": FACTS}
+           "mech": not a.no_mech, "saps": [], "build_facts": FACTS, "provenance": PROV}
     tracked = H.tracked()
 
     # ---------------------------------------------------------------- the upstream diff
@@ -212,7 +212,11 @@ def run_pr(pair, pr, backend):
 
     # ---------------------------------------------------------------- units that are never applied
     for u in units.values():
-        if has_placeholder_leak(u.expanded): u.status = "PLACEHOLDER_LEAK"
+        r = region_of.get(u.key)
+        rej = screen_unit(u.target_original, u.expanded, r.before_text if r else "", r.after_text if r else "", lang_of(u.file))
+        if rej:
+            # a leaked marker, the fork's own block a second time, or one function for a whole file
+            u.status = rej[0].upper(); u.detail["rejected"] = rej[1][:3]
         elif is_echo(u.expanded, u.target_original): u.status = "ECHO"
 
     # ---------------------------------------------------------------- mechanical hunks (uncovered upstream change groups)
@@ -421,8 +425,10 @@ def run_pr(pair, pr, backend):
                 continue
             edits = [UnitEdit(m, units[m].target_original, units[m].expanded) if m in units
                      else UnitEdit(m, mech[m]["old"], mech[m]["new"], priority=-1) for m in ms]
-            mr = merge_units(orig, edits); text = mr.text; shift_at = []
+            mr = merge_units(orig, edits, language=lang_of(path)); text = mr.text; shift_at = []
             for m in ms: rec[m] = mr.units[m].as_dict()
+            if mr.violations:                             # never build a file the merge cannot account for
+                for m in ms: rec[m] = {**rec[m], "status": "unspliceable", "reason": "merge invariant violated: " + "; ".join(mr.violations)[:200]}
             lang = EXT.get(path.rsplit(".", 1)[-1])
             if lang and not a.no_fix_imports and mr.changed and any(m in units for m in ms):
                 up = src_text(head, upstream_file.get(path))
@@ -448,7 +454,7 @@ def run_pr(pair, pr, backend):
         bad_merge = {}
         for m, r in rec.items():
             merge_log[m] = r
-            if r["status"] == UNSPLICEABLE or (r["status"] == CONFLICT and r["applied"] == 0):
+            if r["status"] in NOT_APPLIED or (r["status"] == CONFLICT and r["applied"] == 0):
                 bad_merge[gid_of(m)] = f"{r['status']}: {r['reason']}"
         if bad_merge: return None, bad_merge, [], rec
         projs = sorted({H.project_of(p) for p in spans if H.project_of(p)})
@@ -674,7 +680,8 @@ dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"],
 if dirty: sys.exit(f"fork clone is not clean:\n{dirty}")
 backend = CachedBackend(OllamaBackend(), a.gen_cache, a.gen_cache_ro,
                         regenerate={"placeholder_violation"} if a.placeholder_retry else ())
-print(f"backend {backend.model} digest={backend.model_digest} params={backend.params}; placeholder_retry={a.placeholder_retry} "
+PROV = run_provenance(backend, driver="order_pr.py", k=1, placeholder_retry=a.placeholder_retry)
+print(f"backend {backend.model} digest={PROV['model_digest']} params={backend.params}; rcap {PROV['rcap_commit']} placeholder_retry={a.placeholder_retry} "
       f"fix_imports={not a.no_fix_imports} mech={not a.no_mech}; {len(todo)} PR(s) to run ({len(done)} done)", flush=True)
 for n, (pair, pr) in enumerate(todo, 1):
     try:

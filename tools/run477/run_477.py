@@ -8,9 +8,10 @@ Usage: run_477.py <salp-out-root> <results.jsonl> [--limit N]
 """
 import json, sys, time, traceback, os
 from pathlib import Path
-sys.path.insert(0, "/home/adam/Documents/work/rcap-class-project/rcap/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from rcap.backend_ollama import OllamaBackend
 from rcap.pipeline import run_case
+from rcap.provenance import run_provenance
 
 root = Path(sys.argv[1]); out = Path(sys.argv[2])
 limit = int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else None
@@ -47,6 +48,7 @@ if per_pair:
 if limit: saps = saps[:limit]
 
 backend = OllamaBackend()
+PROV = run_provenance(backend, driver="run_477.py", k=1)
 print(f"backend {backend.name}/{backend.model} digest={backend.model_digest} "
       f"limit={backend.request_limit_chars}", flush=True)
 print(f"{len(done)} already recorded; {len(saps)} to run", flush=True)
@@ -54,7 +56,7 @@ print(f"{len(done)} already recorded; {len(saps)} to run", flush=True)
 t_start = time.time()
 for i, (key, pair, pr_dir, sap) in enumerate(saps, 1):
     manifest = json.loads((pr_dir / "pr.json").read_text())
-    row = {"key": key, "pair": pair, "pr": pr_dir.name, "sap": sap}
+    row = {"key": key, "pair": pair, "pr": pr_dir.name, "sap": sap, "provenance": PROV}
     t0 = time.time()
     try:
         res = run_case(pr_dir / sap, manifest, backend)

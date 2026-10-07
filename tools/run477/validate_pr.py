@@ -15,6 +15,10 @@ Usage: validate_pr.py <fork-worktree> <target_repo> [--all] [--only-pr N]
 import collections, json, os, re, sys, time
 from pathlib import Path
 import subprocess
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src")); sys.path.insert(0, str(Path(__file__).resolve().parent))
+from harness import lang_of, screen_unit, unit_sources  # noqa: E402
+from rcap.provenance import run_provenance  # noqa: E402
+PROV = run_provenance(None, driver="validate_pr.py")
 # validate.py's helpers (everything before its main loop); baseline keys "proj|Class" are shared
 exec(compile(Path(__file__).with_name("validate.py").read_text().split("\ndone = ")[0], "validate.py", "exec"))
 baseline = json.loads(BASE.read_text()) if BASE.exists() else {}
@@ -43,7 +47,9 @@ for i, pr in enumerate(todo, 1):
         for r in rs:
             p = r["target_file"]; text = (FORK / p).read_text(encoding="utf-8"); orig = text; applied = []
             for u in r["units"]:
-                if text.count(u["target_original"] or "\0") == 1:
+                rej = screen_unit(u["target_original"] or "", u["candidate_expanded"], *unit_sources(V.parent / "salp-477-out" / r["key"], u.get("entity")), lang_of(p))
+                if rej: applied.append(rej[0])
+                elif text.count(u["target_original"] or "\0") == 1:
                     text = text.replace(u["target_original"], u["candidate_expanded"], 1); applied.append("ok")
                 else: applied.append("miss")
             ok = applied[0] == "ok" and text != orig
@@ -97,6 +103,7 @@ for i, pr in enumerate(todo, 1):
     finally:
         restore(paths)
     row["seconds"] = round(time.time() - t0, 1)
+    row["provenance"] = PROV
     with OUT_PR.open("a") as fh: fh.write(json.dumps(row) + "\n")
     print(f"[{i}/{len(todo)}] PR-{pr} ({len(rs)} SAPs): {row['verdict']} {row.get('reason', '')} ({row['seconds']}s)", flush=True)
 print("ALL DONE", flush=True)

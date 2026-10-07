@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gencache import CachedBackend  # noqa: E402
 from rcap.backend_ollama import OllamaBackend  # noqa: E402
 from rcap.pipeline import run_case  # noqa: E402
+from rcap.provenance import run_provenance  # noqa: E402
 from rcap.reduction_program import PLACEHOLDER, recover  # noqa: E402
 from rcap.request import unit_kinds  # noqa: E402
 
@@ -43,6 +44,7 @@ if a.limit: todo = todo[:a.limit]
 backend = OllamaBackend()
 num_ctx = backend.params.get("num_ctx")
 if a.gen_cache: backend = CachedBackend(backend, a.gen_cache)
+PROV = run_provenance(backend, driver="regen_units.py", k=1, narrow=not a.no_narrow)
 print(f"backend {backend.model} digest={backend.model_digest} params={backend.params}; "
       f"{len(todo)} to run ({len(keys) - len(todo)} done); narrow={not a.no_narrow}", flush=True)
 
@@ -58,7 +60,7 @@ for i, key in enumerate(todo, 1):
     manifest = json.loads((sap_dir.parent / "pr.json").read_text())
     sap = json.loads((sap_dir / "sap.json").read_text())
     rec = {"key": key, "target_repo": manifest["target_repo"], "target_file": sap["target_file"],
-           "source_file": sap["source_file"], "units": []}
+           "source_file": sap["source_file"], "units": [], "provenance": PROV}
     try:
         res = run_case(sap_dir, manifest, backend, narrow_whole_file_targets=not a.no_narrow)
         rec["outcome"] = next((u.generation.outcome for u in res.units if u.generation.outcome != "completion"), "completion")

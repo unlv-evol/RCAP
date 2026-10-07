@@ -10,9 +10,10 @@ build + test step needs. Resumable by key.
 """
 import json, sys, time, traceback, hashlib
 from pathlib import Path
-sys.path.insert(0, "/home/adam/Documents/work/rcap-class-project/rcap/src")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from rcap.backend_ollama import OllamaBackend
 from rcap.pipeline import run_case
+from rcap.provenance import run_provenance
 from rcap.reduction_program import recover, PLACEHOLDER
 
 RUN = Path("/home/adam/Documents/work/rcap-class-project/run477")
@@ -25,6 +26,7 @@ if "--limit" in sys.argv: keys = keys[:int(sys.argv[sys.argv.index("--limit") + 
 fname = lambda k: OUT / (k.replace("/", "__") + ".json")
 todo = [k for k in keys if not fname(k).exists()]
 backend = OllamaBackend()
+PROV = run_provenance(backend, driver="run_persist.py", k=1)
 print(f"backend {backend.model} digest={backend.model_digest}; {len(keys)} MO completions, {len(todo)} to run", flush=True)
 
 def expand(candidate, art):
@@ -38,7 +40,7 @@ for i, key in enumerate(todo, 1):
     manifest = json.loads((sap_dir.parent / "pr.json").read_text())
     sap = json.loads((sap_dir / "sap.json").read_text())
     rec = {"key": key, "target_repo": manifest["target_repo"], "target_file": sap["target_file"],
-           "source_file": sap["source_file"], "units": []}
+           "source_file": sap["source_file"], "units": [], "provenance": PROV}
     t = time.time()
     try:
         res = run_case(sap_dir, manifest, backend)

@@ -17,6 +17,10 @@ Usage: validate.py <fork-worktree> <target_repo> [--limit N] [--only-key K]
 """
 import json, os, re, subprocess, sys, time, glob, xml.etree.ElementTree as ET
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src")); sys.path.insert(0, str(Path(__file__).resolve().parent))
+from harness import lang_of, screen_unit, unit_sources  # noqa: E402
+from rcap.provenance import run_provenance  # noqa: E402
+PROV = run_provenance(None, driver="validate.py")
 V = Path("/home/adam/Documents/work/rcap-class-project/run477/validate")
 FORK = Path(sys.argv[1]).resolve(); REPO = sys.argv[2]
 GRADLE = (V / "gradle_bin.txt").read_text().strip()
@@ -104,14 +108,17 @@ print(f"{REPO}: {len(todo)} candidates to validate ({len(done)} done)", flush=Tr
 
 for i, r in enumerate(todo, 1):
     t0 = time.time(); path = r["target_file"]; fpath = FORK / path
-    row = {"key": r["key"], "file": path, "units": len(r["units"])}
+    row = {"key": r["key"], "file": path, "units": len(r["units"]), "provenance": {**PROV, "generation": r.get("provenance")}}
     subprocess.run(["git", "checkout", "-q", "--", path], cwd=FORK)
     try:
         text = fpath.read_text(encoding="utf-8")
         orig = text; applied = []
         for u in r["units"]:
             n = text.count(u["target_original"] or "\0")
-            if n == 1:
+            # a leaked placeholder, the fork's own block a second time, or one function for a whole-file unit
+            rej = screen_unit(u["target_original"] or "", u["candidate_expanded"], *unit_sources(V.parent / "salp-477-out" / r["key"], u.get("entity")), lang_of(path))
+            if rej: applied.append(rej[0])
+            elif n == 1:
                 text = text.replace(u["target_original"], u["candidate_expanded"], 1); applied.append("ok")
             else: applied.append(f"found_{n}")
         row["splice"] = applied

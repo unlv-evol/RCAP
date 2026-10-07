@@ -22,10 +22,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from harness import Harness  # noqa: E402
-from rcap.generate import has_placeholder_leak  # noqa: E402
+from harness import Harness, lang_of, screen_unit, unit_sources  # noqa: E402
+from rcap.provenance import run_provenance  # noqa: E402
 from rcap.imports import fix_imports, unused_import_fails_build  # noqa: E402
-from rcap.splice import UNSPLICEABLE, UnitEdit, merge_units  # noqa: E402
+from rcap.splice import NOT_APPLIED, UnitEdit, merge_units  # noqa: E402
 
 RUN = Path("/home/adam/Documents/work/rcap-class-project/run477")
 ap = argparse.ArgumentParser()
@@ -38,7 +38,9 @@ ap.add_argument("--repo-cache", default="/home/adam/Documents/work/rcap-class-pr
 ap.add_argument("--source-repo", default="apache__kafka.git")
 ap.add_argument("--gradle-bin-file", default=str(RUN / "validate/gradle_bin.txt"))
 ap.add_argument("--limit", type=int)
+ap.add_argument("--salp-out", default=str(RUN / "salp-477-out"), help="SAP directories (upstream texts for the duplicate check)")
 a = ap.parse_args()
+PROV = run_provenance(None, driver="revalidate.py", candidates=a.candidates)
 
 H = Harness(a.fork, Path(a.gradle_bin_file).read_text().strip()); FORK = H.fork
 OUT = Path(a.out); LOGS = OUT.with_name(OUT.stem + "-logs"); LOGS.mkdir(parents=True, exist_ok=True)
@@ -64,18 +66,23 @@ for i, key in enumerate(todo, 1):
     t0 = time.time()
     r = json.loads((Path(a.candidates) / (key.replace("/", "__") + ".json")).read_text())
     path = r["target_file"]; fpath = FORK / path
-    row = {"key": key, "file": path, "units": len(r["units"]), "fix_imports": a.fix_imports}
+    row = {"key": key, "file": path, "units": len(r["units"]), "fix_imports": a.fix_imports,
+           "provenance": {**PROV, "generation": r.get("provenance")}}
     try:
         orig = fpath.read_text(encoding="utf-8")
-        edits, leaks = [], []
+        edits, leaks = [], {}
         for n, u in enumerate(r["units"]):
             if u.get("outcome") != "completion" or not u.get("candidate_expanded"): continue
-            if has_placeholder_leak(u["candidate_expanded"]): leaks.append(n); continue
+            b_, a_ = unit_sources(Path(a.salp_out) / key, u.get("entity"))
+            rej = screen_unit(u["target_original"] or "", u["candidate_expanded"], b_, a_, lang_of(path))
+            if rej: leaks[n] = rej; continue
             edits.append(UnitEdit(f"u{n}", u["target_original"] or "", u["candidate_expanded"]))
-        m = merge_units(orig, edits)
+        m = merge_units(orig, edits, language=lang_of(path))
         row["splice"] = {k: um.as_dict() for k, um in m.units.items()}
-        row["splice_status"] = [("placeholder_leak" if n in leaks else m.units[f"u{n}"].status if f"u{n}" in m.units else "no_candidate")
+        row["rejected"] = {f"u{n}": {"reason": rj[0], "evidence": rj[1][:3]} for n, rj in leaks.items()}
+        row["splice_status"] = [(leaks[n][0] if n in leaks else m.units[f"u{n}"].status if f"u{n}" in m.units else "no_candidate")
                                 for n in range(len(r["units"]))]
+        if m.violations: raise RuntimeError("merge invariant violated: " + "; ".join(m.violations)[:240])
         text = m.text
         if a.fix_imports and m.changed:
             up = upstream_after(key, r["source_file"])
@@ -86,8 +93,10 @@ for i, key in enumerate(todo, 1):
                                  remove_unused=unused_import_fails_build(lang, checkstyle=FACTS["checkstyle"],
                                                                          scala_fatal_warnings=FACTS["scala_fatal_warnings"]))
                 row["import_fix"] = fx.as_dict(); text = fx.text
-        if not edits or all(um.status == UNSPLICEABLE for um in m.units.values()):
-            row["verdict"] = "INTEGRATION_FAIL"; row["reason"] = "placeholder leak" if leaks and not edits else "no unit could be located"
+        if not edits or all(um.status in NOT_APPLIED for um in m.units.values()):
+            row["verdict"] = "INTEGRATION_FAIL"
+            row["reason"] = (" / ".join(sorted({rj[0] for rj in leaks.values()})).replace("_", " ") if leaks and not edits
+                             else "no unit could be located")
         elif text == orig:
             row["verdict"] = "INCONCLUSIVE"; row["reason"] = "candidate identical to fork code (echo)"
         else:

@@ -39,6 +39,8 @@ from rcap.feedback import (extract_build_feedback, extract_test_feedback, missin
 from rcap.fidelity import judge  # noqa: E402
 from rcap.generate import GenerationRecord, StubBackend  # noqa: E402
 from rcap.pipeline import _expected_placeholders, run_case  # noqa: E402
+from rcap.provenance import run_provenance  # noqa: E402
+from rcap.unitkind import shape_mismatch  # noqa: E402
 from rcap.prorder import find_renames  # noqa: E402
 from rcap.reduction_program import PLACEHOLDER, recover  # noqa: E402
 from rcap.reprompt import UnitState, Validation, run_reprompt_loop  # noqa: E402
@@ -148,7 +150,9 @@ def make_validator(key, path, units, raws):
         text = fpath.read_text(encoding="utf-8"); orig = text; applied = []
         for u, cand in zip(units, expanded):
             n = text.count(u.target_original or "\0")
-            if n == 1: text = text.replace(u.target_original, cand, 1); applied.append("ok")
+            why = shape_mismatch(u.target_original, cand, "scala" if path.endswith((".scala", ".sc")) else "java")
+            if why: applied.append("shape_mismatch")      # one function for a whole-file unit: never written
+            elif n == 1: text = text.replace(u.target_original, cand, 1); applied.append("ok")
             else: applied.append(f"found_{n}")
         detail["splice"] = applied
         if not any(x == "ok" for x in applied) or applied[0] != "ok":
@@ -311,6 +315,7 @@ backend = None
 if a.arm != "A":
     backend = PromptLog(DryBackend() if a.dry_run else CachedBackend(OllamaBackend(), OUTD / "gen-cache"))
     print(f"backend {backend.model} digest={backend.model_digest} params={backend.params}", flush=True)
+PROV = run_provenance(None if a.dry_run else backend, driver="ctx_reprompt.py", arm=a.arm, k=2, echo_policy="retry")
 print(f"arm {a.arm}: {len(todo)} to run ({len(done)} done)", flush=True)
 
 for n, s in enumerate(todo, 1):
@@ -437,6 +442,7 @@ for n, s in enumerate(todo, 1):
                     "traceback": traceback.format_exc()[-1200:]})
         subprocess.run(["git", "checkout", "-q", "--", "."], cwd=FORK)
     row["seconds"] = round(time.time() - t_case, 1)
+    row["provenance"] = PROV
     with OUT.open("a") as fh: fh.write(json.dumps(row) + "\n")
     att = " ".join(str(x.get("verdict")) for x in row.get("attempts", [])) or row.get("final_verdict")
     print(f"[{n}/{len(todo)}] {key}: stored={row['stored_verdict']} -> {att} | stop={row.get('stop_reason')} "

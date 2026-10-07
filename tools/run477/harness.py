@@ -8,6 +8,31 @@ import collections, glob, os, re, subprocess, time, xml.etree.ElementTree as ET
 from pathlib import Path
 
 JAVA_HOME = "/usr/lib/jvm/java-11-openjdk-amd64"
+
+
+def screen_unit(target_original, candidate_expanded, upstream_before="", upstream_after="", language=None):
+    """Why a stored or fresh candidate must not be written into the fork, as (reason, evidence), or
+    None: placeholder_leak (a marker of any spelling), duplicated_block (rcap.accept) or
+    shape_mismatch (one function offered for a whole-file unit, rcap.unitkind). One rule for every
+    driver, so the standalone, the re-prompt and the PR-level paths cannot drift apart."""
+    from rcap.accept import rejection
+    from rcap.unitkind import shape_mismatch
+    rej = rejection(candidate_expanded, target_original, upstream_before or "", upstream_after or "", language=language)
+    if rej: return rej
+    why = shape_mismatch(target_original, candidate_expanded, language) if language else None
+    return ("shape_mismatch", [why]) if why else None
+
+
+def unit_sources(sap_dir, entity):
+    """(upstream before, upstream after) texts of one unit of a SAP directory."""
+    d = Path(sap_dir) / "functions" / (entity or "").split("/")[-1]
+    get = lambda side: next((p.read_text(errors="replace") for p in sorted(d.glob(f"source.{side}.*"))), "")  # noqa: E731
+    return get("before"), get("after")
+
+
+def lang_of(path):
+    return "scala" if str(path).endswith((".scala", ".sc")) else "java"
+
 # What the harness excludes. checkstyle is OFF, so its UnusedImports check never runs; the fork
 # builds Scala 2.12 (gradle.properties scalaVersion=2.12), for which build.gradle does NOT add
 # -Xfatal-warnings (it does only when baseScala != 2.12), and javac has no unused-import lint.

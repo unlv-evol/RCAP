@@ -25,8 +25,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from rcap.backend_ollama import OllamaBackend
 from rcap.feedback import extract_build_feedback, extract_test_feedback, parse_junit_failures
 from rcap.pipeline import _expected_placeholders, run_case
+from rcap.provenance import run_provenance
 from rcap.reduction_program import PLACEHOLDER, recover
 from rcap.reprompt import UnitState, Validation, run_reprompt_loop
+from rcap.unitkind import shape_mismatch
 
 RUN = Path("/home/adam/Documents/work/rcap-class-project/run477")
 ap = argparse.ArgumentParser()
@@ -128,7 +130,9 @@ def make_validator(case_dir, path, units, raws):
             text = fpath.read_text(encoding="utf-8"); orig = text; applied = []
             for u, cand in zip(units, expanded):
                 n = text.count(u.target_original or "\0")
-                if n == 1: text = text.replace(u.target_original, cand, 1); applied.append("ok")
+                why = shape_mismatch(u.target_original, cand, "scala" if path.endswith((".scala", ".sc")) else "java")
+                if why: applied.append("shape_mismatch")      # one function for a whole-file unit: never written
+                elif n == 1: text = text.replace(u.target_original, cand, 1); applied.append("ok")
                 else: applied.append(f"found_{n}")
             detail["splice"] = applied
             if not any(x == "ok" for x in applied) or applied[0] != "ok":
@@ -206,6 +210,7 @@ if Path(a.old_verdicts).exists():
     old = {json.loads(l)["key"]: json.loads(l) for l in open(a.old_verdicts)}
 OUT.parent.mkdir(parents=True, exist_ok=True)
 backend = OllamaBackend()
+PROV = run_provenance(backend, driver="reprompt.py", k=a.k, echo_policy=a.echo_policy)
 print(f"backend {backend.model} digest={backend.model_digest} params={backend.params}; "
       f"k={a.k}; {len(todo)} to run ({len(done)} done)", flush=True)
 
@@ -264,6 +269,7 @@ for n, s in enumerate(todo, 1):
                     "attempts": [], "error": f"{type(exc).__name__}: {exc}"[:400],
                     "stage": getattr(exc, "stage", None), "traceback": traceback.format_exc()[-800:]})
     row["seconds"] = round(time.time() - t_case, 1)
+    row["provenance"] = PROV
     with OUT.open("a") as fh: fh.write(json.dumps(row) + "\n")
     print(f"[{n}/{len(todo)}] {key}: old={row['old_verdict']} -> "
           + " ".join(str(x.get('verdict')) for x in row["attempts"])
