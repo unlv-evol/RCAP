@@ -167,6 +167,9 @@ def run_pr_loop(
     """
     by_key = {u.key: u for u in units}
     limit = None
+    from rcap.pipeline import duplicate_check
+
+    rejects = {u.key: duplicate_check(u.context, u.request.language) for u in units}
     for u in units:
         u.raw = u.generation.candidate
         u.expanded = u.expand(u.raw or "")
@@ -175,6 +178,7 @@ def run_pr_loop(
         if on_attempt:
             on_attempt(u, 1, {"prompt": u.request.prompt, "candidate_raw": u.raw,
                               "candidate_expanded": u.expanded})
+        dup = rejects[u.key](u.raw or "") if rejects[u.key] else None
         if has_placeholder_leak(u.expanded):
             # A placeholder marker survives expansion: it would be written into
             # the fork as a stray comment. Never applied, and never an "echo".
@@ -182,6 +186,13 @@ def run_pr_loop(
             row["placeholder_leak"] = True
             row["verdicts"].append({"round": 1, "verdict": "PLACEHOLDER_LEAK"})
             u.last_verdict = u.round1_verdict = "PLACEHOLDER_LEAK"
+        elif dup:
+            # The fork's own block written a second time: builds, may pass, is wrong.
+            u.status, u.reason = "not_applied", "duplicated_block"
+            u.reason_detail = {"evidence": dup[1]}
+            row["duplicated_block"] = dup[1]
+            row["verdicts"].append({"round": 1, "verdict": "DUPLICATED_BLOCK"})
+            u.last_verdict = u.round1_verdict = "DUPLICATED_BLOCK"
         elif is_echo(u.expanded, u.target_original):
             # Nothing to apply: the attempt-1 answer is the fork's own code.
             u.status, u.reason = "not_applied", "echo_attempt1"
@@ -318,7 +329,7 @@ def run_pr_loop(
                 u.prompts.add(prompt_sha)
                 t0 = time.time()
                 gen = generate(request, backend, expected_placeholders=u.expected_placeholders,
-                               allow_decline=True)
+                               allow_decline=True, reject=rejects[u.key])
                 u.attempts += 1
                 arow = _attempt_row(
                     u, u.attempts, rnd + 1, request, gen,
@@ -356,7 +367,8 @@ def run_pr_loop(
                     actions.append({"unit": u.key, "action": "dropped",
                                     "reason": "placeholder_leak"})
                     break
-                if is_echo(expanded, u.target_original):
+                if is_echo(expanded, u.target_original) or code_equal(expanded, u.target_original):
+                    # per unit: back to the fork's code (comments and layout aside) is a reversion
                     u.echoes += 1
                     arow["echo"] = True
                     arow["verdicts"].append({"round": rnd, "verdict": "ECHO"})  # type: ignore[union-attr]

@@ -39,6 +39,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
+from rcap.accept import has_placeholder_leak
 from rcap.cochange import CoChangeNote
 from rcap.context import AdaptationContext
 from rcap.generate import Backend, GenerationRecord, effective_limit_chars, generate
@@ -212,6 +213,37 @@ def code_equal(candidate: str, target_original: str) -> bool:
     return _norm(_COMMENT.sub("", candidate)) == _norm(_COMMENT.sub("", target_original))
 
 
+UNIT_CHANGED = "CHANGED"
+UNIT_ECHO = "ECHO"
+UNIT_REVERTED = "REVERTED"
+REVERT_MESSAGE = (
+    "The previous answer put a unit back to the unmodified target code although an earlier "
+    "attempt had changed it. Going back to the original is not an adaptation."
+)
+
+
+def unit_states(expanded: list[str], targets: list[str],
+                first_expanded: list[str] | None = None) -> list[str]:
+    """Per UNIT: CHANGED, ECHO (the fork's code once comments and layout are
+    ignored) or REVERTED (the fork's code now, while the unit's first attempt
+    differed from it: a later attempt went back).
+
+    The echo guard used to look at the row only: in a multi-unit row a
+    re-prompted unit could return the fork's original while its siblings kept
+    the row different from the fork, and the row passed. Most raw VALIDs of the
+    2026-10-06 re-prompt evaluation were that (PR-12789 AbstractHerder,
+    PR-12478 / PR-15154 RetryWithToleranceOperator, PR-14483)."""
+    out = []
+    for i, cand in enumerate(expanded):
+        if not code_equal(cand, targets[i]):
+            out.append(UNIT_CHANGED)
+        elif first_expanded is not None and not code_equal(first_expanded[i], targets[i]):
+            out.append(UNIT_REVERTED)
+        else:
+            out.append(UNIT_ECHO)
+    return out
+
+
 def shrink_reasons(vs_attempt1: dict[str, object]) -> list[str]:
     reasons = []
     ratio = vs_attempt1.get("line_ratio")
@@ -313,6 +345,7 @@ _STOP_FOR_OUTCOME = {
     "shape_mismatch": "unparseable",
     # the paper breaks on any extraction failure; these are the same class
     "placeholder_violation": "unparseable",
+    "duplicated_block": "unparseable",
     "no_output": "unparseable",
     "backend_error": "unparseable",
 }
@@ -367,6 +400,9 @@ def run_reprompt_loop(
     seen: list[tuple[str, ...]] = []
     limit = None
     last_failing: tuple[list[str | None], Validation, int] | None = None
+    from rcap.pipeline import duplicate_check
+
+    rejects = [duplicate_check(u.context, u.request.language) for u in units]
 
     for attempt in range(1, k + 1):
         row: dict[str, object] = {
@@ -413,10 +449,11 @@ def run_reprompt_loop(
         vs1 = measure("\n".join(expanded), "\n".join(first_expanded))
         vst = measure("\n".join(expanded), "\n".join(u.target_original for u in units))
         echo = all(is_echo(expanded[i], u.target_original) for i, u in enumerate(units))
+        states = unit_states(expanded, [u.target_original for u in units], first_expanded)
         reasons = shrink_reasons(vs1)
         row.update({
             "metrics": {"vs_attempt1": vs1, "vs_target_original": vst},
-            "echo": echo,
+            "echo": echo, "unit_states": states,
             "code_equal_to_target": all(code_equal(expanded[i], u.target_original)
                                         for i, u in enumerate(units)),
             "suspicious_shrink": bool(reasons), "shrink_reasons": reasons,
@@ -432,11 +469,29 @@ def run_reprompt_loop(
             break
         seen.append(signature)
 
+        leaks = [i for i, c in enumerate(expanded) if has_placeholder_leak(c)]
+        if leaks:
+            # never written into the fork, whatever attempt it comes from
+            row.update({"verdict": "PLACEHOLDER_LEAK", "placeholder_leak_units": leaks})
+            record["stop_reason"] = "placeholder_leak"
+            break
         if echo:
             validation = Validation(verdict="ECHO", kind="echo", feedback=ECHO_MESSAGE,
                                     summary="candidate identical to the unmodified target")
         else:
             validation = validate(attempt, expanded)
+            reverted = [i for i, st in enumerate(states) if st == UNIT_REVERTED]
+            if validation.verdict == "VALID" and (reverted or UNIT_CHANGED not in states):
+                # The row builds and passes because a unit went back to the fork's
+                # code (or because nothing but comments differs): not a port.
+                row["raw_verdict"] = "VALID"
+                validation = Validation(
+                    verdict="REVERTED" if reverted else "ECHO", kind="echo",
+                    feedback=REVERT_MESSAGE if reverted else ECHO_MESSAGE,
+                    units_with_errors=reverted,
+                    summary=(f"unit(s) {reverted} returned to the unmodified target" if reverted
+                             else "no unit differs from the unmodified target in code"),
+                    seconds=validation.seconds, detail=validation.detail)
         row.update({"verdict": validation.verdict, "error_summary": validation.summary,
                     "validation_seconds": validation.seconds,
                     "validation": validation.detail})
@@ -446,7 +501,7 @@ def run_reprompt_loop(
             record["stop_reason"] = "success"
             record["success_class"] = "suspicious_shrink" if reasons else "clean"
             break
-        if validation.verdict not in ("BUILD_FAIL", "TEST_FAIL", "ECHO"):
+        if validation.verdict not in ("BUILD_FAIL", "TEST_FAIL", "ECHO", "REVERTED"):
             # Nothing actionable to feed forward (no test class, timeout,
             # splice failure): stop rather than re-prompt blind.
             record["stop_reason"] = validation.verdict.lower()
@@ -457,7 +512,7 @@ def run_reprompt_loop(
 
         basis, basis_attempt = list(raw), attempt
         echo_notes: list[str] = []
-        if validation.verdict == "ECHO":
+        if validation.verdict in ("ECHO", "REVERTED"):
             if echo_policy == "retry" and last_failing is not None:
                 # (f) the follow-up to an echo keeps the diagnostics: the echo
                 # is discarded and the failing candidate is restated with them.
@@ -496,7 +551,7 @@ def run_reprompt_loop(
             t0 = time.time()
             gens[i] = generate(request, backend,
                                expected_placeholders=u.expected_placeholders,
-                               allow_decline=True)
+                               allow_decline=True, reject=rejects[i])
             gen_seconds[i] = round(time.time() - t0, 1)
             requests[i] = request
             truncated[i] = ctx.feedback.truncated
