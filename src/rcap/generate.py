@@ -11,11 +11,13 @@ from __future__ import annotations
 import datetime
 import hashlib
 import re
+from collections.abc import Callable
 from typing import Protocol
 
 from pydantic import BaseModel, Field
 from salp.structural import grammar_for, parse
 
+from rcap.accept import has_placeholder_leak  # noqa: F401  (re-exported: its home is rcap.accept)
 from rcap.backend_ollama import CHARS_PER_TOKEN_IMPLAUSIBLE, admissible_chars
 
 from rcap.request import AdaptationRequest
@@ -24,8 +26,9 @@ from rcap.unitkind import FILE, FUNCTION, TYPE, WHOLE_KINDS, text_kind
 _CODE_BLOCK = re.compile(r"```[A-Za-z0-9_+-]*\s*\n(.*?)```", re.DOTALL)
 _PH = re.compile(r"/\* RCAP_PH_[^*]+\*/")
 # Any mention of the placeholder prefix, however it is written (`/*RCAP_PH_1*/`,
-# `// RCAP_PH_1`): outside the exact comment form it is still a leak.
-_PH_ANY = re.compile(r"RCAP_PH_[\w.]*")
+# `// RCAP_PH_1`, and without the underscore: `/* RCAP_PHname */`): outside the
+# exact comment form it is still a leak.
+_PH_ANY = re.compile(r"RCAP_PH[\w.]*")
 # Typed refusal (repair requests only): `CANNOT_ADAPT: needs <symbol> from <file>`.
 _DECLINE = re.compile(r"^[\s`*>-]*CANNOT_ADAPT\b\s*:?\s*(.*?)[\s`*]*$", re.MULTILINE)
 
@@ -48,12 +51,6 @@ def placeholder_report(candidate: str, expected: set[str]) -> dict[str, list[str
     return {"missing": sorted(expected - set(counts)),
             "duplicated": sorted(g for g, n in counts.items() if n > 1 and g in expected),
             "unknown": unknown}
-
-
-def has_placeholder_leak(text: str | None) -> bool:
-    """A placeholder marker in text that is about to be written into the fork
-    (i.e. AFTER expansion) is never acceptable."""
-    return bool(text) and "RCAP_PH_" in text
 
 
 class Backend(Protocol):
@@ -79,7 +76,7 @@ class StubBackend:
 class GenerationRecord(BaseModel):
     case_id: str
     # completion | no_output | unparseable | shape_mismatch | placeholder_violation |
-    # limits_exceeded | backend_error | needs_cochange (repair requests only)
+    # duplicated_block | limits_exceeded | backend_error | needs_cochange (repair requests only)
     outcome: str
     candidate: str | None = None
     diagnostics: list[str] = Field(default_factory=list)
@@ -112,11 +109,17 @@ def effective_limit_chars(backend: Backend, language: str | None) -> int | None:
 
 def generate(request: AdaptationRequest, backend: Backend,
              *, expected_placeholders: set[str] | None = None,
-             allow_decline: bool = False) -> GenerationRecord:
+             allow_decline: bool = False,
+             reject: Callable[[str], tuple[str, list[str]] | None] | None = None) -> GenerationRecord:
     """`allow_decline` (repair requests): an answer `CANNOT_ADAPT: ...` instead
     of code is the distinct outcome `needs_cochange` -- a typed refusal, not an
     unparseable answer and not a completion. Off by default, so the ordinary
-    pipeline's outcomes are unchanged."""
+    pipeline's outcomes are unchanged.
+
+    `reject(candidate)` is the caller's last acceptance check on an answer that
+    passed everything else; it returns None, or (outcome, diagnostics) for a
+    typed failure (the pipeline uses it for `duplicated_block`, which needs the
+    fork and upstream texts this function does not have)."""
     # θ must make a weight change distinguishable from an evidence change
     # (sections 10-12): record generation params and model version when the
     # backend exposes them, not just its name.
@@ -266,12 +269,18 @@ def generate(request: AdaptationRequest, backend: Backend,
                 f"{kind} placeholders: {report[kind]}"
                 for kind in ("duplicated", "unknown") if report[kind]])
 
+    if reject is not None:
+        refused = reject(candidate)
+        if refused:
+            return record(refused[0], diag=list(refused[1]))
+
     return record("completion", candidate)
 
 
 def generate_with_placeholder_retry(
     request: AdaptationRequest, backend: Backend, *,
     expected_placeholders: set[str] | None = None,
+    reject: Callable[[str], tuple[str, list[str]] | None] | None = None,
 ) -> tuple[GenerationRecord, dict[str, object] | None]:
     """`generate`, plus ONE targeted retry when the answer is rejected only for
     its placeholders.
@@ -280,16 +289,20 @@ def generate_with_placeholder_retry(
     the exact list of what was wrong (missing / duplicated / unknown) and the
     rule (each original placeholder exactly once, no new one). It is issued
     once; if its answer is anything but a completion the ORIGINAL refusal is
-    returned unchanged. Returns (record, retry info or None when no retry was
+    returned unchanged. The retry's answer passes the same checks as any other
+    (placeholders of any spelling, and `reject`, i.e. no duplicated block): both
+    wrong passes the first version of the retry let through (PR-14026
+    BatchBuilder, PR-13212 OAuthBearerValidationUtils) wrote the changed loop
+    in front of the loop it was to change. Returns (record, retry info or None when no retry was
     issued). Deterministic given a deterministic backend."""
     from rcap.request import synthesize_placeholder_repair
 
-    first = generate(request, backend, expected_placeholders=expected_placeholders)
+    first = generate(request, backend, expected_placeholders=expected_placeholders, reject=reject)
     if first.outcome != "placeholder_violation" or expected_placeholders is None:
         return first, None
     report = _report_from_diagnostics(first.diagnostics, expected_placeholders)
     repair = synthesize_placeholder_repair(request, sorted(expected_placeholders), report)
-    second = generate(repair, backend, expected_placeholders=expected_placeholders)
+    second = generate(repair, backend, expected_placeholders=expected_placeholders, reject=reject)
     info: dict[str, object] = {
         "template_id": repair.template_id, "request_hash": repair.request_hash,
         "prompt_chars": len(repair.prompt), "first_diagnostics": list(first.diagnostics),

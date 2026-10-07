@@ -8,6 +8,7 @@ case still produces exactly ONE Adaptation Package aggregating the units.
 
 from __future__ import annotations
 
+from rcap.accept import describe_duplicates, duplicated_blocks
 from rcap.config import ExecutionConfig
 from rcap.context import AdaptationContext, build_context
 from rcap.coupling import CouplingRecord, detect_units
@@ -15,7 +16,7 @@ from rcap.generate import Backend, generate, generate_with_placeholder_retry
 from rcap.intake import load_case
 from rcap.materialize import materialize
 from rcap.package import AdaptationPackage, build_package
-from rcap.reduction_program import reduce_program
+from rcap.reduction_program import PLACEHOLDER, recover, reduce_program
 from rcap.reduction_semantic import reduce_semantic
 from rcap.request import synthesize
 from rcap.selection import select
@@ -47,6 +48,36 @@ def _expected_placeholders(context: AdaptationContext) -> set[str]:
             for a in context.program_context
             if a.role == "target" and a.entity == entity
             for p in a.placeholders}
+
+
+def duplicate_check(context: AdaptationContext, language: str | None):
+    """The `reject` hook of `generate` for one unit: an answer that, once its
+    placeholders are expanded, holds a block of the fork's code one more time
+    than the fork and upstream account for is `duplicated_block`, not a
+    completion (rcap.accept). This also covers "placeholder kept AND the elided
+    block written out again", which the placeholder check cannot see."""
+    entity = context.target_localization.get("function")
+    art = next((a for a in context.program_context
+                if a.role == "target" and a.entity == entity), None)
+    if art is None:
+        return None
+    original = recover(art)
+    before = context.transformation.get("source.before", "")
+    after = context.transformation.get("source.after", "")
+    for a in context.program_context:
+        if a.entity == entity and a.role == "source.before":
+            before = recover(a)
+        elif a.entity == entity and a.role == "source.after":
+            after = recover(a)
+
+    def reject(candidate: str) -> tuple[str, list[str]] | None:
+        expanded = candidate
+        for e in art.placeholders:
+            expanded = expanded.replace(PLACEHOLDER.format(n=e.ph_id), e.original_text, 1)
+        dup = duplicated_blocks(original, expanded, before, after, language=language)
+        return ("duplicated_block", describe_duplicates(dup)) if dup else None
+
+    return reject
 
 
 def run_case(
@@ -122,13 +153,15 @@ def run_case(
         raise
 
     for ur in unit_results:
+        reject = duplicate_check(ur.context, case.language)
         if placeholder_retry:
             ur.generation, ur.placeholder_retry = generate_with_placeholder_retry(
                 ur.request, backend,
-                expected_placeholders=_expected_placeholders(ur.context))
+                expected_placeholders=_expected_placeholders(ur.context), reject=reject)
         else:
             ur.generation = generate(ur.request, backend,
-                                     expected_placeholders=_expected_placeholders(ur.context))
+                                     expected_placeholders=_expected_placeholders(ur.context),
+                                     reject=reject)
 
     package: AdaptationPackage | None = None
     if all(ur.generation.outcome == "completion" for ur in unit_results):
