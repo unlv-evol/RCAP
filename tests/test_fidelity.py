@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from rcap.fidelity import (
+    COMMENT_ONLY,
     FAITHFUL,
     NO_CHANGE,
     PARTIAL,
@@ -36,7 +37,9 @@ RELABELLED = {"PR-12585/TaskMovement_fn1": "PLACEHOLDER_LEAK",
 @pytest.mark.parametrize("case", FIXTURES, ids=[c["name"] for c in FIXTURES])
 def test_round2_calibration(case):
     f = judge(case["fork_original"], case["candidate"], case["upstream_before"], case["upstream_after"])
-    assert f.label == RELABELLED.get(case["name"], case["expected"]), (f.label, f.reasons, f.evidence)
+    # the fixtures keep the label strings of the round they come from: "FAITHFUL" is FAITHFUL_CODE now
+    want = RELABELLED.get(case["name"], case["expected"])
+    assert f.label == {"FAITHFUL": FAITHFUL}.get(want, want), (f.label, f.reasons, f.evidence)
     if f.label == PARTIAL:
         assert f.reasons                       # a PARTIAL always says why
 
@@ -124,7 +127,11 @@ def test_invented_code_is_partial():
 def test_comment_only_upstream_change_is_no_change_with_reason():
     before = "void f() {\n    // a the b\n    a();\n}\n"
     after = "void f() {\n    // a b\n    a();\n}\n"
+    # the candidate makes upstream's comment change: a port of a comment, never a code port
     f = judge(before, after, before, after)
+    assert f.label == COMMENT_ONLY and f.kind == "comment"
+    # the candidate leaves the comment alone: nothing changed, and upstream changes no code either
+    f = judge(before, before, before, after)
     assert f.label == NO_CHANGE and "comment/layout-only" in f.reasons[0]
 
 
@@ -132,7 +139,8 @@ def test_text_starting_inside_a_doc_comment():
     before = "   * a the b\n   */\n  def f(): Unit = g()\n"
     after = "   * a b\n   */\n  def f(): Unit = g()\n"
     assert tokens(before) == tokens(after)
-    assert judge(before, after, before, after).label == NO_CHANGE
+    assert judge(before, after, before, after).label == COMMENT_ONLY
+    assert judge(before, before, before, after).label == NO_CHANGE
 
 
 def test_unrelated_edit_is_partial_and_says_so():

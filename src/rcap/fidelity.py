@@ -1,4 +1,4 @@
-"""Upstream fidelity of a ported unit: is the candidate the upstream change, or something else?
+r"""Upstream fidelity of a ported unit: is the candidate the upstream change, or something else?
 
 A unit that passes the build and its tests is not necessarily a port. Round 2 found a
 test whose candidate asserts the FORK's current behaviour (`TimeoutException`) where
@@ -10,28 +10,48 @@ echo and no shrink. This module compares, deterministically and at token level,
 
 and returns one label with its evidence:
 
-FAITHFUL   the upstream change is reproduced (recall >= RECALL_FAITHFUL) and the
+FAITHFUL_CODE  the upstream change is reproduced (recall >= RECALL_FAITHFUL) and the
            candidate adds little that is in neither upstream's after-side nor the
            fork original (novel share <= EXTRA_FAITHFUL; the plain extra share, not
-           in upstream's after-side, is reported too), and no expectation was weakened;
+           in upstream's after-side, is reported too), no expectation was weakened,
+           AND the candidate changes code where upstream changes code. Only this
+           label is a code port. (`FAITHFUL` is kept as an alias of it.)
+IMPORT_ONLY  what the candidate changes, or what upstream changes in this unit, is
+           import statements only. Never reported as a code port, however complete:
+           of 40 units the first guard called FAITHFUL, 16 were this or COMMENT_ONLY.
+           `flags` says when the import change is incomplete or comes with a code
+           edit upstream does not make here (`unrequested_code_edit`).
+COMMENT_ONLY  code tokens equal the fork's; the candidate changes comments the way
+           upstream does in this unit (javadoc, typo in a comment).
 PARTIAL    something is missing or extra; `reasons` says what;
+DUPLICATED_BLOCK  the candidate holds a block of the fork's code one more time than
+           the fork and upstream account for (rcap.accept): the changed loop written
+           in front of the loop it was to change. Builds, may pass, is wrong.
 WEAKENED   an expectation (assertion / expected exception / literal inside an
            assertion) differs from upstream's after-side AND equals the old value
            (fork original / upstream before) or a value present in neither; or an
            assertion that upstream keeps was removed;
 NO_CHANGE  the candidate is the fork's code (comments and layout ignored).
-PLACEHOLDER_LEAK  the candidate carries an `RCAP_PH_` marker into the fork. Checked
+PLACEHOLDER_LEAK  the candidate carries a placeholder marker of any spelling
+           (`RCAP_PH\w*`, also `/* RCAP_PHname */`) into the fork. Checked
            first: comments are otherwise ignored, so a candidate that only adds a stray
            placeholder comment used to look like NO_CHANGE.
 FORK_REGRESSION  a fork-only token (in the fork's original unit, in neither side of the
            upstream change) was removed or replaced although upstream does not change
            the code it sits in: the port displaced fork code. Token overlap cannot see
            this (every token may exist upstream or in the fork), so it is positional.
+           Only fork STATE counts: a name, a literal, a call on a fork object. A
+           respelled static API (`TimeUnit.NANOSECONDS.convert(1, HOURS)` ->
+           `HOURS.toNanos(1)`) or a dropped argument label (`f(name = v)` -> `f(v)`)
+           is not fork state. Also given when the candidate writes lines that
+           upstream REMOVES (the fork is moved to upstream's BEFORE text).
 NOTHING_TO_PORT / NOTHING_TO_PORT_IN_ISOLATION  the upstream change of this unit is a
            pure rename of names declared outside the unit, and the candidate keeps the
            fork's names. Validated alone (or when the rename cannot be completed across
            the PR) the unchanged function is the correct answer, not an echo. Only
-           given when the caller says so (`rename_context`).
+           given when the caller says so (`rename_context`). Also given, with
+           `no_counterpart=True`, to an unchanged file whose unit is a source function
+           the fork does not have. Neither a model failure nor a success.
 
 Pure text processing: comments are ignored, string literals are single tokens,
 punctuation does not count in the token shares. Mechanically applied hunks are
@@ -46,7 +66,13 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
-FAITHFUL = "FAITHFUL"
+from rcap.accept import code_lines, describe_duplicates, duplicated_blocks, placeholder_marks
+
+FAITHFUL_CODE = "FAITHFUL_CODE"
+FAITHFUL = FAITHFUL_CODE          # the old name; the old label string was "FAITHFUL"
+IMPORT_ONLY = "IMPORT_ONLY"
+COMMENT_ONLY = "COMMENT_ONLY"
+DUPLICATED_BLOCK = "DUPLICATED_BLOCK"
 PARTIAL = "PARTIAL"
 WEAKENED = "WEAKENED"
 NO_CHANGE = "NO_CHANGE"
@@ -138,7 +164,15 @@ class Assertion:
 
 def assertions(code: str) -> list[Assertion]:
     """Outermost calls assert*/expect*/fail/intercept/verify(...) and @Test(expected = ...)."""
-    ts = tokens(code)
+    out: list[Assertion] = []
+    # one excerpt at a time: a call cut off by the end of a diff excerpt must not swallow
+    # the next excerpt (PR-15154 ErrorHandlingIntegrationTest: a false "not ported")
+    for seg in _HUNK_HEADER.split(code or ""):
+        out += _segment_assertions(_segment_tokens(seg))
+    return out
+
+
+def _segment_assertions(ts: list[str]) -> list[Assertion]:
     out: list[Assertion] = []
     i = 0
     while i < len(ts):
@@ -152,6 +186,8 @@ def assertions(code: str) -> list[Assertion]:
             i += 1
             continue
         j = i + 1
+        if j >= len(ts):
+            break
         if ts[j] == "[":                       # Scala: intercept[X](...) / assertThrows[X](...)
             while j < len(ts) and ts[j] != "]":
                 j += 1
@@ -165,6 +201,9 @@ def assertions(code: str) -> list[Assertion]:
                 if depth == 0:
                     break
             k += 1
+        if k >= len(ts):                       # cut off by the end of the excerpt: not judged
+            i += 1
+            continue
         body = ts[i:k + 1]
         vals = [name] + [x for x in body[1:] if _is_value(x)]
         skel = ["<M>"] + ["<V>" if _is_value(x) else x for x in body[1:]]
@@ -202,6 +241,10 @@ class Fidelity:
     missing_tokens: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)   # assertion evidence lines
+    kind: str | None = None                # what the candidate changes: code | import | comment | none
+    upstream_kind: str | None = None       # what upstream changes in this unit: code | import | comment | none
+    flags: list[str] = field(default_factory=list)
+    adapted: list[str] = field(default_factory=list)    # upstream token -> fork-side spelling credited
 
     def as_dict(self) -> dict[str, object]:
         return dict(self.__dict__)
@@ -333,6 +376,130 @@ def declared_locally(code: str, name: str) -> bool:
     return False
 
 
+def _is_fork_state(ts: Sequence[str], i: int) -> bool:
+    """Does token i denote something of the fork's own (a name, a literal, a
+    member of a fork object), as opposed to a spelling?
+
+    Not fork state: an argument LABEL (`f(name = value)`: the value is what
+    counts), and a member of a chain rooted in a type (`TimeUnit.NANOSECONDS
+    .convert(..)`: a static API, which can be respelled without changing the
+    value). Everything else is, including a call on an object
+    (`client.setFollowRedirects(false)`) and a chain this cannot resolve."""
+    t = ts[i]
+    if not _IDENT_TOKEN.match(t):
+        return True
+    prev = ts[i - 1] if i else ""
+    nxt = ts[i + 1] if i + 1 < len(ts) else ""
+    if nxt == "=" and prev in ("(", ","):
+        return False
+    if prev == ".":
+        k = i
+        while k >= 2 and ts[k - 1] == "." and _IDENT_TOKEN.match(ts[k - 2]):
+            k -= 2
+        if k >= 1 and ts[k - 1] == ".":
+            return True                        # `x().y`: receiver is not a plain name
+        return not ts[k][:1].isupper()
+    return True
+
+
+def reverts_to_before(fork_original: str, candidate: str, upstream_before: str,
+                      upstream_after: str) -> list[str]:
+    """Code lines the candidate ADDS to the fork that upstream REMOVES (they are
+    in upstream's before-side and not in its after-side): the candidate moves
+    the fork to the text upstream moved away from (PR-16170). Two or more
+    substantive lines, so a re-added brace or a one-liner does not count."""
+    from rcap.accept import _substantive
+
+    fork, after = set(code_lines(fork_original)), set(code_lines(upstream_after))
+    removed = {ln for ln in code_lines(upstream_before) if ln not in after and _substantive(ln)}
+    added = [ln for ln in dict.fromkeys(code_lines(candidate)) if ln not in fork and ln in removed]
+    return added if len(added) >= 2 else []
+
+
+_IMPORT_LINE = re.compile(r"^[ \t]*(?:import|package)\b[^\n]*$", re.MULTILINE)
+_COMMENT_TEXT = re.compile(r'''"(?:\\.|[^"\\\n])*"|(//[^\n]*|/\*.*?(?:\*/|\Z))''', re.DOTALL)
+_WORDS = re.compile(r"[A-Za-z0-9_@<>{}#.]+")
+
+
+def without_imports(code: str) -> str:
+    """`code` without its import and package statements."""
+    return _IMPORT_LINE.sub("", code or "")
+
+
+def comment_words(code: str) -> Counter:
+    """Words of the comments of `code` (excerpt texts may start inside one)."""
+    out: Counter = Counter()
+    for seg in _HUNK_HEADER.split(code or ""):
+        close, open_ = seg.find("*/"), seg.find("/*")
+        if close >= 0 and (open_ < 0 or close < open_):
+            out.update(_WORDS.findall(seg[:close]))
+            seg = seg[close + 2:]
+        for m in _COMMENT_TEXT.finditer(seg):
+            if m.group(1):
+                out.update(_WORDS.findall(m.group(1).lstrip("/*")))
+    return out
+
+
+def change_kind(a: str, b: str) -> str:
+    """What differs between two texts: code | import | comment | none."""
+    ta, tb = tokens(a), tokens(b)
+    if ta == tb:
+        return "comment" if comment_words(a) != comment_words(b) else "none"
+    return "import" if tokens(without_imports(a)) == tokens(without_imports(b)) else "code"
+
+
+def _char_edit(a: str, b: str) -> tuple[tuple[str, str, int], ...]:
+    """The character edit a -> b: (deleted, inserted, characters after it). Quotes
+    of a literal are not part of its value. The position from the end is part of
+    the edit: `0 -> 1` in the last place is not `0 -> 1` in the middle."""
+    a, b = a.strip("\"'"), b.strip("\"'")
+    return tuple((a[i1:i2], b[j1:j2], len(a) - i2) for op, i1, i2, j1, j2
+                 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes() if op != "equal")
+
+
+def _replacements(a: Sequence[str], b: Sequence[str]) -> list[tuple[str, str]]:
+    """(old, new) token pairs of the equal-length replace blocks of a -> b."""
+    out: list[tuple[str, str]] = []
+    for op, i1, i2, j1, j2 in SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op == "replace" and i2 - i1 == j2 - j1:
+            out += [(x, y) for x, y in zip(a[i1:i2], b[j1:j2]) if x != y]
+    return out
+
+
+def adaptations(tf: Sequence[str], tc: Sequence[str], tb: Sequence[str], ta: Sequence[str],
+                up_add: Sequence[str], c_add: Sequence[str]) -> dict[str, str]:
+    """Upstream-added tokens the candidate wrote in the fork's spelling: {upstream
+    token: candidate token}. Two rules, both about a token upstream adds that
+    the candidate lacks while it adds one upstream does not have:
+
+    * a consistent NAME substitution: the candidate's added tokens are
+      upstream's with identifier u always written c (one-to-one), where the
+      fork does not have u (PR-18611: the fork has no `d3`, the port says `d2`);
+    * the SAME CHARACTER EDIT: upstream turns X0 into X1, the candidate turns
+      the fork's Y0 into Y1, and X0->X1 and Y0->Y1 are the same edit of
+      characters (PR-12250: `IBP_3_0_IV0`->`IBP_3_0_IV1` upstream, the fork's
+      `"3.0-IV0"`->`"3.0-IV1"`)."""
+    out: dict[str, str] = {}
+    fork_vocab, after_vocab = set(tf), set(ta)
+    fwd: dict[str, str] = {}
+    bad: set[str] = set()
+    for u, c in _replacements(list(up_add), list(c_add)):
+        if not (_IDENT_TOKEN.match(u) and _IDENT_TOKEN.match(c)) or u in fork_vocab or c in after_vocab:
+            continue
+        if fwd.setdefault(u, c) != c:
+            bad.add(u)
+    for u, c in fwd.items():
+        if u not in bad and list(fwd.values()).count(c) == 1:
+            out[u] = c
+    up_edits = {(x, y): _char_edit(x, y) for x, y in _replacements(tb, ta)}
+    for (y0, y1) in _replacements(tf, tc):
+        edit = _char_edit(y0, y1)
+        for (x0, x1), e in up_edits.items():
+            if e and e == edit and x1 not in out and y1 not in after_vocab and x1 != y1:
+                out[x1] = y1
+    return out
+
+
 def fork_regressions(fork_original: str, candidate: str, upstream_before: str,
                      upstream_after: str) -> list[str]:
     """Evidence lines for fork-only code the candidate displaced.
@@ -351,7 +518,8 @@ def fork_regressions(fork_original: str, candidate: str, upstream_before: str,
         return []
     vocab = set(tb) | set(ta)
     fork_only = {i for i, t in enumerate(tf) if t not in vocab and t not in _PUNCT
-                 and (_IDENT_TOKEN.match(t) or t[:1] in "\"'" or t[:1].isdigit())}
+                 and (_IDENT_TOKEN.match(t) or t[:1] in "\"'" or t[:1].isdigit())
+                 and _is_fork_state(tf, i)}
     if not fork_only:
         return []
     changed_b = [False] * (len(tb) + 1)
@@ -388,36 +556,76 @@ def fork_regressions(fork_original: str, candidate: str, upstream_before: str,
 
 def judge(fork_original: str, candidate: str, upstream_before: str, upstream_after: str,
           *, rename_context: str | None = None,
-          fork_has: Callable[[str], bool] | None = None) -> Fidelity:
+          fork_has: Callable[[str], bool] | None = None,
+          language: str | None = None, no_counterpart: bool = False,
+          upstream_file: tuple[str, str] | None = None) -> Fidelity:
     """Fidelity of `candidate` (a port of upstream_before -> upstream_after onto fork_original).
 
     `rename_context`: "isolation" (the unit was validated alone) or "pr" (the PR's
     rename could not be completed); only then may an unchanged unit whose upstream
     change is a pure rename be labelled NOTHING_TO_PORT(_IN_ISOLATION). `fork_has(name)`
-    lets the caller veto that when the fork already declares the new name."""
-    if "RCAP_PH_" in (candidate or ""):
-        lines = [ln.strip()[:200] for ln in candidate.splitlines() if "RCAP_PH_" in ln]
+    lets the caller veto that when the fork already declares the new name.
+    `language` is needed for the duplicated-block check (it finds method bodies);
+    `no_counterpart`: the caller established that the unit is a source function the
+    fork does not have (rcap.scoring), so an unchanged fork file is NOTHING_TO_PORT.
+    `upstream_file`: (before, after) of the WHOLE upstream file. SALP may slice the
+    import of a change into one unit and its code into a sibling; a whole-file
+    candidate of the import unit then carries the sibling's code too. With the file
+    texts that code is recognised as upstream's (flag `code_of_sibling_unit`,
+    FAITHFUL_CODE); without them such a unit is IMPORT_ONLY + `unrequested_code_edit`."""
+    marks = placeholder_marks(candidate)
+    if marks:
+        lines = [ln.strip()[:200] for ln in candidate.splitlines() if "RCAP_PH" in ln]
         return Fidelity(PLACEHOLDER_LEAK, reasons=[f"{len(lines)} line(s) carry a placeholder marker into the fork"],
                         evidence=lines[:5])
     tf, tc = tokens(fork_original), tokens(candidate)
     tb, ta = tokens(upstream_before), tokens(upstream_after)
+    kind, up_kind = change_kind(fork_original, candidate), change_kind(upstream_before, upstream_after)
     if tf == tc:
+        if kind == "comment":
+            cw = comment_words(candidate) - comment_words(fork_original)
+            cw += comment_words(fork_original) - comment_words(candidate)
+            uw = comment_words(upstream_after) - comment_words(upstream_before)
+            uw += comment_words(upstream_before) - comment_words(upstream_after)
+            got = sum((cw & uw).values())
+            if uw and got / sum(uw.values()) >= 0.5:
+                return Fidelity(COMMENT_ONLY, recall=round(got / sum(uw.values()), 3), kind=kind, upstream_kind=up_kind,
+                                reasons=["only comments change, as upstream's comments do in this unit"]
+                                + (["upstream also changes code here, which is not ported"] if tb != ta else []),
+                                flags=["code_not_ported"] if tb != ta else [])
+            return Fidelity(NO_CHANGE, recall=0.0 if tb != ta else None, kind=kind, upstream_kind=up_kind,
+                            reasons=["the candidate edits comments only, and not the way upstream does"])
         if tb == ta:
             # upstream changes only comments / layout here, and so does (or not) the candidate
-            return Fidelity(NO_CHANGE, reasons=["comment/layout-only: upstream changes no code token in this unit either"])
+            return Fidelity(NO_CHANGE, kind=kind, upstream_kind=up_kind,
+                            reasons=["comment/layout-only: upstream changes no code token in this unit either"])
         pairs = pure_rename(upstream_before, upstream_after) if rename_context else None
         if pairs and not any(declared_locally(upstream_after, new) for _, new in pairs) \
                 and not (fork_has and any(fork_has(new) for _, new in pairs)):
             label = NOTHING_TO_PORT_IN_ISOLATION if rename_context == "isolation" else NOTHING_TO_PORT
             shown = ", ".join(f"{o} -> {n}" for o, n in pairs)
-            return Fidelity(label, recall=0.0, reasons=[
+            return Fidelity(label, recall=0.0, kind=kind, upstream_kind=up_kind, reasons=[
                 f"upstream only renames {shown} (declared outside this unit); keeping the fork's "
                 "name is the correct result " + ("when the unit is validated alone" if rename_context == "isolation"
                                                  else "because the rename is not completed in the fork")],
                 evidence=[f"rename {o} -> {n}" for o, n in pairs])
-        return Fidelity(NO_CHANGE, recall=0.0, reasons=["candidate is the fork's code"])
+        if no_counterpart:
+            return Fidelity(NOTHING_TO_PORT, recall=0.0, kind=kind, upstream_kind=up_kind, flags=["no_counterpart"],
+                            reasons=["the unit is a source function the fork does not have; the fork's file is unchanged"])
+        return Fidelity(NO_CHANGE, recall=0.0, kind=kind, upstream_kind=up_kind, reasons=["candidate is the fork's code"])
+    dup = duplicated_blocks(fork_original, candidate, upstream_before, upstream_after, language=language) \
+        if language is not None else []
+    if dup:
+        return Fidelity(DUPLICATED_BLOCK, kind=kind, upstream_kind=up_kind,
+                        reasons=[f"{len(dup)} block(s) of the fork's code written once more than the fork and upstream account for"],
+                        evidence=describe_duplicates(dup)[:5])
     up_add, up_rem = (_significant(x) for x in _delta(tb, ta))
     c_add, c_rem = (_significant(x) for x in _delta(tf, tc))
+    # upstream tokens the candidate wrote in the fork's spelling count as written
+    adapted = adaptations(tf, tc, tb, ta, up_add, c_add)
+    if adapted:
+        back = {c: u for u, c in adapted.items()}
+        c_add = [back.get(t, t) for t in c_add]
     # upstream-added tokens the fork already has (beyond upstream's before) need not be added;
     # upstream-removed tokens the fork never had cannot be removed
     pre = Counter(_significant(tf)) - Counter(_significant(tb))
@@ -436,13 +644,23 @@ def judge(fork_original: str, candidate: str, upstream_before: str, upstream_aft
     # adaptation, not an invention; only tokens in neither text count against FAITHFUL
     novel = extra - Counter(_significant(tf))
     novel_share = round(sum(novel.values()) / len(c_add), 3) if c_add else 0.0
-    weak, notes = _assertion_check(fork_original, candidate, upstream_before, upstream_after)
+    if upstream_file is not None and up_kind != "code" and kind == "code":
+        # the unit's own upstream text holds no code change (an import unit), but the candidate
+        # edits code: its expectations are compared with the upstream FILE, where that code is
+        weak, notes = _assertion_check(fork_original, candidate, upstream_file[0], upstream_file[1])
+    else:
+        weak, notes = _assertion_check(fork_original, candidate, upstream_before, upstream_after)
+    if not adapted and Counter(c_add) == Counter(up_add) and Counter(c_rem) == Counter(up_rem):
+        # the candidate's token change IS upstream's: a note that an expectation "differs" can
+        # only come from pairing the wrong two assertions (PR-13885: two message typos)
+        notes = []
     f = Fidelity(PARTIAL, recall=recall, extra_share=extra_share, novel_share=novel_share,
                  upstream_added=len(up_add), upstream_removed=len(up_rem),
                  candidate_added=len(c_add), candidate_removed=len(c_rem),
                  extra_tokens=sorted(extra.elements())[:40],
                  missing_tokens=sorted((miss_add_net + miss_rem_net).elements())[:40],
-                 evidence=weak + notes)
+                 evidence=weak + notes, kind=kind, upstream_kind=up_kind,
+                 adapted=[f"{u} -> {c}" for u, c in sorted(adapted.items())])
     if weak:
         f.label = WEAKENED
         f.reasons.append(f"{len(weak)} weakened expectation(s)")
@@ -452,6 +670,13 @@ def judge(fork_original: str, candidate: str, upstream_before: str, upstream_aft
         f.label = FORK_REGRESSION
         f.reasons.append(f"{len(regress)} fork-only expression(s) displaced")
         f.evidence = regress + f.evidence
+        return f
+    back_lines = reverts_to_before(fork_original, candidate, upstream_before, upstream_after)
+    if back_lines:
+        f.label = FORK_REGRESSION
+        f.flags.append("reverts_to_upstream_before")
+        f.reasons.append(f"REVERTS_TO_UPSTREAM_BEFORE: the candidate writes {len(back_lines)} line(s) that upstream removes")
+        f.evidence = [f"added although upstream removes it: `{ln[:160]}`" for ln in back_lines[:5]] + f.evidence
         return f
     if recall is None:
         f.reasons.append("upstream changes no code token in this unit (comment/layout only, or already in the fork)")
@@ -465,6 +690,42 @@ def judge(fork_original: str, candidate: str, upstream_before: str, upstream_aft
                          f"nor the fork): {' '.join(sorted(novel.elements())[:12])}")
     if notes:
         f.reasons += notes
+    # ---- what kind of change is it? An import (or comment) change is never a code port.
+    if kind == "import" or (up_kind in ("import", "comment", "none") and kind == "code"):
+        imp_up = Counter(_significant(_delta(tokens(_imports_only(upstream_before)), tokens(_imports_only(upstream_after)))[0]))
+        imp_c = Counter(_significant(_delta(tokens(_imports_only(fork_original)), tokens(_imports_only(candidate)))[0]))
+        rem_up = Counter(_significant(_delta(tokens(_imports_only(upstream_before)), tokens(_imports_only(upstream_after)))[1]))
+        rem_c = Counter(_significant(_delta(tokens(_imports_only(fork_original)), tokens(_imports_only(candidate)))[1]))
+        shares = bool((imp_up & imp_c) - Counter({"import": 10 ** 6, "static": 10 ** 6})) or bool(
+            (rem_up & rem_c) - Counter({"import": 10 ** 6, "static": 10 ** 6}))
+        if kind == "code" and upstream_file is not None:
+            mine = Counter(code_lines(without_imports(candidate))) - Counter(code_lines(without_imports(fork_original)))
+            theirs = Counter(code_lines(without_imports(upstream_file[1]))) - Counter(code_lines(without_imports(upstream_file[0])))
+            gone = Counter(code_lines(without_imports(fork_original))) - Counter(code_lines(without_imports(candidate)))
+            theirs_gone = Counter(code_lines(without_imports(upstream_file[0]))) - Counter(code_lines(without_imports(upstream_file[1])))
+            n = sum(mine.values()) + sum(gone.values())
+            hit = sum((mine & theirs).values()) + sum((gone & theirs_gone).values())
+            if n and hit / n >= RECALL_FAITHFUL:
+                f.label = FAITHFUL_CODE
+                f.flags.append("code_of_sibling_unit")
+                f.reasons = [f"this unit's own upstream change is {up_kind}-only; the candidate's code edit "
+                             f"({hit} of {n} changed lines) is one upstream makes elsewhere in the same file"]
+                return f
+        if kind == "import" or shares:
+            if f.reasons:
+                f.flags.append("import_change_incomplete_or_extra")
+            if kind == "code":
+                f.flags.append("unrequested_code_edit")
+                f.reasons.append("upstream changes only imports/comments in this unit; the candidate also edits code")
+            elif up_kind == "code":
+                f.flags.append("code_not_ported")
+                f.reasons.append("upstream also changes code in this unit; the candidate changes imports only")
+            f.label = IMPORT_ONLY
+            return f
     if not f.reasons:
-        f.label = FAITHFUL
+        f.label = FAITHFUL_CODE
     return f
+
+
+def _imports_only(code: str) -> str:
+    return "\n".join(m.group(0) for m in _IMPORT_LINE.finditer(code or ""))
