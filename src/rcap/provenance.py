@@ -61,6 +61,10 @@ def run_provenance(backend: object | None = None, **extra: object) -> dict[str, 
             "num_ctx": params.get("num_ctx"), "temperature": params.get("temperature"),
             "seed": params.get("seed"), "params": params, "url": url,
         })
+        limits = getattr(backend, "limits", None)
+        if limits is not None and hasattr(limits, "as_dict"):
+            # the capacity configuration: what decides a capacity refusal
+            out["limits"] = limits.as_dict()
     out.update(code_version())
     out.update(extra)
     return out

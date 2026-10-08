@@ -20,8 +20,23 @@ from salp.structural import grammar_for, parse
 from rcap.accept import has_placeholder_leak  # noqa: F401  (re-exported: its home is rcap.accept)
 from rcap.backend_ollama import CHARS_PER_TOKEN_IMPLAUSIBLE, admissible_chars
 
+from rcap.regions import merge_regions, region_shape_error
 from rcap.request import AdaptationRequest
-from rcap.unitkind import FILE, FUNCTION, TYPE, WHOLE_KINDS, text_kind
+from rcap.unitkind import FILE, FUNCTION, REGION, TYPE, WHOLE_KINDS, text_kind
+
+# Why a unit was not attempted, or its answer not used, for a reason that lies
+# in the backend's capacity (window, output budget, speed) and not in what the
+# model wrote. Always with outcome `limits_exceeded`. A comparison of two
+# models reports results over all units and over the units neither model
+# refused for capacity.
+CAPACITY_KINDS = (
+    "request_too_large",          # refused up front: the request alone passes the request limit
+    "answer_cannot_fit_window",   # refused up front: prompt + expected answer pass the window
+    "input_truncated",            # the runtime evaluated fewer tokens than the prompt has
+    "window_overflow",            # prompt + answer passed the window while answering
+    "output_budget_exhausted",    # the answer reached the output budget (num_predict) unfinished
+    "generation_timeout",         # no answer within the timeout derived from the budget
+)
 
 _CODE_BLOCK = re.compile(r"```[A-Za-z0-9_+-]*\s*\n(.*?)```", re.DOTALL)
 _PH = re.compile(r"/\* RCAP_PH_[^*]+\*/")
@@ -85,6 +100,16 @@ class GenerationRecord(BaseModel):
     # Tokens, measured separately). Recorded only when the runtime reports
     # them — never estimated. Empty for backends without a tokenizer.
     usage: dict[str, int] = Field(default_factory=dict)
+    # The limits this request was generated (or refused) under: request size and
+    # its bound, expected prompt / answer tokens, output budget, timeout, and
+    # the runtime's timings when it reports them. Present whenever the backend
+    # declares limits; for a unit sent as regions: {"regions": [one per region]}.
+    limits: dict[str, object] = Field(default_factory=dict)
+    # One of CAPACITY_KINDS when the outcome is a capacity refusal, else None.
+    capacity: str | None = None
+    # A whole-target unit answered region by region: one entry per region
+    # request (lines, outcome, request hash, usage).
+    regions: list[dict[str, object]] = Field(default_factory=list)
     request_hash: str
     # exec_id is the deterministic (backend, model, request) anchor; the
     # timestamp (section 11: "a timestamp may be added") makes repeated runs —
@@ -137,11 +162,22 @@ def generate(request: AdaptationRequest, backend: Backend,
         f"{backend.name}:{backend.model}:{request.request_hash}".encode()).hexdigest()[:16]
 
     usage: dict[str, int] = {}
+    # Explicit limits (rcap.backend_ollama.GenerationLimits): the budget of
+    # this request. A backend without them keeps the request-size check only.
+    declared = getattr(backend, "limits", None)
+    plan: dict[str, object] = {}
+    if declared is not None and hasattr(declared, "plan"):
+        plan = declared.plan(len(request.prompt), getattr(request, "expected_answer_chars", None),
+                             getattr(request, "language", None))
+        if limit_chars:
+            plan["request_limit_chars"] = limit_chars
 
-    def record(outcome: str, candidate: str | None = None, *, diag: list[str] | None = None):
+    def record(outcome: str, candidate: str | None = None, *, diag: list[str] | None = None,
+               capacity: str | None = None):
         return GenerationRecord(
             case_id=request.case_id, outcome=outcome, candidate=candidate,
             diagnostics=diag or [], generation_config=theta, usage=dict(usage),
+            limits=dict(plan), capacity=capacity,
             request_hash=request.request_hash, exec_id=exec_id,
             executed_at=datetime.datetime.now(datetime.UTC)
             .isoformat(timespec="seconds"))
@@ -151,17 +187,41 @@ def generate(request: AdaptationRequest, backend: Backend,
     # acceptance limit — an oversized request silently truncated by the runtime
     # is a garbage completion, not a measurement.
     if limit_chars and len(request.prompt) > limit_chars:
-        return record("limits_exceeded", diag=[
+        return record("limits_exceeded", capacity="request_too_large", diag=[
             (f"request is {len(request.prompt)} chars; backend declares an "
              f"acceptance limit of {limit_chars} chars")])
+    # The window holds the prompt AND the answer. When the two cannot fit, the
+    # request is refused here instead of being generated until the runtime
+    # shifts the context (the answer is then written without the text it
+    # answers, and with no cap it runs until the client times out).
+    if plan.get("fits_window") is False:
+        return record("limits_exceeded", capacity="answer_cannot_fit_window", diag=[
+            (f"prompt (~{plan['expected_prompt_tokens']} tokens for {len(request.prompt)} chars) plus the "
+             f"expected answer (~{plan['expected_output_tokens']} tokens for "
+             f"{plan['expected_answer_chars']} chars) exceed the {plan['num_ctx']}-token window; "
+             "not generated")])
 
     try:
-        raw = backend.generate(request)
+        if plan and getattr(backend, "accepts_budget", False):
+            raw = backend.generate(request, num_predict=plan["output_budget_tokens"],
+                                   timeout=plan["timeout_s"])
+        else:
+            raw = backend.generate(request)
     except Exception as exc:  # noqa: BLE001 - any backend crash is a generation failure state
+        if "timed out" in str(exc).lower():
+            # the backend was too slow for this answer: capacity, not a model error
+            return record("limits_exceeded", capacity="generation_timeout", diag=[str(exc)])
         return record("backend_error", diag=[str(exc)])
     reported = getattr(backend, "last_usage", None)
     if reported:
         usage.update({k: v for k, v in reported.items() if isinstance(v, int)})
+    if plan:
+        timing = getattr(backend, "last_timing", None)
+        if timing:
+            plan["timing"] = dict(timing)
+        source = getattr(backend, "last_source", None)
+        if source:
+            plan["answer_source"] = source
 
     # Post-hoc runtime evidence of the same limit. The obvious test --
     # input_tokens >= num_ctx -- CANNOT EVER FIRE: when the runtime truncates it
@@ -190,7 +250,7 @@ def generate(request: AdaptationRequest, backend: Backend,
         could_be_truncated = in_tok >= num_ctx * 0.4
         if pinned or in_tok >= num_ctx or (
                 could_be_truncated and ratio > CHARS_PER_TOKEN_IMPLAUSIBLE):
-            return record("limits_exceeded", diag=[
+            return record("limits_exceeded", capacity="input_truncated", diag=[
                 (f"runtime evaluated {in_tok} prompt tokens for a "
                  f"{len(request.prompt)}-char prompt ({ratio:.2f} chars/token, "
                  f"window {num_ctx}"
@@ -205,9 +265,14 @@ def generate(request: AdaptationRequest, backend: Backend,
     # e.g. a 997-line file came back 513 lines shorter.
     out_tok = usage.get("output_tokens", 0)
     if num_ctx and in_tok and out_tok and in_tok + out_tok > num_ctx:
-        return record("limits_exceeded", diag=[
+        return record("limits_exceeded", capacity="window_overflow", diag=[
             (f"prompt ({in_tok} tokens) plus answer ({out_tok} tokens) exceed the {num_ctx}-token "
              "window; the runtime shifted the context while answering")])
+    # The answer reached the output budget: it was cut, whatever it parses as.
+    if getattr(backend, "last_done_reason", None) == "length" and plan:
+        return record("limits_exceeded", capacity="output_budget_exhausted", diag=[
+            (f"the answer reached the output budget of {plan['output_budget_tokens']} tokens "
+             f"(expected ~{plan.get('expected_output_tokens')}) and was cut by the runtime")])
 
     if not raw or not raw.strip():
         return record("no_output")
@@ -221,6 +286,39 @@ def generate(request: AdaptationRequest, backend: Backend,
             detail = declined.group(1).strip()
             return record("needs_cochange",
                           diag=["CANNOT_ADAPT: " + detail if detail else "CANNOT_ADAPT"])
+    wanted = getattr(request, "answer_kind", FUNCTION)
+    if wanted == REGION:
+        # One part of a file: its first line's indentation is part of the answer
+        # (only blank lines around it are dropped), it is not parsed on its own
+        # (the spliced file is, by generate_regions), and it must still begin and
+        # end with the part's own first and last line.
+        body = match.group(1) if match else raw
+        lines = body.splitlines()
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        candidate = "".join(x.rstrip() + "\n" for x in lines)
+        if not candidate:
+            return record("no_output")
+        # blank lines at the part's own edges are context like any other line: put them back
+        part = (request.region or {}).get("text", "").splitlines()
+        lead = next((n for n, x in enumerate(part) if x.strip()), 0)
+        trail = next((n for n, x in enumerate(reversed(part)) if x.strip()), 0)
+        candidate = "\n" * lead + candidate + "\n" * trail
+        why = region_shape_error((request.region or {}).get("text", ""), candidate)
+        if why:
+            return record("shape_mismatch", diag=[f"the answer is not the adapted part: {why}"])
+        if expected_placeholders is not None:
+            report = placeholder_report(candidate, expected_placeholders)
+            if report["missing"]:
+                return record("placeholder_violation",
+                              diag=[f"missing placeholders: {report['missing']}"])
+            if report["duplicated"] or report["unknown"]:
+                return record("placeholder_violation", diag=[
+                    f"{kind} placeholders: {report[kind]}"
+                    for kind in ("duplicated", "unknown") if report[kind]])
+        return record("completion", candidate)
     candidate = (match.group(1) if match else raw).strip() + "\n"
 
     # τ may be a bare method (probe-wrap it in a class) or, for class-level
@@ -246,7 +344,6 @@ def generate(request: AdaptationRequest, backend: Backend,
     # or an excerpt parses fine, and splicing it would replace the whole file
     # with it: a typed failure, never a completion. Function requests are not
     # checked (answer_kind defaults to "function").
-    wanted = getattr(request, "answer_kind", FUNCTION)
     if wanted in WHOLE_KINDS:
         got = text_kind(candidate, lang)
         if not (got == FILE or (wanted == TYPE and got == TYPE)):
@@ -275,6 +372,95 @@ def generate(request: AdaptationRequest, backend: Backend,
             return record(refused[0], diag=list(refused[1]))
 
     return record("completion", candidate)
+
+
+def generate_regions(
+    whole: AdaptationRequest, regions: list[AdaptationRequest], target: str, backend: Backend, *,
+    expected_placeholders: set[str] | None = None,
+    reject: Callable[[str], tuple[str, list[str]] | None] | None = None,
+    placeholder_retry: bool = False,
+) -> tuple[GenerationRecord, dict[str, object] | None]:
+    """A whole-target unit answered region by region (rcap.regions).
+
+    Each region request is generated on its own (with its own budget and, when
+    `placeholder_retry`, its own targeted retry); the answers are spliced over
+    their exact spans of `target` (rcap.splice) and the spliced text is then
+    held to what a whole-target answer is held to: it parses when the target
+    did, it has every placeholder exactly once, and `reject` accepts it. The
+    returned record is the UNIT's: its candidate is the complete target text,
+    so everything downstream is unchanged. The first region that fails decides
+    the outcome and the remaining regions are not generated.
+
+    Returns (record, placeholder-retry info of the last region retried or None)."""
+    records: list[GenerationRecord] = []
+    retry_info: dict[str, object] | None = None
+    usage: dict[str, int] = {}
+    for r in regions:
+        text = (r.region or {}).get("text", "")
+        exp = None if expected_placeholders is None else {ph for ph in expected_placeholders if ph in text}
+        if placeholder_retry:
+            rec, info = generate_with_placeholder_retry(r, backend, expected_placeholders=exp)
+            retry_info = info or retry_info
+        else:
+            rec = generate(r, backend, expected_placeholders=exp)
+        records.append(rec)
+        for k, v in rec.usage.items():
+            usage[k] = usage.get(k, 0) + v
+        if rec.outcome != "completion":
+            break
+    first = records[0]
+    combined_hash = hashlib.sha256(
+        ("regions:" + "\n".join(r.request_hash for r in regions)).encode()).hexdigest()
+
+    def record(outcome: str, candidate: str | None = None, diag: list[str] | None = None,
+               capacity: str | None = None) -> GenerationRecord:
+        return GenerationRecord(
+            case_id=whole.case_id, outcome=outcome, candidate=candidate, diagnostics=diag or [],
+            generation_config=first.generation_config, usage=dict(usage),
+            limits={"regions": [rec.limits for rec in records]}, capacity=capacity,
+            regions=[{"index": n + 1, "of": len(regions), "lines": (rq.region or {}).get("lines"),
+                      "outcome": rec.outcome, "request_hash": rq.request_hash,
+                      "template_id": rq.template_id, "prompt_chars": len(rq.prompt),
+                      "usage": dict(rec.usage), "capacity": rec.capacity}
+                     for n, (rq, rec) in enumerate(zip(regions, records))],
+            request_hash=combined_hash,
+            exec_id=hashlib.sha256(
+                f"{backend.name}:{backend.model}:{combined_hash}".encode()).hexdigest()[:16],
+            executed_at=records[-1].executed_at)
+
+    bad = records[-1]
+    if bad.outcome != "completion":
+        return record(bad.outcome, diag=[f"region {len(records)} of {len(regions)}: {d}"
+                                         for d in bad.diagnostics] or
+                      [f"region {len(records)} of {len(regions)}: {bad.outcome}"],
+                      capacity=bad.capacity), retry_info
+    from rcap.regions import Region
+
+    spans = [Region(rq.region["start"], rq.region["end"], rq.region["lines"][0], rq.region["lines"][1],
+                    rq.region["text"]) for rq in regions]
+    merged, why = merge_regions(target, spans, [rec.candidate or "" for rec in records])
+    if merged is None:
+        return record("unparseable", diag=["the region answers could not be spliced: " + why]), retry_info
+    lang = whole.language or "java"
+    grammar = grammar_for(lang)
+
+    def parses(text: str) -> bool:
+        tree = parse(text, grammar) if grammar is not None else None
+        return tree is not None and not tree.root_node.has_error
+    if grammar is not None and parses(target) and not parses(merged):
+        return record("unparseable", diag=[
+            f"the target with the adapted part(s) spliced in no longer parses as {lang}"]), retry_info
+    if expected_placeholders is not None:
+        report = placeholder_report(merged, expected_placeholders)
+        if report["missing"] or report["duplicated"] or report["unknown"]:
+            return record("placeholder_violation", diag=[
+                f"{kind} placeholders: {report[kind]}"
+                for kind in ("missing", "duplicated", "unknown") if report[kind]]), retry_info
+    if reject is not None:
+        refused = reject(merged)
+        if refused:
+            return record(refused[0], diag=list(refused[1])), retry_info
+    return record("completion", merged), retry_info
 
 
 def generate_with_placeholder_retry(

@@ -16,6 +16,7 @@ import hashlib
 from pydantic import BaseModel
 
 from rcap.context import AdaptationContext
+from rcap.regions import RegionPlan, plan_regions
 from rcap.unitkind import FILE, FUNCTION, REGION, WHOLE_KINDS, text_kind
 
 TEMPLATE_ID = "rcap-request-v1"
@@ -83,6 +84,47 @@ WHOLE_INSTRUCTIONS_ADDED = (
     "with constraints derived from recovered evidence. Add the function to the\n"
     "fork's {noun} at the corresponding place, adapted to the fork's code and\n"
     "respecting every constraint.\n" + _WHOLE_TAIL
+)
+
+
+# Region requests (rcap.regions): a whole-file unit whose change could be
+# anchored in the fork's file is asked for the anchored part only, one request
+# per region, and the answers are spliced back. The whole-file templates above
+# remain the fallback for units whose change could not be located.
+REGION_TEMPLATE_ID = "rcap-request-region-v1"
+REGION_TEMPLATE_VERSION = "1"
+
+_REGION_TAIL = (
+    "Only this part is shown and only this part can be changed; the rest of the\n"
+    "fork's file stays as it is. Apply the same change to this part, respecting\n"
+    "every constraint. Change only what the source change changes and keep\n"
+    "every other line of the part exactly as it is, including its first line,\n"
+    "its last line and the indentation. If the part already has the change, or\n"
+    "has nothing this change applies to, return the part unchanged.\n"
+    "Placeholder comments of the form /* RCAP_PH_... */ stand for elided code:\n"
+    "keep each one exactly where it is, character for character, and do not\n"
+    "invent code for it.\n"
+    "Return ONLY the complete adapted part, every line of it from its first to\n"
+    "its last, in one ```{lang} code block, with no commentary. Do not return\n"
+    "the whole file, a single statement or a diff."
+)
+REGION_INSTRUCTIONS_EXCERPT = (
+    "You are adapting a source-side code change into a diverged fork.\n"
+    "This change is not inside one function: it edits file-level code (imports,\n"
+    "fields, declarations, or several members). Below are the changed parts of\n"
+    "the source file BEFORE and AFTER the change (excerpts: a line starting\n"
+    "with @@ is a diff hunk header that says where an excerpt sits, it is not\n"
+    "code), the PART of the fork's file that corresponds to them, with a few\n"
+    "lines of the code around it, and constraints derived from recovered\n"
+    "evidence.\n" + _REGION_TAIL
+)
+REGION_INSTRUCTIONS_FUNCTION = (
+    "You are adapting a source-side code change into a diverged fork.\n"
+    "Below is the change as a before/after pair of ONE function from the source\n"
+    "project. No function of that name was located in the fork; the PART of the\n"
+    "fork's file shown is where the changed lines of that function were found,\n"
+    "with a few lines of the code around it, together with constraints derived\n"
+    "from recovered evidence.\n" + _REGION_TAIL
 )
 
 
@@ -319,10 +361,14 @@ def synthesize_placeholder_repair(request: "AdaptationRequest", expected: list[s
     request_hash = hashlib.sha256(
         f"{PLACEHOLDER_REPAIR_TEMPLATE_ID}:{PLACEHOLDER_REPAIR_TEMPLATE_VERSION}\n{prompt}"
         .encode()).hexdigest()
+    extra = {}
+    if request.region is not None:               # a region request stays one: same span, same shape check
+        extra = {"answer_kind": request.answer_kind, "region": request.region}
     return AdaptationRequest(case_id=request.case_id, language=request.language,
                              template_id=PLACEHOLDER_REPAIR_TEMPLATE_ID,
                              template_version=PLACEHOLDER_REPAIR_TEMPLATE_VERSION,
-                             prompt=prompt, request_hash=request_hash)
+                             prompt=prompt, request_hash=request_hash,
+                             expected_answer_chars=request.expected_answer_chars, **extra)
 
 
 _FEEDBACK_HEADINGS = {
@@ -362,7 +408,22 @@ class AdaptationRequest(BaseModel):
     # What a well-formed answer is: "function" (the default contract), or
     # "file" / "type" when the target is the fork's whole file / a whole type
     # (rcap.unitkind). `generate` rejects an answer of the wrong shape.
+    # "region": the answer is one part of the target file (`region` says which).
     answer_kind: str = FUNCTION
+    # How long a well-formed answer is expected to be, in characters: the text
+    # asked back plus what the source change adds to it. The backend's limits
+    # turn it into an output-token budget (rcap.generate.plan_limits). Not part
+    # of the prompt or of the hash.
+    expected_answer_chars: int | None = None
+    # Region requests only: {"index", "of", "start", "end", "lines", "text",
+    # "hunks", "anchors"}: the exact span of the target text the answer replaces.
+    region: dict | None = None
+
+
+def expected_answer_chars(asked_back: str, before: str, after: str) -> int:
+    """Length of a well-formed answer: the text asked back, plus what the source
+    change adds to it (never less than the text itself)."""
+    return len(asked_back) + max(0, len(after) - len(before))
 
 
 def unit_kinds(context: AdaptationContext) -> tuple[str, str, str]:
@@ -569,6 +630,9 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
 
     prompt = "\n\n".join(sections) + "\n"
     answer_kind = target_kind if whole else FUNCTION
+    expected = expected_answer_chars(context.transformation.get("target", ""),
+                                     context.transformation.get("source.before", ""),
+                                     context.transformation.get("source.after", ""))
     if feedback is None:
         template_id, version = ((TEMPLATE_ID, TEMPLATE_VERSION) if not whole
                                 else (WHOLE_TEMPLATE_ID, WHOLE_TEMPLATE_VERSION))
@@ -577,7 +641,7 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
         return AdaptationRequest(case_id=context.case_id, language=lang,
                                  template_id=template_id, template_version=version,
                                  prompt=prompt, request_hash=request_hash,
-                                 answer_kind=answer_kind)
+                                 answer_kind=answer_kind, expected_answer_chars=expected)
     template_id, version = ((REPAIR_V3_TEMPLATE_ID, REPAIR_V3_TEMPLATE_VERSION) if v3
                             else (REPAIR_TEMPLATE_ID, REPAIR_TEMPLATE_VERSION))
     # The attempt index is part of the hash, so every attempt of a case has a
@@ -589,7 +653,68 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
                              template_id=template_id,
                              template_version=version,
                              prompt=prompt, request_hash=request_hash,
-                             answer_kind=answer_kind)
+                             answer_kind=answer_kind, expected_answer_chars=expected)
+
+
+def synthesize_regions(context: AdaptationContext,
+                       plan: RegionPlan | None = None) -> tuple[list[AdaptationRequest], RegionPlan]:
+    """The region requests of a whole-target unit, one per region (rcap.regions).
+
+    Returns ([], plan) when the unit is not a whole-target unit, carries repair
+    feedback, or its change could not be located (`plan.reason` says why): the
+    caller then sends the whole-target request of `synthesize`. Function units
+    never get here with a plan, so their requests are untouched."""
+    lang = context.language or "java"
+    before_kind, after_kind, target_kind = unit_kinds(context)
+    t = context.transformation
+    if target_kind not in WHOLE_KINDS or getattr(context, "feedback", None) is not None:
+        return [], RegionPlan([], [], "not a whole-target unit")
+    if plan is None:
+        plan = plan_regions(t.get("source.before"), t.get("source.after"), t["target"])
+    if not plan.located:
+        return [], plan
+    excerpt = REGION in (before_kind, after_kind)
+    task = (REGION_INSTRUCTIONS_EXCERPT if excerpt else REGION_INSTRUCTIONS_FUNCTION).format(lang=lang)
+    out: list[AdaptationRequest] = []
+    for n, region in enumerate(plan.regions, 1):
+        if excerpt:
+            before = "".join(plan.hunks[i].before_text() for i in region.hunks)
+            after = "".join(plan.hunks[i].after_text() for i in region.hunks)
+            heads = ("## Source file BEFORE the change (changed parts only)",
+                     "## Source file AFTER the change (changed parts only)")
+        else:
+            before, after = t["source.before"], t["source.after"]
+            heads = ("## Source function BEFORE the change", "## Source function AFTER the change")
+        sections = [
+            "## Task\n" + task,
+            f"{heads[0]}\n```{lang}\n" + before + "```",
+            f"{heads[1]}\n```{lang}\n" + after + "```",
+            f"## Part of the target file in the fork (adapt this; return all of it)\n```{lang}\n"
+            + region.text + "```",
+        ]
+        if context.constraints:
+            lines = [f"- [{c.kind}] {c.detail}" + (" (BLOCKING)" if c.blocking else "")
+                     for c in context.constraints]
+            sections.append("## Constraints from recovered evidence\n" + "\n".join(lines))
+        if context.target_localization.get("file"):
+            where = f"File: {context.target_localization['file']}"
+            if len(plan.regions) > 1:
+                where += f"\nPart {n} of {len(plan.regions)} of this file that the change touches."
+            sections.append("## Target location\n" + where)
+        sections.append(f"## Output\nOne ```{lang} block containing the complete adapted part: every "
+                        "line of it, from the first to the last. Nothing else.")
+        prompt = "\n\n".join(sections) + "\n"
+        request_hash = hashlib.sha256(
+            f"{REGION_TEMPLATE_ID}:{REGION_TEMPLATE_VERSION}\n{prompt}".encode()).hexdigest()
+        hunk_before = "".join("".join(x + "\n" for x in plan.hunks[i].before) for i in region.hunks)
+        hunk_after = "".join("".join(x + "\n" for x in plan.hunks[i].after) for i in region.hunks)
+        out.append(AdaptationRequest(
+            case_id=context.case_id, language=lang, template_id=REGION_TEMPLATE_ID,
+            template_version=REGION_TEMPLATE_VERSION, prompt=prompt, request_hash=request_hash,
+            answer_kind=REGION,
+            expected_answer_chars=expected_answer_chars(region.text, hunk_before, hunk_after),
+            region={"index": n, "of": len(plan.regions), "text": region.text, **region.as_dict()}))
+    return out, plan
 
 
 def untraceable_lines(prompt: str, context: AdaptationContext) -> list[str]:
@@ -599,5 +724,7 @@ def untraceable_lines(prompt: str, context: AdaptationContext) -> list[str]:
     non-empty line of the given prompt outside it has no context origin —
     invented evidence."""
     legitimate = set(synthesize(context).prompt.splitlines())
+    for r in synthesize_regions(context)[0]:
+        legitimate |= set(r.prompt.splitlines())
     return [line for line in prompt.splitlines()
             if line.strip() and line not in legitimate]

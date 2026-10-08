@@ -12,13 +12,13 @@ from rcap.accept import describe_duplicates, duplicated_blocks
 from rcap.config import ExecutionConfig
 from rcap.context import AdaptationContext, build_context
 from rcap.coupling import CouplingRecord, detect_units
-from rcap.generate import Backend, generate, generate_with_placeholder_retry
+from rcap.generate import Backend, generate, generate_regions, generate_with_placeholder_retry
 from rcap.intake import load_case
 from rcap.materialize import materialize
 from rcap.package import AdaptationPackage, build_package
 from rcap.reduction_program import PLACEHOLDER, recover, reduce_program
 from rcap.reduction_semantic import reduce_semantic
-from rcap.request import synthesize
+from rcap.request import synthesize, synthesize_regions
 from rcap.selection import select
 from rcap.unitkind import narrow_targets
 
@@ -33,6 +33,11 @@ class UnitResult:
         self.generation = generation
         # Set only when the opt-in placeholder retry was issued for this unit.
         self.placeholder_retry: dict[str, object] | None = None
+        # A whole-target unit reduced to regions (rcap.regions): the requests
+        # actually sent (empty: the whole-target `request` is sent) and the
+        # plan, with the reason when the change could not be located.
+        self.region_requests: list = []
+        self.region_plan = None
 
 
 class CaseResult:
@@ -84,12 +89,18 @@ def run_case(
     sap_dir, pr_manifest: dict | None, backend: Backend,
     config: ExecutionConfig | None = None,
     *, placeholder_retry: bool = False, narrow_whole_file_targets: bool = True,
+    region_requests: bool = True,
 ) -> CaseResult:
     """`narrow_whole_file_targets` (default ON): a unit whose source payloads are
     one function but whose target payload is the fork's whole file is narrowed
     to the function's counterpart when the file declares exactly one
     (rcap.unitkind.narrow_targets). Units whose target is already a function
     are never touched, so their requests are byte-identical either way.
+
+    `region_requests` (default ON): a unit whose target is still the fork's
+    whole file is asked for the part(s) of that file its change touches, when
+    they can be located (rcap.regions), and the answers are spliced back; the
+    whole-file request remains the fallback. Function units are never touched.
 
     `placeholder_retry` (default OFF): when a unit's answer is rejected for
     its placeholder comments, issue ONE targeted repair request
@@ -139,6 +150,8 @@ def run_case(
                 unit_results.append(UnitResult(unit, context, None, None))
         for ur in unit_results:
             ur.request = synthesize(ur.context)
+            if region_requests:
+                ur.region_requests, ur.region_plan = synthesize_regions(ur.context)
     except Exception as exc:
         # Section 14: a typed failure record keeps the stable case identity and
         # the evidence dispositions established before the failure.
@@ -154,7 +167,12 @@ def run_case(
 
     for ur in unit_results:
         reject = duplicate_check(ur.context, case.language)
-        if placeholder_retry:
+        if ur.region_requests:
+            ur.generation, ur.placeholder_retry = generate_regions(
+                ur.request, ur.region_requests, ur.context.transformation["target"], backend,
+                expected_placeholders=_expected_placeholders(ur.context), reject=reject,
+                placeholder_retry=placeholder_retry)
+        elif placeholder_retry:
             ur.generation, ur.placeholder_retry = generate_with_placeholder_retry(
                 ur.request, backend,
                 expected_placeholders=_expected_placeholders(ur.context), reject=reject)
