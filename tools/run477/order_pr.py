@@ -16,7 +16,10 @@ bad sibling masked every good unit. Here, per upstream PR:
      (hard), or A is the test of B's file (soft). A name whose only provider is unavailable (no
      candidate, hunk does not apply, file absent) makes its users BLOCKED_BY(provider), unbuilt;
   5. groups are applied in topological layers, providers first, one incremental build per layer.
-     Compile errors are charged within the layer; a failed group's hard dependents are
+     Compile errors are charged within the layer by what each group CHANGED (rcap.blame): the
+     group that wrote the error line, or the group that changed the declaration the error is
+     about; anything ambiguous is isolated by building subsets of the layer, and every group
+     taken out is tried once more on the kept state. A failed group's hard dependents are
      BLOCKED_BY(group) and never built; independent groups go on. Tests run on the compiled
      final state; charged groups are taken out with their dependents and the rest is re-tested.
 
@@ -34,10 +37,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gencache import CachedBackend, load_replay  # noqa: E402
 from harness import Harness, lang_of, screen_unit  # noqa: E402
+from rcap import blame  # noqa: E402
 from rcap import cochange as cc  # noqa: E402
 from rcap import prorder as po  # noqa: E402
 from rcap.backend_ollama import OllamaBackend  # noqa: E402
-from rcap.feedback import (Span, TestFailure, _fallback, attribute_errors, attribute_test_failures,  # noqa: E402
+from rcap.feedback import (Span, TestFailure, _fallback, attribute_test_failures,  # noqa: E402
                            parse_compile_errors, parse_junit_failures)
 from rcap.provenance import run_provenance  # noqa: E402
 from rcap.imports import fix_imports, unused_import_fails_build  # noqa: E402
@@ -60,8 +64,10 @@ ap.add_argument("--old-candidates", default=str(RUN / "validate/candidates"))
 ap.add_argument("--old-results", default=str(RUN / "results-477-v2.jsonl"))
 ap.add_argument("--gen-cache", required=True); ap.add_argument("--gen-cache-ro", action="append", default=[])
 ap.add_argument("--only", action="append"); ap.add_argument("--limit", type=int)
-ap.add_argument("--max-bisect", type=int, default=10)
+ap.add_argument("--max-bisect", type=int, default=40, help="subset builds per layer for isolating an ambiguous compile error")
+ap.add_argument("--max-reinstate", type=int, default=30, help="re-tries per layer of groups taken out for a compile error")
 ap.add_argument("--plan-only", action="store_true", help="stop after the dependency graph: no build, no test")
+ap.add_argument("--no-regions", action="store_true", help="whole-file units are always asked for the whole file (as before rcap.regions)")
 a = ap.parse_args()
 
 H = Harness(a.fork, Path(a.gradle_bin_file).read_text().strip()); FORK = H.fork
@@ -152,7 +158,7 @@ def run_pr(pair, pr, backend):
                 r = json.loads(l); old_rows[r["sap"]] = r
 
     # ---------------------------------------------------------------- attempt 1 for every SAP
-    units, regions, no_cand, upstream_file = {}, [], {}, {}
+    units, regions, no_cand, upstream_file, generation = {}, [], {}, {}, {}
     t_gen = time.time()
     for name, sdir, origin in saps:
         srow = {"sap": name, "dir": str(sdir), "origin": origin, "units": [], "missing_units": []}
@@ -178,7 +184,7 @@ def run_pr(pair, pr, backend):
         o = old_rows.get(name, {})
         backend.expected = list(zip(o.get("unit_outcomes") or [], o.get("prompt_chars") or []))
         try:
-            res = run_case(sdir, manifest, backend, placeholder_retry=a.placeholder_retry)
+            res = run_case(sdir, manifest, backend, placeholder_retry=a.placeholder_retry, region_requests=not a.no_regions)
         except Exception as exc:
             srow["refused"] = {"stage": getattr(exc, "stage", None), "error": f"{type(exc).__name__}: {exc}"[:300]}
             for fn in fns: no_cand[f"{name}::{fn}"] = f"refused:{getattr(exc, 'stage', None)}"
@@ -188,11 +194,22 @@ def run_pr(pair, pr, backend):
         for i, u in enumerate(res.units):
             ent = u.context.target_localization.get("function"); fn = (ent or "").split("/")[-1]; key = f"{name}::{fn}"
             retry = u.placeholder_retry
+            # what was sent, and under which limits: in every unit's record, whatever its outcome
+            gen = {"request": ("regions" if u.region_requests else u.request.template_id),
+                   "template": (u.region_requests[0].template_id if u.region_requests else u.request.template_id),
+                   "prompt_chars": (sum(len(r.prompt) for r in u.region_requests) if u.region_requests else len(u.request.prompt)),
+                   "whole_request_chars": len(u.request.prompt), "target_chars": len(u.context.transformation.get("target", "")),
+                   "usage": dict(u.generation.usage), "limits": u.generation.limits, "capacity": u.generation.capacity,
+                   "regions": u.generation.regions,
+                   "region_plan": (u.region_plan.as_dict() if u.region_plan is not None and u.request.answer_kind != "function" else None)}
+            generation[key] = gen
             if u.generation.outcome != "completion":
                 outcome = u.generation.outcome; diags = list(u.generation.diagnostics)[:2]
                 if outcome == "backend_error" and diags and diags[0].startswith("stored-477 outcome: "):
                     outcome = diags[0].split(": ", 1)[1]; diags = ["outcome of the 477 run for the identical prompt; not regenerated"]
-                srow["missing_units"].append({"unit": key, "outcome": outcome, "diagnostics": diags, "placeholder_retry": retry})
+                    if outcome == "limits_exceeded": gen["capacity"] = "stored_477_limits_exceeded"
+                srow["missing_units"].append({"unit": key, "outcome": outcome, "diagnostics": diags, "placeholder_retry": retry,
+                                              "capacity": gen["capacity"], "request": gen["request"]})
                 no_cand[key] = outcome; continue
             art = next((x for x in u.context.program_context if x.role == "target" and x.entity == ent), None)
             raw = u.generation.candidate; exp = raw
@@ -202,11 +219,14 @@ def run_pr(pair, pr, backend):
                    placeholder_retry=retry, status=None, detail={}, flags=[], template=u.generation.request_hash)
             units[key] = st; srow["units"].append(key)
             (adir / f"{name}.{fn}.target_original.txt").write_text(st.target_original)
-            (adir / f"{name}.{fn}.prompt.txt").write_text(u.request.prompt)
+            (adir / f"{name}.{fn}.prompt.txt").write_text(
+                "\n\n".join(f"===== region request {n} of {len(u.region_requests)} =====\n{r.prompt}"
+                            for n, r in enumerate(u.region_requests, 1)) if u.region_requests else u.request.prompt)
     for name, sdir, origin in saps:      # functions the pipeline never turned into a unit (null transformation per unit, ...)
         for r in regions:
             if r.key.startswith(name + "::") and r.key not in units and r.key not in no_cand: no_cand[r.key] = "no_unit:not_adaptable"
     row["attempt1_generation"] = {"seconds": round(time.time() - t_gen, 1), "sources": dict(backend.sources)}
+    row["generation"] = generation
     region_of = {r.key: r for r in regions}
     cc.classify_hunks(files, regions)
 
@@ -398,21 +418,29 @@ def run_pr(pair, pr, backend):
 
     _decl = {}
     def decl_names(m):
-        """Names a change declares OR un-declares (its own signature, added and removed lines): an error
-        elsewhere that cannot resolve or apply one of them is charged to this change, not to its whole file."""
+        """Names a change declares OR un-declares on the lines it adds and removes: an error elsewhere
+        that cannot resolve or apply one of them is charged to this change (rcap.blame)."""
         if m not in _decl:
             if m in units:
                 u = units[m]
-                lines = [u.target_original.split("{")[0].replace("\n", " "), u.expanded.split("{")[0].replace("\n", " ")] \
-                    + po.added_lines(u.target_original, u.expanded) + po.added_lines(u.expanded, u.target_original)
+                # the lines it adds and removes, nothing else: a unit whose target is a whole file does not
+                # "declare" the class by containing it, and an unchanged signature breaks no caller
+                lines = po.added_lines(u.target_original, u.expanded) + po.added_lines(u.expanded, u.target_original)
             else: lines = mech[m]["added"] + mech[m]["removed"]
             _decl[m] = tuple(dict.fromkeys(cc.declared_names(lines)))
         return _decl[m]
 
     merge_log = {}
+    rank = {g.gid: n for n, g in enumerate(groups)}
+    layer_of = {gid: n for n, layer in enumerate(order) for gid in layer}
+    last_applied = [blame.Applied()]
     def apply_state(gids):
-        """Write the state; -> (spans by file, sources, per-member merge record)."""
+        """Write the state; -> (spans by file, sources, per-member merge record). The state is written in
+        one canonical order (layer, then the PR's own group order), whatever order it is asked for."""
+        gids = sorted(dict.fromkeys(gids), key=lambda g: (layer_of.get(g, len(order)), rank.get(g, len(rank)), g))
         restore(); ids = [m for gid in gids for m in by_id[gid].ids]
+        ap = last_applied[0] = blame.Applied()
+        for gid in gids: ap.declares[gid] = frozenset(n for m in by_id[gid].ids for n in decl_names(m))
         byfile = collections.defaultdict(list); spans, sources, rec = collections.defaultdict(list), {}, {}
         for m in ids: byfile[units[m].file if m in units else mech[m]["target"]].append(m)
         for path, ms in byfile.items():
@@ -422,6 +450,8 @@ def run_pr(pair, pr, backend):
                 (FORK / path).parent.mkdir(parents=True, exist_ok=True); (FORK / path).write_text(text, encoding="utf-8")
                 sources[path] = text
                 for m in ms: spans[path].append(Span(m, 1, text.count("\n") + 1, "mech", tuple(cc.declared_names(mech[m]["added"]))))
+                ap.changed[path] = [(1, text.count("\n") + 1, tuple(sorted({gid_of(m) for m in ms})))]
+                ap.spans[path] = [(1, text.count("\n") + 1, gid_of(m)) for m in ms]
                 continue
             edits = [UnitEdit(m, units[m].target_original, units[m].expanded) if m in units
                      else UnitEdit(m, mech[m]["old"], mech[m]["new"], priority=-1) for m in ms]
@@ -443,42 +473,57 @@ def run_pr(pair, pr, backend):
             names = {m: decl_names(m) for m in ms}
             for first, last, owners in mr.hunk_lines():   # the changed lines themselves, most specific owner first
                 for o in owners[:1]: spans[path].append(Span(o, sh(first), sh(last), "unit" if o in units else "mech", names[o]))
+                ap.changed.setdefault(path, []).append((sh(first), sh(last), tuple(sorted({gid_of(o) for o in owners}))))
             for m in sorted((m for m in ms if mr.units[m].new_span), key=lambda m: mr.units[m].new_span[1] - mr.units[m].new_span[0]):
                 first, last = mr.lines_of(m); spans[path].append(Span(m, sh(first), sh(last), "unit" if m in units else "mech", names[m]))
+                ap.spans.setdefault(path, []).append((sh(first), sh(last), gid_of(m)))
+        ap.sources = sources
         return dict(spans), sources, rec
 
     builds = []
     def build(tag, gids):
-        """-> (ok, charged {gid: text}, unattributed [text], merge records)"""
-        spans, sources, rec = apply_state(gids)
+        """Write and compile one state -> rcap.blame.BuildResult (errors carry repo-relative paths)."""
+        spans, sources, rec = apply_state(gids); ap = last_applied[0]
         bad_merge = {}
         for m, r in rec.items():
             merge_log[m] = r
             if r["status"] in NOT_APPLIED or (r["status"] == CONFLICT and r["applied"] == 0):
                 bad_merge[gid_of(m)] = f"{r['status']}: {r['reason']}"
-        if bad_merge: return None, bad_merge, [], rec
+        if bad_merge:
+            builds.append({"tag": tag, "groups": len(gids), "rc": None, "seconds": 0, "unwritable": sorted(bad_merge)})
+            return blame.BuildResult(None, applied=ap, unwritable=bad_merge)
         projs = sorted({H.project_of(p) for p in spans if H.project_of(p)})
         rc, log, secs = H.gradle(*[f"{p}:testClasses" for p in projs], timeout=BUILD_TIMEOUT)
         (rdir / f"{tag}.build.log").write_text(log)
         builds.append({"tag": tag, "groups": len(gids), "rc": rc, "seconds": secs, "projects": projs})
         print(f"    {pr} {tag}: {len(gids)} group(s) -> rc={rc} ({secs}s)", flush=True)
-        if rc == 0: return True, {}, [], rec
-        if rc == "timeout": return False, {}, ["build timeout"], rec
-        errors = attribute_errors(parse_compile_errors(log), spans, root=str(FORK), sources=sources)
-        charged, unattr = {}, []
-        live_members = [m for gid in gids for m in by_id[gid].ids]
-        for e in errors:
-            if not e.keys:
-                # no span, name, file or owner: charge the changes that (un)declare a name the message mentions
-                said = set(re.findall(r"[A-Za-z_$][\w$]*", e.message + " " + " ".join(getattr(e, "body", None) or [])))
-                hit = sorted(m for m in live_members if said & set(decl_names(m)))
-                if hit: e.keys, e.how = hit, "message-name"
-            line = f"{e.rel}:{e.line}: {e.message} ({e.how})"
-            if not e.keys: unattr.append(line)
-            for k in e.keys: charged.setdefault(gid_of(k), line[:300])
-        if not errors: unattr.append("build failed with no file:line compiler error: " + _fallback(log, 1500)[:400])
-        builds[-1].update(errors=len(errors), charged=sorted(charged), unattributed=len(unattr))
-        return False, charged, unattr[:20], rec
+        if rc == 0: return blame.BuildResult(True, applied=ap)
+        if rc == "timeout": return blame.BuildResult(False, applied=ap, note="build timeout")
+        errors = parse_compile_errors(log); prefix = str(FORK).rstrip("/") + "/"
+        for e in errors: e.rel = e.path[len(prefix):] if e.path.startswith(prefix) else e.path
+        note = "" if errors else "build failed with no file:line compiler error: " + _fallback(log, 1500)[:400]
+        builds[-1].update(errors=len(errors))
+        return blame.BuildResult(False, errors=errors, applied=ap, note=note)
+
+    attribution = []
+    def settle(tag, base, layer_groups, li=None, prefix=""):
+        """rcap.blame.settle_layer on top of `base`; statuses are set here. -> kept groups (sorted)."""
+        out = blame.settle_layer(base, layer_groups, build, hard_dependents=graph.hard_dependents, tag=tag,
+                                 max_isolation_builds=a.max_bisect, max_reinstate_builds=a.max_reinstate)
+        attribution.append({"tag": tag, "groups": sorted(layer_groups), "kept": out.kept, "builds": out.builds,
+                            "failed": out.failed, "evidence": out.evidence})
+        for g, f in sorted(out.failed.items(), key=lambda kv: kv[1]["status"] == "BLOCKED_BY"):
+            if g in accepted: accepted.remove(g)
+            if f["status"] == "BLOCKED_BY":
+                if gstate[g]["status"] is None:
+                    set_status(g, "BLOCKED_BY", blocked_by=f["blocked_by"], names=graph.hard.get(g, {}).get(f["blocked_by"], []), provider_available=True)
+                continue
+            detail = {k: v for k, v in f.items() if k != "status"}
+            detail["error"] = (prefix + str(detail.get("error", "")))[:300]
+            if li is not None: detail["layer"] = li
+            if str(f.get("how", "")).startswith("unattributed"): detail["unattributed"] = True
+            fail(g, f["status"], **detail)
+        return out.kept
 
     def fail(gid, status, **detail):
         """Mark a group and everything that cannot compile without it."""
@@ -497,37 +542,7 @@ def run_pr(pair, pr, backend):
                     lost = [p for p in graph.hard.get(gid, {}) if p not in accepted and p not in layer]
                     if lost: set_status(gid, "BLOCKED_BY", blocked_by=lost[0], names=graph.hard[gid][lost[0]], provider_available=True)
             live = [g for g in layer if gstate[g]["status"] is None]
-            rounds = 0
-            while live:
-                rounds += 1
-                ok, charged, unattr, rec = build(f"layer-{li:02d}.{rounds:02d}", accepted + live)
-                if ok: break
-                mine = [g for g in live if g in charged]
-                if ok is None or mine:
-                    for g in (mine or [g for g in charged if g in live]):
-                        fail(g, "INTEGRATION_FAIL" if ok is None else "BUILD_FAIL", error=charged[g], layer=li)
-                    earlier = [g for g in charged if g in accepted]
-                    if ok is None and earlier and not mine:      # an accepted group no longer merges next to this layer
-                        for g in live: fail(g, "INTEGRATION_FAIL", error="conflicts with an accepted group: " + charged[earlier[0]], layer=li)
-                    still = [g for g in live if gstate[g]["status"] is None]
-                    if len(still) == len(live):               # nothing in the layer could be charged: no progress possible
-                        for g in live: fail(g, "INTEGRATION_FAIL", error="state could not be written: " + "; ".join(list(charged.values())[:2])[:300], layer=li)
-                        still = []
-                    live = still
-                    continue
-                # nothing in this layer is charged: try its groups one by one on top of what is accepted
-                if len(live) == 1 or len(live) > a.max_bisect:
-                    for g in live: fail(g, "BUILD_FAIL", error="unattributed in its layer: " + "; ".join((unattr or list(charged.values()))[:2])[:300], layer=li, unattributed=True)
-                    live = []; break
-                good = []
-                for n, g in enumerate(live, 1):
-                    ok1, ch1, un1, _ = build(f"layer-{li:02d}.{rounds:02d}.single-{n:02d}", accepted + good + [g])
-                    if ok1: good.append(g)
-                    else: fail(g, "BUILD_FAIL" if ok1 is False else "INTEGRATION_FAIL", layer=li, bisected=True,
-                               error=(ch1.get(g) or "; ".join((un1 or list(ch1.values()))[:2]))[:300])
-                live = [g for g in good if gstate[g]["status"] is None]
-                break
-            accepted += live
+            if live: accepted += settle(f"layer-{li:02d}", list(accepted), live, li=li)
             # a completed rename that failed as a whole: keep the fork's names and try its members once, as plain groups
             for gid in layer:
                 g = by_id[gid]
@@ -544,11 +559,8 @@ def run_pr(pair, pr, backend):
                         ng.gid = m + "#reverted"; ng.members = [m]; by_id[ng.gid] = ng; merged_into[m] = ng.gid
                         gstate[ng.gid] = {"status": None, "detail": {"rename_reverted": g.atomic}}; solo.append(ng.gid)
                     if solo:
-                        ok, charged, unattr, _ = build(f"layer-{li:02d}.reverted", accepted + solo)
-                        if ok: accepted += solo
-                        else:
-                            for s in solo: set_status(s, "BUILD_FAIL" if s in charged or not charged else "BLOCKED_BY",
-                                                      error=charged.get(s) or "; ".join(unattr[:1]), blocked_by=None if s in charged else next(iter(charged), None))
+                        for s_ in solo: layer_of[s_] = li - 1
+                        accepted += settle(f"layer-{li:02d}.reverted", list(accepted), solo, li=li)
 
         # ---------------------------------------------------------------- tests on the compiled final state
         test_rounds, final_tests, unattr_tests, timed_out_classes, hit = 0, {}, [], set(), {}
@@ -606,11 +618,8 @@ def run_pr(pair, pr, backend):
             for g, t in hit.items():
                 accepted.remove(g); fail(g, "TEST_FAIL", error=t[:300])
             if accepted:                                   # what is left must still compile together
-                ok, ch, un, _ = build(f"after-tests-{test_rounds:02d}", accepted)
-                if not ok:
-                    for g in [x for x in accepted if x in ch] or list(accepted):
-                        if g in accepted: accepted.remove(g)
-                        fail(g, "BUILD_FAIL", error=("after a sibling was taken out: " + (ch.get(g) or "; ".join(un[:1])))[:300])
+                kept = settle(f"after-tests-{test_rounds:02d}", [], list(accepted), prefix="after a sibling was taken out: ")
+                accepted[:] = [g for g in accepted if g in kept]
         exhausted = test_rounds >= 6 and bool(hit)
         row["tests"] = {"rounds": test_rounds, "final": final_tests, "unattributed": unattr_tests[:20], "exhausted": exhausted}
         merge_log.pop("imports", None)
@@ -662,7 +671,7 @@ def run_pr(pair, pr, backend):
                          "provides": sorted(by_id[gid].provides) if gid in by_id else [],
                          "needed_by": sorted(k for k, v in out_units.items() if mid in v["depends_on_mech"])}
     dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=FORK, capture_output=True, text=True).stdout.strip()
-    row.update(units=out_units, mech_hunks=out_mech, no_candidate=no_cand, builds=builds, imports=merge_log.get("imports", {}),
+    row.update(units=out_units, mech_hunks=out_mech, no_candidate=no_cand, builds=builds, attribution=attribution, imports=merge_log.get("imports", {}),
                units_total=len(regions), units_with_candidate=len(units), final_groups=list(accepted),
                fork_clean_after=not dirty, seconds=round(time.time() - t_pr, 1))
     return row

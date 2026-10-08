@@ -19,7 +19,8 @@ class CachedBackend:
         self.replay = {}; self.expected = []; self.sources = collections.Counter()
         for k in ("name", "model", "params", "model_digest", "request_limit_chars", "request_limit_chars_is_explicit"):
             setattr(self, k, getattr(inner, k))
-        self.last_usage = None; self.last_source = None
+        self.limits = getattr(inner, "limits", None); self.accepts_budget = getattr(inner, "accepts_budget", False)
+        self.last_usage = None; self.last_source = None; self.last_done_reason = None; self.last_timing = None
 
     def _cached(self, h):
         for d in [self.dir, *self.ro]:
@@ -27,13 +28,19 @@ class CachedBackend:
             if f.exists(): return json.loads(f.read_text()), d is self.dir
         return None, False
 
-    def generate(self, request):
+    def generate(self, request, **budget):
+        """`budget` (num_predict, timeout) goes to the backend on a live call only; a cached answer was
+        written without a cap or within one, and is the same text either way."""
         h = sha(request.prompt); d, own = self._cached(h)
+        self.last_done_reason = None; self.last_timing = None
         if self.expected:
-            # outcomes the 477 run recorded for this SAP's units, in order (it kept no prompt hash
-            # for failures, so identity is checked by prompt length)
-            outcome, chars = self.expected.pop(0)
-            if outcome != "completion" and outcome not in self.regenerate and chars == len(request.prompt) \
+            # outcomes the 477 run recorded for this SAP's units (it kept no prompt hash for failures, so
+            # identity is checked by prompt length). Looked up by that length, not by position: a unit that
+            # is refused before the backend is called, or that is sent as several region requests, would
+            # shift a positional queue.
+            hit = next((n for n, (_, chars) in enumerate(self.expected) if chars == len(request.prompt)), None)
+            outcome = self.expected.pop(hit)[0] if hit is not None else "completion"
+            if outcome != "completion" and outcome not in self.regenerate \
                     and h not in self.replay and d is None:
                 self.sources["stored-477-failure"] += 1
                 raise RuntimeError("stored-477 outcome: " + outcome)
@@ -47,15 +54,18 @@ class CachedBackend:
             if d.get("error"):
                 self.sources["cache-error"] += 1; raise RuntimeError(d["error"])
             raw, usage, src = d["raw"], d.get("usage"), "cache" if own else "cache-earlier-round"
+            self.last_done_reason = d.get("done_reason"); self.last_timing = d.get("timing")
         else:
             f = self.dir / f"{h}.json"
-            try: raw = self.inner.generate(request)
-            except Exception as exc:      # a timeout costs 10 minutes: pay for it once
-                f.write_text(json.dumps({"error": f"{type(exc).__name__}: {exc}"[:300], "case_id": request.case_id}))
+            try: raw = self.inner.generate(request, **budget) if self.accepts_budget else self.inner.generate(request)
+            except Exception as exc:      # a timeout is paid for once
+                f.write_text(json.dumps({"error": f"{type(exc).__name__}: {exc}"[:300], "case_id": request.case_id, "budget": budget}))
                 self.sources["live-error"] += 1; raise
             usage = self.inner.last_usage; src = "live"
+            self.last_done_reason = getattr(self.inner, "last_done_reason", None); self.last_timing = getattr(self.inner, "last_timing", None)
             f.write_text(json.dumps({"raw": raw, "usage": usage, "model": self.model, "params": self.params,
-                                     "template_id": request.template_id, "case_id": request.case_id}))
+                                     "template_id": request.template_id, "case_id": request.case_id,
+                                     "done_reason": self.last_done_reason, "timing": self.last_timing, "budget": budget}))
         self.last_usage = usage or None; self.last_source = src; self.sources[src] += 1
         return raw
 
