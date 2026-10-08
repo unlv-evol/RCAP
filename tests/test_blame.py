@@ -297,3 +297,20 @@ def test_error_symbols():
     assert strong == {"LoggingResource"} and "Herder" in weak
     e = parse_compile_errors((FIX / "PR-12250.layer-01.03.build.log").read_text())[2]
     assert blame.error_symbols(e)[0] == {"ibp"}
+
+
+def test_groups_that_need_each_other_are_put_back_together():
+    """X and Y only build together (a dependency the graph does not know); Z breaks the build with an
+    error nothing can be charged for. Subset builds take X, Y and Z out one by one; the joint retry on
+    the kept state fails because of Z, the single retries fail for X and Y alone... so the pair is
+    retried as what it is: everything taken out except what still fails alone with the rest."""
+    def build(tag, groups):
+        s = set(groups)
+        bad = ("Z" in s) or (("X" in s) != ("Y" in s))
+        return blame.BuildResult(not bad, note="" if not bad else "build failed with no file:line compiler error")
+    out = blame.settle_layer([], ["W", "X", "Y"], build)
+    assert out.kept == ["W", "X", "Y"] and out.failed == {}             # nothing wrong: one build
+    out = blame.settle_layer([], ["W", "X", "Y", "Z"], build)
+    assert "Z" in out.failed and "W" in out.kept
+    # X and Y came back through the joint retry of the groups isolation had taken out with Z
+    assert out.kept == ["W", "X", "Y"], out.failed

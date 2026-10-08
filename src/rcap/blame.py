@@ -33,9 +33,10 @@ that is both a victim and a culprit shows its own error in the next round.
 When a round has no certain charge the suspects are tested by subset builds
 (`isolate`): each half of the suspect set on top of the rest, down to single
 groups; a set whose members build one by one but not together is reduced to a
-minimal failing set. Finally every group that was taken out is tried once
-more on top of what was kept (`reinstated`): a group is only lost when the
-kept state really does not build with it.
+minimal failing set. Finally the groups that were taken out are tried once
+more on top of what was kept, all together and then one by one
+(`reinstate`): a group is only lost when the kept state really does not
+build with it.
 
 Every decision iterates groups in sorted order and every build is asked for a
 sorted state, so the outcome does not depend on the order of the groups
@@ -190,7 +191,7 @@ def settle_layer(
     accepted: Sequence[str], layer: Iterable[str],
     build: Callable[[str, list[str]], BuildResult], *,
     hard_dependents: Callable[[str], Iterable[str]] | None = None,
-    max_isolation_builds: int = 40, max_reinstate_builds: int = 30,
+    max_isolation_builds: int = 80, max_reinstate_builds: int = 40,
     tag: str = "layer",
 ) -> LayerOutcome:
     """Find which groups of `layer` build on top of `accepted`.
@@ -276,9 +277,39 @@ def settle_layer(
                  error=(("" if how.startswith("isolated") else how + ": ")
                         + first_error(res, charges, g if any(g in c.suspects for c in charges) else None))[:300])
 
-    # every group taken out for a compile error is tried once more on what was kept
+    # every group taken out for a compile error is tried once more on what was kept: first all of
+    # them together (groups that need each other without the dependency graph knowing it fail one
+    # by one in a subset build and build as a set), then one by one
+    retry = sorted(k for k, v in failed.items()
+                   if v["status"] == "BUILD_FAIL" and "build timeout" not in str(v.get("error")))
+    if len(retry) > 1 and live is not None:
+        mine = [d for d, v in failed.items() if v.get("blocked_by") in retry and v.get("same_layer")]
+        res = run("reinstate-all", live + retry + mine, "reinstate")
+        evidence.append({"build": res.tag, "reinstate": retry, "with": mine, "ok": bool(res.ok)})
+        if res.ok:
+            for x in [*retry, *mine]:
+                failed.pop(x, None)
+                live.append(x)
+            live.sort()
+        elif len(retry) > 2:
+            # all but one: when a single group is what keeps the others from building together
+            for g in retry:
+                if count["reinstate"] >= max_reinstate_builds:
+                    break
+                others = [x for x in retry if x != g]
+                keep = [d for d in mine if failed[d].get("blocked_by") != g]
+                res = run(f"reinstate-without-{retry.index(g) + 1:02d}", live + others + keep, "reinstate")
+                evidence.append({"build": res.tag, "reinstate": others, "without": g, "ok": bool(res.ok)})
+                if res.ok:
+                    for x in [*others, *keep]:
+                        failed.pop(x, None)
+                        live.append(x)
+                    live.sort()
+                    failed[g]["reinstatement"] = "the other groups taken out build together without it"
+                    break
     for g in sorted(k for k, v in failed.items()
-                    if v["status"] == "BUILD_FAIL" and "build timeout" not in str(v.get("error"))):
+                    if v["status"] == "BUILD_FAIL" and "build timeout" not in str(v.get("error"))
+                    and "reinstatement" not in v):
         if count["reinstate"] >= max_reinstate_builds:
             failed[g]["reinstatement"] = "not tried: build budget of the layer used up"
             continue

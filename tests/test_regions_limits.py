@@ -298,3 +298,14 @@ def test_a_capacity_refusal_of_one_region_is_the_units(sap_dir, pr_manifest, tmp
     assert (g.outcome, g.capacity) == ("limits_exceeded", "generation_timeout")
     assert len(backend.calls) == 1 and len(g.regions) == 1          # the second region is not generated
     assert g.diagnostics[0].startswith("region 1 of 2:") and len(g.limits["regions"]) == 1
+
+
+def test_a_region_never_begins_or_ends_inside_a_block_comment():
+    doc = "".join(f"     * javadoc line {n} of a long comment\n" for n in range(1, 15))
+    target = BIG.replace("    private static final Logger log", "    /**\n" + doc + "     */\n    private static final Logger log")
+    r = rg.plan_regions(HUNK2_BEFORE, HUNK2_AFTER, target).regions[0]
+    assert r.text.splitlines()[0].strip() == "/**"            # 6 lines of context would have begun at `* javadoc line 10`
+    tail = BIG.replace("    public int method1(int value) {", "    /*\n" + doc + "     */\n    public int method1(int value) {")
+    r = rg.plan_regions(HUNK2_BEFORE, HUNK2_AFTER, tail).regions[0]
+    assert r.text.splitlines()[-1].strip() == "*/"
+    assert rg._comment_state(["a /* b */ c", "// not /* open", "x /* open", "still", "done */ y"]) == [False, False, False, True, True, False]

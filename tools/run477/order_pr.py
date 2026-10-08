@@ -499,6 +499,16 @@ def run_pr(pair, pr, backend):
         print(f"    {pr} {tag}: {len(gids)} group(s) -> rc={rc} ({secs}s)", flush=True)
         if rc == 0: return blame.BuildResult(True, applied=ap)
         if rc == "timeout": return blame.BuildResult(False, applied=ap, note="build timeout")
+        # a change in a Gradle project the fork does not have: nothing was compiled at all, and the groups
+        # that write into that project are the ones that cannot be integrated
+        gone = re.search(r"Project '([^']+)' not found in (?:root )?project '([^']*)'", log)
+        if gone:
+            want = (gone.group(2).rstrip(":") + ":" + gone.group(1)) if gone.group(2).startswith(":") else ":" + gone.group(1)
+            mine = {gid: f"Gradle project {want} does not exist in the fork" for gid in gids
+                    for m in by_id[gid].ids if H.project_of(units[m].file if m in units else mech[m]["target"]) == want}
+            if mine:
+                builds[-1].update(missing_project=want, unwritable=sorted(mine))
+                return blame.BuildResult(None, applied=ap, unwritable=mine)
         errors = parse_compile_errors(log); prefix = str(FORK).rstrip("/") + "/"
         for e in errors: e.rel = e.path[len(prefix):] if e.path.startswith(prefix) else e.path
         note = "" if errors else "build failed with no file:line compiler error: " + _fallback(log, 1500)[:400]

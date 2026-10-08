@@ -159,6 +159,30 @@ def locate(hunk: SourceHunk, target_lines: list[str]) -> tuple[int, int, int] | 
     return first, max(first, last), len(chain)
 
 
+def _comment_state(lines: list[str]) -> list[bool]:
+    """state[n]: line n (0-based) begins inside a `/* ... */` comment. One extra
+    entry for "after the last line". String contents are not parsed: a `/*`
+    inside a string literal is rare enough and only widens a region."""
+    state, inside = [], False
+    for line in lines:
+        state.append(inside)
+        pos = 0
+        while True:
+            if inside:
+                end = line.find("*/", pos)
+                if end < 0:
+                    break
+                inside, pos = False, end + 2
+            else:
+                start = line.find("/*", pos)
+                cut = line.find("//", pos)
+                if start < 0 or (0 <= cut < start):
+                    break
+                inside, pos = True, start + 2
+    state.append(inside)
+    return state
+
+
 def plan_regions(before: str | None, after: str | None, target: str, *,
                  context: int = CONTEXT_LINES, max_regions: int = MAX_REGIONS,
                  max_fraction: float = MAX_FRACTION) -> RegionPlan:
@@ -193,8 +217,15 @@ def plan_regions(before: str | None, after: str | None, target: str, *,
     offsets = [0]
     for x in lines:
         offsets.append(offsets[-1] + len(x))
+    opens = _comment_state(plain)
     regions: list[Region] = []
     for first, last, hs, anchors in joined:
+        # a part never begins or ends inside a block comment: asked for half a comment, the
+        # model completes or drops it, and the answer no longer matches the part's edges
+        while first > 0 and opens[first]:
+            first -= 1
+        while last < len(lines) - 1 and opens[last + 1]:
+            last += 1
         # the exact-text splice needs the region's text to occur once: widen until it does
         while target.count("".join(lines[first:last + 1])) != 1 and (first > 0 or last < len(lines) - 1):
             first, last = max(0, first - 1), min(len(lines) - 1, last + 1)
