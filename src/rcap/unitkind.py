@@ -34,7 +34,7 @@ import difflib
 import hashlib
 import re
 
-from salp.structural import grammar_for, parse
+from rcap.grammars import function_name_node, grammar_for, is_classless, parse
 
 FUNCTION = "function"   # exactly one method / constructor / def
 FILE = "file"           # a compilation unit: package clause, or no code at all
@@ -57,7 +57,18 @@ def _code_children(node) -> list:
 
 
 def _lone_method(text: str, grammar):
-    """The single method node of `text` parsed as a class body, else None."""
+    """The single method node of `text` parsed as a class body, else None.
+    In a language without classes (C) the text is parsed as it stands and the
+    single top-level function is the answer; a parse error elsewhere in it is
+    tolerated there (rcap.grammars), a second top-level node is not."""
+    if is_classless(grammar):
+        tree = parse(text, grammar)
+        if tree is None:
+            return None
+        top = _code_children(tree.root_node)
+        if len(top) == 1 and top[0].type in grammar.method_like:
+            return top[0]
+        return None
     tree = parse(_PROBE_HEAD + text + "\n}", grammar)
     if tree is None or tree.root_node.has_error:
         return None
@@ -129,16 +140,20 @@ def function_name(text: str, language: str | None) -> tuple[str, int] | None:
     node = _lone_method(text, grammar)
     if node is None:
         return None
-    name = node.child_by_field_name("name")
+    name = function_name_node(node)
     if name is None:
         return None
-    src = (_PROBE_HEAD + text + "\n}").encode()
+    src = (text if is_classless(grammar) else _PROBE_HEAD + text + "\n}").encode()
     return src[name.start_byte:name.end_byte].decode(), _arity(node, grammar)
 
 
 def _arity(method, grammar) -> int:
     n = 0
     stack = [c for c in method.children if c.type in grammar.parameters]
+    cur = method.child_by_field_name("declarator") if not stack else None
+    while cur is not None and not stack:      # C: the list hangs off the declarator chain
+        stack = [c for c in cur.children if c.type in grammar.parameters]
+        cur = cur.child_by_field_name("declarator")
     for params in stack:
         n += sum(1 for c in params.named_children if c.type in grammar.parameter)
     return n
@@ -155,7 +170,7 @@ def find_methods(file_text: str, name: str, language: str | None) -> list[tuple[
     while stack:
         node = stack.pop()
         if node.type in grammar.method_like:
-            ident = node.child_by_field_name("name")
+            ident = function_name_node(node)
             if ident is not None and raw[ident.start_byte:ident.end_byte].decode() == name:
                 out.append((node.start_byte, node.end_byte, _arity(node, grammar)))
         stack.extend(node.children)

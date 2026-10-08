@@ -100,13 +100,14 @@ def code_lines(code: str, numbers: list[int] | None = None) -> list[str]:
 def _method_of_line(text: str, language: str | None) -> list[str] | None:
     """For every source line of `text`: the name of the outermost method it
     lies in, "" outside any method. None when the text cannot be parsed."""
-    from salp.structural import grammar_for, parse
+    from rcap.grammars import function_name_node, grammar_for, is_classless, parse
 
     grammar = grammar_for((language or "java").lstrip("."))
     if grammar is None:
         return None
     lines = text.count("\n") + 1
-    for head in ("", "class __RcapProbe {\n"):
+    # C: a function stands at the top of the file, there is no class to wrap it in
+    for head in (("",) if is_classless(grammar) else ("", "class __RcapProbe {\n")):
         src = head + text + ("\n}" if head else "")
         tree = parse(src, grammar)
         if tree is None or tree.root_node.has_error:
@@ -118,7 +119,7 @@ def _method_of_line(text: str, language: str | None) -> list[str] | None:
         while stack:
             node = stack.pop()
             if node.type in grammar.method_like:
-                ident = node.child_by_field_name("name")
+                ident = function_name_node(node)
                 name = raw[ident.start_byte:ident.end_byte].decode() if ident is not None else "<init>"
                 for ln in range(node.start_point[0] - shift, node.end_point[0] - shift + 1):
                     if 0 <= ln < len(owner):

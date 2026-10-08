@@ -19,7 +19,7 @@ import hashlib
 import re
 
 from pydantic import BaseModel, Field
-from salp.structural import grammar_for, parse
+from rcap.grammars import grammar_for, parse, removable_types, tolerates_parse_errors
 
 from rcap.config import ExecutionConfig
 from rcap.materialize import MaterializationRecord
@@ -137,14 +137,18 @@ def _normalize(s: str) -> str:
     return _WS.sub("", s)
 
 
-def _candidates(root, source: str, protected: set[int], min_lines: int):
-    """Outermost removable subtrees not touching a protected line, by recursive walk."""
+def _candidates(root, source: str, protected: set[int], min_lines: int,
+                types: frozenset[str] = REMOVABLE_TYPES, clean_only: bool = False):
+    """Outermost removable subtrees not touching a protected line, by recursive walk.
+    `clean_only` (C): a subtree that holds a parse error is never cut, because
+    its extent is then a guess of the parser's (a macro, an `#ifdef` branch)."""
     found = []
 
     def walk(node):
         start, end = node.start_point[0], node.end_point[0]
-        if (node.type in REMOVABLE_TYPES
+        if (node.type in types
                 and end - start + 1 >= min_lines
+                and not (clean_only and node.has_error)
                 and not any(start <= p <= end for p in protected)):
             found.append(node)
             return  # outermost wins; never descend into a placeheld subtree
@@ -158,12 +162,15 @@ def _candidates(root, source: str, protected: set[int], min_lines: int):
 def _reduce_one(
     entity: str, role: str, text: str, protected: set[int],
     grammar, min_lines: int, removable_norm: set[str] | None,
+    language: str | None = None,
 ) -> ReducedArtifact:
     tree = parse(text, grammar)
     root = tree.root_node
     nodes_before = _count_nodes(root)
 
-    nodes = _candidates(root, text, protected, min_lines)
+    nodes = _candidates(root, text, protected, min_lines,
+                        removable_types(language, REMOVABLE_TYPES),
+                        tolerates_parse_errors(language))
     if removable_norm is not None:  # target side: only segments the source also removes
         nodes = [n for n in nodes
                  if _normalize(text[n.start_byte:n.end_byte]) in removable_norm]
@@ -235,15 +242,15 @@ def reduce_program(
 
         art_s = _reduce_one(entity, "source.before", f_s,
                             ch_s | _lines_naming(f_s, names), grammar,
-                            config.min_placeholder_lines, None)
+                            config.min_placeholder_lines, None, case.language)
         art_sp = _reduce_one(entity, "source.after", f_sp,
                              ch_sp | _lines_naming(f_sp, names), grammar,
-                             config.min_placeholder_lines, None)
+                             config.min_placeholder_lines, None, case.language)
         removable_norm = {_normalize(p.original_text)
                           for p in art_s.placeholders + art_sp.placeholders}
         art_t = _reduce_one(entity, "target", f_t,
                             _lines_naming(f_t, names), grammar,
-                            config.min_placeholder_lines, removable_norm or None)
+                            config.min_placeholder_lines, removable_norm or None, case.language)
 
         for art in (art_s, art_sp, art_t):
             _assert_no_protected_overlap(case, art)
