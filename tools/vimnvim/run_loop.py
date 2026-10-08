@@ -70,6 +70,18 @@ symbols = None
 if a.arm == "ctx_C":
     from symctx import SymbolContexts
     symbols = SymbolContexts(cfg)
+# every request that reaches the backend is kept, also one answered by a decline
+_current = {"dir": None}
+_generate = backend.generate
+
+
+def _generate_and_keep(request, **budget):
+    if _current["dir"] is not None:
+        (_current["dir"] / f"request-{sha(request.prompt)[:16]}.txt").write_text(request.prompt)
+    return _generate(request, **budget)
+
+
+backend.generate = _generate_and_keep
 out = OUT / "arms" / f"{a.arm}.jsonl"; out.parent.mkdir(parents=True, exist_ok=True)
 done = load_jsonl(out)
 print(f"{a.arm}: {len(sub['attempt1_fails'])} cases (reachable {len(sub['reachable'])}), {len(done)} done", flush=True)
@@ -91,6 +103,7 @@ with out.open("a") as fh:
                           target_original=unit.target_original, expand=unit.expand,
                           expected_placeholders=set(), parse_reference=unit.target_original)
         adir = OUT / "attempts" / a.arm / cid; adir.mkdir(parents=True, exist_ok=True)
+        _current["dir"] = adir
         attempts: dict[int, dict] = {}
 
         def on_attempt(k, arts, attempts=attempts, adir=adir):
