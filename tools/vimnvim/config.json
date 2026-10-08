@@ -1,0 +1,62 @@
+{
+  "config_id": "vim-neovim-metrics-2026-10-08",
+  "benchmark": {
+    "name": "PPatHF Vim->Neovim test set (Pan et al., ISSTA'24)",
+    "test_set": "/home/adam/Documents/work/rcap-class-project/ppathf-replication/data/data/vim_neovim_test_all.json",
+    "test_set_sha256": "FILLED_BY_freeze.py",
+    "cases": 310,
+    "case_id": "<index:03d>_<commit_id_target[:10]>",
+    "case_list": "cases.txt (written next to this file by freeze.py; every run asserts it)"
+  },
+  "stored": {
+    "baseline": "/home/adam/Documents/work/rcap-class-project/ppathf-replication/results.jsonl",
+    "baseline_rerun": "/home/adam/Documents/work/rcap-class-project/ppathf-replication/results-baseline-rerun-20260926.jsonl",
+    "ppathf_reduced": "/home/adam/Documents/work/rcap-class-project/ppathf-replication/results-reduced.jsonl",
+    "ppathf_reduced_test_set": "/home/adam/Documents/work/rcap-class-project/ppathf-replication/data/data/sliced/vim_neovim_test_sliced_all.json",
+    "harness": "/home/adam/Documents/work/rcap-class-project/ppathf-replication/harness.py",
+    "symbol_map": "/home/adam/Documents/work/rcap-class-project/ppathf-memory/symbol_map.json",
+    "vim_repo": "/home/adam/Documents/work/rcap-class-project/ppathf-memory/repos/vim.git",
+    "note": "read-only; nothing under ppathf-replication or ppathf-memory is written"
+  },
+  "erratum": {
+    "truncation_chars_per_input_token": 4.5,
+    "flag_outcomes": ["backend_error"],
+    "note": "ERRATUM-truncation.md: a stored baseline record is flagged when chars per input token > 4.5 (C) or it timed out; flagged cases are reported, never dropped silently"
+  },
+  "backend": {
+    "url": "http://localhost:11435",
+    "model": "qwen3-coder:30b",
+    "temperature": 0,
+    "seed": 12535,
+    "num_ctx": 16384,
+    "language": "c",
+    "request_limit": "rcap.backend_ollama.GenerationLimits defaults: num_ctx * 2.6 chars for C = 42598; prompt + expected answer must fit the window; output budget 1.5 x expected answer"
+  },
+  "compile": {
+    "container": "nvimcc-metrics",
+    "image": "nvim-build-env",
+    "tree": "nvim-build",
+    "tree_note": "a COPY of ppathf-memory/nvim-build (Neovim 27fb62988e, one configured build); the copy is edited and restored, the original is never touched",
+    "gate": "a case is reachable only if the developer's own function compiles in this tree",
+    "flags": ["-fsyntax-only", "-fdiagnostics-color=never", "-fmax-errors=50"]
+  },
+  "arms": {
+    "rcap_full": {"step": 2, "request": "rcap-request-v1", "program_reduction": false},
+    "rcap_reduced": {"step": 2, "request": "rcap-request-v1", "program_reduction": true,
+                     "min_placeholder_lines": 3,
+                     "protection": "changed source lines only (Program-Reduction-Only: the benchmark has no SAP evidence)",
+                     "target_rule": "only segments the source side also removes; none when the source removes none"},
+    "loop_feedback": {"step": 3, "k": 10, "echo_policy": "feedback", "attempt1": "stored.baseline",
+                      "repair": "rcap-reprompt-v2 (errors only)"},
+    "loop_retry": {"step": 3, "k": 10, "echo_policy": "retry", "attempt1": "stored.baseline",
+                   "repair": "rcap-reprompt-v2 (errors only)", "secondary": true},
+    "ctx_B": {"step": 4, "k": 2, "attempt1": "stored.baseline", "repair": "rcap-reprompt-v2 (errors only)"},
+    "ctx_C": {"step": 4, "k": 2, "attempt1": "stored.baseline",
+              "repair": "rcap-reprompt-v3-context (missing names: Vim definition / Neovim equivalents)"}
+  },
+  "scoring": {
+    "metrics": "rcap.ppathf_metrics (PPatHF package: tree-sitter C leaf tokens, comments dropped; token equality; token Levenshtein; RED = gen/src, src==0 -> /1)",
+    "protocol": "aligned: a missing or incomplete output is scored as the pre-patch function (Origin)",
+    "labels": "rcap.scoring.score_unit(language='c', rename_context='isolation')"
+  }
+}
