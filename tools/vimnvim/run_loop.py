@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Steps 3 and 4: re-prompting on compile failures, with rcap.reprompt unchanged.
 
-  run_loop.py --out DIR --arm loop_feedback|loop_retry|ctx_B|ctx_C [--only SUBSTR] [--limit N] [--offline]
+  run_loop.py --out DIR --arm loop_feedback|loop_retry|ctx_B|ctx_C|ctx_C2 [--only SUBSTR] [--limit N] [--offline]
 
 Subset (fixed by the config, written to DIR/subset.json on first use): the cases
 the compile check can reach (the developer's own function compiles in the tree)
@@ -67,9 +67,9 @@ sub = subset()
 backend = make_backend(cfg, live=not a.offline)
 prov = provenance(cfg, backend, arm=a.arm, arm_config=arm, compile_tree=compiler.commit, compile_flags=compiler.extra)
 symbols = None
-if a.arm == "ctx_C":
+if a.arm == "ctx_C" or arm.get("symbol_context"):
     from symctx import SymbolContexts
-    symbols = SymbolContexts(cfg)
+    symbols = SymbolContexts(cfg, arm.get("similar_floor", 0.6))
 # every request that reaches the backend is kept, also one answered by a decline
 _current = {"dir": None}
 _generate = backend.generate
@@ -140,7 +140,8 @@ with out.open("a") as fh:
             if not miss:
                 return {}
             scs, omitted = symbols.build(case, miss)
-            return {"symbol_context": scs, "symbol_context_omitted": omitted}
+            return {"symbol_context": scs, "symbol_context_omitted": omitted,
+                    "decline_prefill": arm.get("decline_prefill", True)}
 
         row = {"arm": a.arm, "case_id": cid, "attempt1_source": "stored.baseline", "provenance": prov}
         try:

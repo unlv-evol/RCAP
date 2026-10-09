@@ -661,3 +661,71 @@ for name, d in S["compile_vs_truth"].items():
 L.append("")
 (OUT / "tables.md").write_text("\n".join(L) + "\n")
 print(f"scored {len(ROWS)} rows, {len(SERIES)} series -> {OUT / 'tables.md'}")
+
+# ------------------------------------------------------------------ REPORT.md
+# REPORT.prose.md (hand-written, in the results directory) holds the text; the
+# markers <!--T1--> .. <!--T8-->, <!--STATUS--> and <!--STEP2--> are filled from
+# the numbers above, so the report can be re-rendered when a running arm ends.
+import datetime
+import re
+
+prose = OUT / "REPORT.prose.md"
+if prose.exists():
+    sections: dict[str, list[str]] = {}
+    cur = None
+    for line in L:
+        m = re.match(r"^## (T\d)\. (.*)$", line)
+        if m:
+            cur = m.group(1)
+            sections.setdefault(cur, []).append(f"**{m.group(2)}**")
+            continue
+        if cur:
+            sections[cur].append(line)
+    n_arm = {arm: len(ARM[arm]) for arm in ARM}
+    n_loop = {arm: len(LOOP[arm]) for arm in LOOP}
+    want_loop = len(sub["attempt1_fails"]) if sub else 0
+    pending = [f"{a} {n}/{len(cases)}" for a, n in n_arm.items() if n < len(cases)] + \
+              [f"{a} {n}/{want_loop}" for a, n in n_loop.items() if n < want_loop]
+    status = (f"Rendered {datetime.datetime.now().isoformat(timespec='seconds')} by `tools/vimnvim/report.py`. "
+              f"Arms complete: " + ", ".join([f"{a} {n}/{len(cases)}" for a, n in n_arm.items() if n == len(cases)]
+                                             + [f"{a} {n}/{want_loop}" for a, n in n_loop.items() if n == want_loop and n]) + ". "
+              + ("**Still running or not started: " + ", ".join(pending) + ".** Every number of an incomplete arm below is over the cases "
+                 "it has finished and will change; re-render with the command in section 9." if pending else "All arms are complete."))
+
+    def step2_text() -> str:
+        if not st2:
+            return "_Step 2 has not produced a row yet (the chain runs it after steps 3 and 4)._"
+        out = []
+        for arm in ("rcap_full", "rcap_reduced"):
+            d = st2.get(arm)
+            if not d:
+                out.append(f"- `{arm}`: not started.")
+                continue
+            a = agg(SERIES[arm]["rows"]); x = agg(SERIES[arm + ".as_is"]["rows"])
+            cap = sum(v for k, v in d["outcomes"].items() if k.startswith("limits_exceeded"))
+            out.append(
+                f"- `{arm}` ({d['n_done']}/{len(cases)} cases): {acc(a)} exact, AED {f2(a['aed'])}, RED {f2(a['red'], 3)} "
+                f"(median {f2(a['red_median'], 3)}) with rejected and refused answers left as the fork's code; "
+                f"{acc(x)}, AED {f2(x['aed'])}, RED {f2(x['red'], 3)} with every answer scored as written. "
+                f"Capacity refusals: {cap}. The acceptance rules reject {d['rejected_by_acceptance']} answers "
+                f"(placeholder {d['placeholder_violation']}, duplicated block {d['duplicated_block']}); scored as written those "
+                f"rejected answers are {acc(d['rejected_as_is']) if d['rejected_as_is'] else '–'} exact with RED "
+                f"{f2(d['rejected_as_is']['red'], 3) if d['rejected_as_is'] else '–'} against 1.000 as Origin.")
+        d = st2.get("reduced_vs_full")
+        if d:
+            m, b = d["pipeline"]["mcnemar"], d["both_completed"]["mcnemar"]
+            verdict = ("no significant difference" if m["p"] >= 0.05 else
+                       ("the program cut is significantly BETTER" if m["gain"] > m["loss"] else "the program cut is significantly WORSE"))
+            out.append(
+                f"- reduced vs full, paired on {d['paired_n']} cases: exact +{m['gain']}/−{m['loss']}, McNemar exact p={pv(m['p'])} "
+                f"({verdict} at 0.05); on the {d['both_completed']['n']} cases both arms completed: +{b['gain']}/−{b['loss']}, p={pv(b['p'])}. "
+                f"Capacity: {len(d['refused_full_only'])} cases are refused without the cut and answered with it, "
+                f"{len(d['refused_reduced_only'])} the other way round. {d['prompt_identical']} requests are byte-identical in both arms "
+                "(nothing to cut).")
+        return "\n".join(out)
+
+    text = prose.read_text()
+    text = re.sub(r"<!--(T\d)-->", lambda m: "\n".join(sections.get(m.group(1), ["_not available yet_"])).rstrip(), text)
+    text = text.replace("<!--STATUS-->", status).replace("<!--STEP2-->", step2_text())
+    (OUT / "REPORT.md").write_text(text)
+    print("wrote", OUT / "REPORT.md")

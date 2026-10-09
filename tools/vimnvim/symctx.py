@@ -115,8 +115,9 @@ class VimIndex:
 
 
 class SymbolContexts:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, similar_floor: float = 0.6):
         out = Path(cfg["_out"])
+        self.similar_floor = similar_floor
         self.fork = ForkIndex(out / cfg["compile"]["tree"])
         self.vim = VimIndex(Path(cfg["stored"]["vim_repo"]))
         self.map = json.loads(Path(cfg["stored"]["symbol_map"]).read_text())["map"]
@@ -131,7 +132,7 @@ class SymbolContexts:
                 members.append(decl[1])
                 hints.append(f"In earlier ports of Vim changes, `{name}` was written `{e['neovim']}` in the fork "
                              f"({e['support']} times).")
-        for sig in rank_members(name, self.fork.members, limit=4, floor=0.6):
+        for sig in rank_members(name, self.fork.members, limit=4, floor=self.similar_floor):
             if sig not in members:
                 members.append(sig)
         return members[:MAX_FORK_MEMBERS], hints

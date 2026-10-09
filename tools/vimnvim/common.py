@@ -42,6 +42,13 @@ def load_config(out_dir: str | Path) -> dict:
     """The FROZEN config of a results directory (freeze.py wrote it)."""
     cfg = json.loads((Path(out_dir) / "config.json").read_text())
     cfg["_out"] = str(Path(out_dir).resolve())
+    # arms added AFTER results were seen live in their own file and are marked
+    # exploratory; the frozen config is never edited
+    extra = Path(out_dir) / "config.exploratory.json"
+    if extra.exists():
+        for name, arm in json.loads(extra.read_text())["arms"].items():
+            assert name not in cfg["arms"] and arm.get("exploratory") is True
+            cfg["arms"][name] = arm
     return cfg
 
 
