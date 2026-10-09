@@ -85,22 +85,18 @@ def test_java_function_name_is_unchanged():
     assert function_name("void run(int a, int b) { go(); }", "java") == ("run", 2)
 
 
-def test_parse_error_of_the_target_is_not_held_against_a_c_answer():
-    """A condition split over `#ifdef` branches is an ERROR node for tree-sitter and valid C."""
-    assert not parse(CLEAN, C).root_node.has_error
-    assert parse(FORK, C).root_node.has_error
-    answer = "```c\n" + FORK.replace("return OK;", "return n;") + "```"
-    refused = generate(_request(), StubBackend(answer))
-    assert refused.outcome == "unparseable"
-    kept = generate(_request(), StubBackend(answer), parse_reference=FORK)
-    assert kept.outcome == "completion"
-    # a clean reference still makes a broken answer unparseable
-    broken = generate(_request(), StubBackend("```c\n" + CLEAN.replace("return OK;", "return (;") + "```"),
-                      parse_reference=CLEAN)
-    assert broken.outcome == "unparseable"
-    # and Java is not excused by a reference
-    java = generate(_request("java"), StubBackend("```java\nvoid f( {\n```"), parse_reference="void g( {")
-    assert java.outcome == "unparseable"
+def test_a_parse_error_does_not_reject_a_c_answer():
+    """A condition split over `#ifdef` branches, or a type passed to a macro, is an
+    ERROR node for tree-sitter and valid C: the answer is kept and the fact recorded."""
+    assert not parse(CLEAN, C).root_node.has_error and parse(FORK, C).root_node.has_error
+    kept = generate(_request(), StubBackend("```c\n" + FORK.replace("return OK;", "return n;") + "```"))
+    assert kept.outcome == "completion" and "parse error" in kept.diagnostics[0]
+    macro = CLEAN.replace("int i;", "int i;\n  char **p = ALLOC_ONE(char_u *);")
+    assert generate(_request(), StubBackend("```c\n" + macro + "```")).outcome == "completion"
+    clean = generate(_request(), StubBackend("```c\n" + CLEAN + "```"))
+    assert clean.outcome == "completion" and clean.diagnostics == []
+    # Java is held to its grammar as before
+    assert generate(_request("java"), StubBackend("```java\nvoid f( {\n```")).outcome == "unparseable"
 
 
 def test_program_cut_in_c_cuts_statements_and_recovers():

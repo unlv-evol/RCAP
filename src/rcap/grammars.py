@@ -15,12 +15,14 @@ What differs in C, and what the callers do about it (`is_classless`):
 * its name is not a `name` field but sits at the bottom of the declarator
   chain (`function_name_node`);
 * real C does not always parse without an ERROR node: a function-like macro
-  in a signature (`FUNC_ATTR_NONNULL_ALL`), or braces split over `#ifdef`
-  branches, are valid to the compiler and an error to tree-sitter. 27 of the
-  310 Neovim functions and 136 of the 310 Vim functions of the benchmark have
-  one. A parse error is therefore not evidence of a broken answer in C
-  (`tolerates_parse_errors`): `rcap.generate` only calls a C answer
-  unparseable when the text it was asked to adapt parses clean.
+  in a signature (`FUNC_ATTR_NONNULL_ALL`), a type passed to a macro
+  (`ALLOC_ONE(char_u *)`), a condition split over `#ifdef` branches are valid
+  to the compiler and an error to tree-sitter. 27 of the 310 Neovim functions
+  and 136 of the 310 Vim functions of the benchmark have one, and so do 35 of
+  the 300 stored zero-shot answers, one of them token-identical to the
+  developer's port. A parse error is therefore no evidence of a broken answer
+  in C (`tolerates_parse_errors`): `rcap.generate` keeps such an answer and
+  records the fact; whether it is valid code is the compile check's question.
 
 Removable statement types of the program cut are per language too
 (`removable_types`): Java's set is the recorded one, unchanged.

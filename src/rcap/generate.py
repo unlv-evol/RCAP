@@ -135,16 +135,8 @@ def effective_limit_chars(backend: Backend, language: str | None) -> int | None:
 def generate(request: AdaptationRequest, backend: Backend,
              *, expected_placeholders: set[str] | None = None,
              allow_decline: bool = False,
-             reject: Callable[[str], tuple[str, list[str]] | None] | None = None,
-             parse_reference: str | None = None) -> GenerationRecord:
-    """`parse_reference`: the text the answer replaces (the fork's function,
-    in the form the request showed it). Only read for a language whose valid
-    code may hold tree-sitter ERROR nodes (C, rcap.grammars): there an answer
-    with a parse error is `unparseable` only if this reference parses clean,
-    so the answer is never held to more than the code it was made from. For
-    Java and Scala it changes nothing.
-
-    `allow_decline` (repair requests): an answer `CANNOT_ADAPT: ...` instead
+             reject: Callable[[str], tuple[str, list[str]] | None] | None = None) -> GenerationRecord:
+    """`allow_decline` (repair requests): an answer `CANNOT_ADAPT: ...` instead
     of code is the distinct outcome `needs_cochange` -- a typed refusal, not an
     unparseable answer and not a completion. Off by default, so the ordinary
     pipeline's outcomes are unchanged.
@@ -339,16 +331,20 @@ def generate(request: AdaptationRequest, backend: Backend,
     if grammar is None:
         return record("unparseable",
                       diag=[f"no tree-sitter grammar available for {lang}"])
+    parse_note: list[str] = []
     def parses(text: str) -> bool:
         tree = parse(text, grammar)
         return tree is not None and not tree.root_node.has_error
     if not (parses("class __RcapProbe {\n" + candidate + "\n}") or parses(candidate)):
-        excused = (tolerates_parse_errors(lang) and parse_reference is not None
-                   and not parses(parse_reference))
-        if not excused:
+        # C (rcap.grammars): a tree-sitter ERROR node is no evidence of broken
+        # code there (a type passed to a macro, an `#ifdef` inside an
+        # expression), so the answer is kept and the fact recorded. For Java
+        # and Scala nothing changes.
+        if not tolerates_parse_errors(lang):
             diag = (f"candidate parses neither as a {lang} method nor as a "
                     "compilation unit")
             return record("unparseable", diag=[diag])
+        parse_note = [f"tree-sitter reports a parse error; not a rejection in {lang}"]
 
     # Answer shape. A request whose target is the fork's whole file (or a whole
     # type) is answered by the whole file (type). An answer that is one function
@@ -382,7 +378,7 @@ def generate(request: AdaptationRequest, backend: Backend,
         if refused:
             return record(refused[0], diag=list(refused[1]))
 
-    return record("completion", candidate)
+    return record("completion", candidate, diag=parse_note)
 
 
 def generate_regions(

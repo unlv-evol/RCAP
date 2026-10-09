@@ -48,7 +48,7 @@ with out.open("a") as fh:
         unit = Unit(cid, case, bool(arm["program_reduction"]), arm.get("min_placeholder_lines", 3))
         request = synthesize(unit.context)
         gen = generate(request, backend, expected_placeholders=unit.expected_placeholders,
-                       reject=unit.reject, parse_reference=unit.context.transformation["target"])
+                       reject=unit.reject)
         cached = raw_answer(cfg, request.prompt)
         raw_code = extract_code(cached.get("raw")) if cached and not cached.get("error") else None
         if gen.capacity in ("request_too_large", "answer_cannot_fit_window", "input_truncated",

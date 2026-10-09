@@ -161,9 +161,6 @@ class UnitState:
     target_original: str                  # placeholder-recovered fork text
     expand: Callable[[str], str]          # candidate (placeholder form) -> full text
     expected_placeholders: set[str] | None = None
-    # C only (rcap.generate): the target as the request shows it, so a parse
-    # error the target has itself is not held against the answer
-    parse_reference: str | None = None
 
 
 def _norm(text: str | None) -> str:
@@ -554,8 +551,7 @@ def run_reprompt_loop(
             t0 = time.time()
             gens[i] = generate(request, backend,
                                expected_placeholders=u.expected_placeholders,
-                               allow_decline=True, reject=rejects[i],
-                               parse_reference=u.parse_reference)
+                               allow_decline=True, reject=rejects[i])
             gen_seconds[i] = round(time.time() - t0, 1)
             requests[i] = request
             truncated[i] = ctx.feedback.truncated

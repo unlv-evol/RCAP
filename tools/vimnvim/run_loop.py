@@ -101,7 +101,7 @@ with out.open("a") as fh:
                                request_hash=request.request_hash, exec_id="stored-baseline")
         state = UnitState(index=0, entity=unit.entity, context=unit.context, request=request, generation=gen,
                           target_original=unit.target_original, expand=unit.expand,
-                          expected_placeholders=set(), parse_reference=unit.target_original)
+                          expected_placeholders=set())
         adir = OUT / "attempts" / a.arm / cid; adir.mkdir(parents=True, exist_ok=True)
         _current["dir"] = adir
         attempts: dict[int, dict] = {}
