@@ -19,7 +19,7 @@ What differs in C, and what the callers do about it (`is_classless`):
   (`ALLOC_ONE(char_u *)`), a condition split over `#ifdef` branches are valid
   to the compiler and an error to tree-sitter. 27 of the 310 Neovim functions
   and 136 of the 310 Vim functions of the benchmark have one, and so do 35 of
-  the 300 stored zero-shot answers, one of them token-identical to the
+  the 300 stored zero-shot answers, 10 of them token-identical to the
   developer's port. A parse error is therefore no evidence of a broken answer
   in C (`tolerates_parse_errors`): `rcap.generate` keeps such an answer and
   records the fact; whether it is valid code is the compile check's question.

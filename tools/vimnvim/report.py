@@ -169,7 +169,9 @@ for arm in ("rcap_full", "rcap_reduced"):
         meta={c: {"outcome": r["outcome"], "capacity": r["capacity"]} for c, r in rows.items()})
 
 LOOP = {}
-for arm in ("loop_feedback", "loop_retry", "ctx_B", "ctx_C"):
+for arm in ("loop_feedback", "loop_retry", "ctx_B", "ctx_C", "ctx_C2"):
+    if arm not in cfg["arms"]:
+        continue
     rows = {c: r for c, r in load_jsonl(OUT / "arms" / f"{arm}.jsonl").items() if "attempts" in r}
     LOOP[arm] = rows
     if not rows:
@@ -265,7 +267,8 @@ headline("2c. Zero-shot on PPatHF's own reduced inputs (stored 2026-09-20)", p_r
 for arm, tag in (("loop_feedback", "3. Baseline + re-prompt loop k=10 (echo policy: feedback)"),
                  ("loop_retry", "3'. Baseline + re-prompt loop k=10 (echo policy: retry)"),
                  ("ctx_B", "4B. Baseline + ONE re-prompt, errors only"),
-                 ("ctx_C", "4C. Baseline + ONE re-prompt, with context of the missing names")):
+                 ("ctx_C", "4C. Baseline + ONE re-prompt, with context of the missing names"),
+                 ("ctx_C2", "4C2 (EXPLORATORY, added after 4C was seen). As 4C, no ready-made decline line")):
     if LOOP.get(arm):
         headline(f"{tag}: loop rule (first compiling attempt, else Origin)", embed(arm, "rule"),
                  note=f"subset n={len(LOOP[arm])}; the other {len(cases) - len(LOOP[arm])} cases are step 1 unchanged")
@@ -389,6 +392,16 @@ for arm, rows in LOOP.items():
         "curve": curve, "fixed": fixed,
         "fixed_summary": dict(collections.Counter(f["direction"] for f in fixed)),
         "fixed_exact": sum(1 for f in fixed if f["fix_exact"]),
+        "fixed_agg": ({
+            "a1_aed": sum(f["a1_gen"] for f in fixed) / len(fixed), "fix_aed": sum(f["fix_gen"] for f in fixed) / len(fixed),
+            "a1_red": sum(f["a1_red"] for f in fixed) / len(fixed), "fix_red": sum(f["fix_red"] for f in fixed) / len(fixed),
+            "a1_red_median": sorted(f["a1_red"] for f in fixed)[len(fixed) // 2],
+            "fix_red_median": sorted(f["fix_red"] for f in fixed)[len(fixed) // 2],
+            "fix_red_lt_1": sum(1 for f in fixed if f["fix_red"] < 1), "fix_red_lt_02": sum(1 for f in fixed if f["fix_red"] < 0.2),
+            "fix_is_pre_patch": sum(1 for f in fixed if f["fix_echo"]),
+            "sign": pm.sign_test([f["a1_gen"] for f in fixed], [f["fix_gen"] for f in fixed]),
+            "max_step_further": max([f["fix_gen"] - f["a1_gen"] for f in fixed if f["fix_gen"] > f["a1_gen"]] or [0]),
+        } if fixed else None),
         "fixed_labels": dict(collections.Counter(f["fix_label"] for f in fixed)),
         "final_vs_attempt1_moved": dict(moved),
         "attempt1_as_is": agg(a1), "attempt1_gated": agg({c: origin[c] for c in rows}),
@@ -404,23 +417,30 @@ for arm, rows in LOOP.items():
                          for r in rows.values()}),
     }
 S["loops"] = st3
-if LOOP.get("ctx_B") and LOOP.get("ctx_C"):
-    common = set(LOOP["ctx_B"]) & set(LOOP["ctx_C"])
-    Bf, Cf = SERIES["ctx_B.final@2"]["rows"], SERIES["ctx_C.final@2"]["rows"]
-    Br, Cr = SERIES["ctx_B.rule@2"]["rows"], SERIES["ctx_C.rule@2"]["rows"]
+def ctx_compare(other: str) -> dict | None:
+    if not (LOOP.get("ctx_B") and LOOP.get(other)):
+        return None
+    common = set(LOOP["ctx_B"]) & set(LOOP[other])
+    Bf, Cf = SERIES["ctx_B.final@2"]["rows"], SERIES[f"{other}.final@2"]["rows"]
+    Br, Cr = SERIES["ctx_B.rule@2"]["rows"], SERIES[f"{other}.rule@2"]["rows"]
     pb = [bool(LOOP["ctx_B"][c]["first_success_attempt"]) for c in sorted(common)]
-    pc = [bool(LOOP["ctx_C"][c]["first_success_attempt"]) for c in sorted(common)]
-    S["ctx"] = {"n": len(common), "pass": pm.mcnemar_exact(pb, pc), "B_pass": sum(pb), "C_pass": sum(pc),
-                "final": paired(Bf, Cf, common), "rule": paired(Br, Cr, common),
-                "B": {"final": agg(Bf, common), "rule": agg(Br, common)}, "C": {"final": agg(Cf, common), "rule": agg(Cr, common)},
-                "v3_used": sum(1 for c in common if any(u.get("template_id") == "rcap-reprompt-v3-context"
-                                                        for a in LOOP["ctx_C"][c]["attempts"] for u in a["units"])),
-                "per_case": [{"case_id": c, "B": [a["verdict"] for a in LOOP["ctx_B"][c]["attempts"]][-1],
-                              "C": [a["verdict"] for a in LOOP["ctx_C"][c]["attempts"]][-1],
-                              "a1_red": SERIES["ctx_B.attempt"]["rows"][f"{c}#a1"]["rel_distance"],
-                              "B_red": Bf[c]["rel_distance"], "C_red": Cf[c]["rel_distance"],
-                              "B_exact": Bf[c]["exact_match"], "C_exact": Cf[c]["exact_match"],
-                              "B_label": Bf[c]["label"], "C_label": Cf[c]["label"]} for c in sorted(common)]}
+    pc = [bool(LOOP[other][c]["first_success_attempt"]) for c in sorted(common)]
+    return {"arm": other, "n": len(common), "pass": pm.mcnemar_exact(pb, pc), "B_pass": sum(pb), "C_pass": sum(pc),
+            "final": paired(Bf, Cf, common), "rule": paired(Br, Cr, common),
+            "B": {"final": agg(Bf, common), "rule": agg(Br, common)}, "C": {"final": agg(Cf, common), "rule": agg(Cr, common)},
+            "B_last": dict(collections.Counter(LOOP["ctx_B"][c]["attempts"][-1]["verdict"] for c in common)),
+            "C_last": dict(collections.Counter(LOOP[other][c]["attempts"][-1]["verdict"] for c in common)),
+            "v3_used": sum(1 for c in common if any(u.get("template_id") == "rcap-reprompt-v3-context"
+                                                    for a in LOOP[other][c]["attempts"] for u in a["units"])),
+            "per_case": [{"case_id": c, "B": [a["verdict"] for a in LOOP["ctx_B"][c]["attempts"]][-1],
+                          "C": [a["verdict"] for a in LOOP[other][c]["attempts"]][-1],
+                          "a1_red": SERIES["ctx_B.attempt"]["rows"][f"{c}#a1"]["rel_distance"],
+                          "B_red": Bf[c]["rel_distance"], "C_red": Cf[c]["rel_distance"],
+                          "B_exact": Bf[c]["exact_match"], "C_exact": Cf[c]["exact_match"],
+                          "B_label": Bf[c]["label"], "C_label": Cf[c]["label"]} for c in sorted(common)]}
+
+
+S["ctx"] = [x for x in (ctx_compare("ctx_C"), ctx_compare("ctx_C2")) if x]
 
 # ------------------------------------------------------------------ step 5: labels against the ground truth
 LABEL_SETS = collections.OrderedDict()
@@ -428,7 +448,7 @@ LABEL_SETS["step 1: zero-shot baseline"] = [r for r in b_rows.values() if r["has
 for arm in ("rcap_full", "rcap_reduced"):
     if arm + ".as_is" in SERIES:
         LABEL_SETS[f"step 2: {arm}, answers as written"] = [r for r in SERIES[arm + ".as_is"]["rows"].values() if r["has_output"]]
-for arm in ("loop_feedback", "loop_retry", "ctx_B", "ctx_C"):
+for arm in ("loop_feedback", "loop_retry", "ctx_B", "ctx_C", "ctx_C2"):
     if f"{arm}.attempt" in SERIES:
         LABEL_SETS[f"step {'3' if arm.startswith('loop') else '4'}: {arm}, re-prompted attempts (attempt >= 2)"] = [
             r for r in SERIES[f"{arm}.attempt"]["rows"].values() if r["attempt"] >= 2]
@@ -446,7 +466,13 @@ def label_tables(rs: list[dict]) -> dict:
         tp = sum(1 for r in rs if pred(r) and truth(r)); p = sum(1 for r in rs if pred(r)); t = sum(1 for r in rs if truth(r))
         return {"tp": tp, "predicted": p, "true": t, "precision": tp / p if p else None, "recall": tp / t if t else None}
     faithful = lambda r: r["label"] == fd.FAITHFUL_CODE  # noqa: E731
+    near = collections.Counter()
+    for r in rs:
+        if faithful(r) and not r["raw_exact"]:
+            g = r["raw_gen"]
+            near["1-2 tokens" if g <= 2 else "3-5 tokens" if g <= 5 else "6-20 tokens" if g <= 20 else "> 20 tokens"] += 1
     return {"n": n, "by_label": {k: dict(v) for k, v in sorted(by.items(), key=lambda kv: -kv[1]["n"])},
+            "faithful_not_exact_distance": dict(near),
             "faithful_vs_exact": pr(faithful, lambda r: bool(r["raw_exact"])),
             "faithful_vs_red02": pr(faithful, lambda r: r["raw_rel"] < 0.2),
             "faithful_vs_red1": pr(faithful, lambda r: r["raw_rel"] < 1),
@@ -468,6 +494,8 @@ def compile_tables(rs: list[dict]) -> dict:
             "red_mean": sum(reds) / len(reds) if reds else None,
             "faithful": sum(1 for r in g if r["label"] == fd.FAITHFUL_CODE),
             "faithful_exact": sum(1 for r in g if r["label"] == fd.FAITHFUL_CODE and r["raw_exact"]),
+            "faithful_red02": sum(1 for r in g if r["label"] == fd.FAITHFUL_CODE and r["raw_rel"] < 0.2),
+            "faithful_red1": sum(1 for r in g if r["label"] == fd.FAITHFUL_CODE and r["raw_rel"] >= 1),
             "echo": sum(1 for r in g if r["echo"]),
             "labels": dict(collections.Counter(r["label"] for r in g))}
     try:
@@ -481,6 +509,26 @@ def compile_tables(rs: list[dict]) -> dict:
     return out
 
 
+# the labels applied to the DEVELOPERS' OWN ports: what a correct port is called
+dev_rows = add("developer", {c: nl(k["func_after_target"]) for c, k in cases.items()}, step=5,
+               desc="the developer's port itself (ground truth), labelled like any output")
+S["labels_on_developer_ports"] = {
+    "n": len(dev_rows), "labels": dict(collections.Counter(r["label"] for r in dev_rows.values())),
+    "accept": dict(collections.Counter(r["accept"] or "accepted" for r in dev_rows.values())),
+    "not_faithful": sorted(c for c, r in dev_rows.items() if r["label"] != fd.FAITHFUL_CODE)[:400]}
+
+def _split(dev_faithful: bool) -> dict:
+    cs = [c for c, r in dev_rows.items() if (r["label"] == fd.FAITHFUL_CODE) is dev_faithful]
+    out = [b_rows[c] for c in cs if b_rows[c]["has_output"]]
+    f = [r for r in out if r["label"] == fd.FAITHFUL_CODE]
+    return {"cases": len(cs), "outputs": len(out), "exact": sum(1 for r in out if r["raw_exact"]),
+            "labelled_faithful": len(f), "faithful_exact": sum(1 for r in f if r["raw_exact"]),
+            "faithful_red02": sum(1 for r in f if r["raw_rel"] < 0.2), "faithful_red_ge1": sum(1 for r in f if r["raw_rel"] >= 1),
+            "src_distance_median": sorted(dev_rows[c]["src_distance"] for c in cs)[len(cs) // 2] if cs else None}
+
+
+S["labels_on_developer_ports"]["baseline_split"] = {"developer_port_faithful": _split(True),
+                                                    "developer_port_not_faithful": _split(False)}
 S["labels"] = {name: label_tables(rs) for name, rs in LABEL_SETS.items() if rs}
 S["compile_vs_truth"] = {name: compile_tables(rs) for name, rs in LABEL_SETS.items() if rs}
 pooled, seen = [], set()
@@ -616,28 +664,45 @@ for arm, d in st3.items():
           f"- labels, attempt 1: {d['labels_attempt1']}; last candidate: {d['labels_final']}", "",
           f"**A re-prompt made the build pass in {len(d['fixed'])} cases**: {d['fixed_summary']}; exact {d['fixed_exact']}; labels {d['fixed_labels']}", ""]
     if d["fixed"]:
+        g = d["fixed_agg"]
+        L += [f"On these {len(d['fixed'])}: token distance to the developer's port, mean {f2(g['a1_aed'])} at attempt 1 -> {f2(g['fix_aed'])} at the passing attempt; "
+              f"RED mean {f2(g['a1_red'], 3)} -> {f2(g['fix_red'], 3)}, median {f2(g['a1_red_median'], 3)} -> {f2(g['fix_red_median'], 3)}; "
+              f"sign test on the distance p={pv(g['sign']['p'])}; the passing attempt has RED < 1 in {g['fix_red_lt_1']}, RED < 0.2 in {g['fix_red_lt_02']}, "
+              f"is the pre-patch function in {g['fix_is_pre_patch']}; the largest step AWAY from the developer's port is {g['max_step_further']} tokens.", ""]
         L += ["| case | passes at attempt | dev. change (tokens) | attempt 1: distance / RED / label | passing attempt: distance / RED / label | exact | direction |",
               "|---|---|---|---|---|---|---|"]
         for f in d["fixed"]:
             L.append(f"| {f['case_id']} | {f['attempt']} | {f['src_distance']} | {f['a1_gen']} / {f2(f['a1_red'], 3)} / {f['a1_label']} | "
                      f"{f['fix_gen']} / {f2(f['fix_red'], 3)} / {f['fix_label']} | {'yes' if f['fix_exact'] else 'no'} | {f['direction']} |")
         L.append("")
-if "ctx" in S:
-    d = S["ctx"]
-    L += [f"## T6. One re-prompt: errors only (B) vs with context (C), n={d['n']}", "",
-          f"- compiles after the re-prompt: B {d['B_pass']}, C {d['C_pass']} (McNemar exact: C only {d['pass']['gain']}, B only {d['pass']['loss']}, p={pv(d['pass']['p'])}); "
-          f"the v3 request was used in {d['v3_used']} of {d['n']} C cases (the others had no name to describe and got the v2 request)",
+for d in S["ctx"]:
+    X = d["arm"].replace("ctx_", "")
+    L += [f"## T6. One re-prompt: errors only (B) vs with context ({X}{', EXPLORATORY' if X != 'C' else ''}), n={d['n']}", "",
+          f"- compiles after the re-prompt: B {d['B_pass']}, {X} {d['C_pass']} (McNemar exact: {X} only {d['pass']['gain']}, B only {d['pass']['loss']}, p={pv(d['pass']['p'])}); "
+          f"the v3 request was used in {d['v3_used']} of {d['n']} {X} cases (a case with no name to describe gets the v2 request)",
+          f"- outcome of the re-prompt: B {d['B_last']}; {X} {d['C_last']}",
           "", "| arm | RULE: Accuracy | AED | RED | LAST as written: Accuracy | AED | RED | RED median |", "|---|---|---|---|---|---|---|---|"]
-    for x in ("B", "C"):
-        L.append(f"| {x} | {acc(d[x]['rule'])} | {f2(d[x]['rule']['aed'])} | {f2(d[x]['rule']['red'], 3)} | {acc(d[x]['final'])} | "
+    for x, name in (("B", "B"), ("C", X)):
+        L.append(f"| {name} | {acc(d[x]['rule'])} | {f2(d[x]['rule']['aed'])} | {f2(d[x]['rule']['red'], 3)} | {acc(d[x]['final'])} | "
                  f"{f2(d[x]['final']['aed'])} | {f2(d[x]['final']['red'], 3)} | {f2(d[x]['final']['red_median'], 3)} |")
-    L += ["", f"- C vs B, rule: {pair_txt(d['rule'])}", f"- C vs B, last as written: {pair_txt(d['final'])}", "",
-          "| case | attempt 1 RED | B: verdict / RED / label | C: verdict / RED / label |", "|---|---|---|---|"]
+    L += ["", f"- {X} vs B, rule: {pair_txt(d['rule'])}", f"- {X} vs B, last as written: {pair_txt(d['final'])}", "",
+          f"| case | attempt 1 RED | B: verdict / RED / label | {X}: verdict / RED / label |", "|---|---|---|---|"]
     for x in d["per_case"]:
         L.append(f"| {x['case_id']} | {f2(x['a1_red'], 3)} | {x['B']} / {f2(x['B_red'], 3)}{' exact' if x['B_exact'] else ''} / {x['B_label']} | "
                  f"{x['C']} / {f2(x['C_red'], 3)}{' exact' if x['C_exact'] else ''} / {x['C_label']} |")
     L.append("")
 L += ["## T7. Labels against the ground truth", ""]
+dl = S["labels_on_developer_ports"]
+L += [f"**The developers' own ports, labelled like any output** (n={dl['n']}): {dl['labels']}; acceptance rules: {dl['accept']}. "
+      "A label other than FAITHFUL_CODE here means: the developer did NOT reproduce the upstream change as it stands "
+      "(adapted it, ported part of it), or the label is wrong.", "",
+      "| cases where the developer's own port is ... | cases | step-1 outputs | exact | labelled FAITHFUL_CODE | of those: exact | RED < 0.2 | RED >= 1 | median size of the developer's change (tokens) |",
+      "|---|---|---|---|---|---|---|---|---|"]
+for name, key in (("labelled FAITHFUL_CODE", "developer_port_faithful"), ("labelled anything else", "developer_port_not_faithful")):
+    x = dl["baseline_split"][key]
+    L.append(f"| {name} | {x['cases']} | {x['outputs']} | {x['exact']} | {x['labelled_faithful']} | {x['faithful_exact']} | "
+             f"{x['faithful_red02']} | {x['faithful_red_ge1']} | {x['src_distance_median']} |")
+L.append("")
 for name, d in S["labels"].items():
     L += [f"**{name}** (n={d['n']} outputs)", "", "| label | n | exact | " + " | ".join(pm.RED_BANDS) + " |", "|---|---|---|---|---|---|---|"]
     for lab, v in d["by_label"].items():
@@ -648,15 +713,16 @@ for name, d in S["labels"].items():
                      ("nochange_is_echo", "NO_CHANGE / REVERTED / COMMENT_ONLY -> output equals the pre-patch function on tokens")):
         p = d[key]
         L.append(f"- {txt}: precision {p['tp']}/{p['predicted']} = {f2(p['precision'], 3)}, recall {p['tp']}/{p['true']} = {f2(p['recall'], 3)}")
+    L.append(f"- FAITHFUL_CODE outputs that are NOT exact, by token distance to the developer's port: {d['faithful_not_exact_distance']}")
     L.append("")
 L += ["## T8. Does `compiles` predict closeness (reachable cases only)", "",
-      "| outputs | compiles: n | exact | RED < 0.2 | RED >= 1 | RED median | FAITHFUL_CODE (exact among them) | fails: n | exact | RED < 0.2 | RED >= 1 | RED median | Fisher p (exact) | Mann-Whitney p (RED) |",
+      "| outputs | compiles: n | exact | RED < 0.2 | RED >= 1 | RED median | compiles AND FAITHFUL_CODE: n (exact / RED < 0.2 / RED >= 1) | fails: n | exact | RED < 0.2 | RED >= 1 | RED median | Fisher p (exact) | Mann-Whitney p (RED) |",
       "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
 for name, d in S["compile_vs_truth"].items():
     if not d["n"]:
         continue
     c, f = d["compiles"], d["fails"]
-    L.append(f"| {name} | {c['n']} | {c['exact']} | {c['red_lt_02']} | {c['red_ge_1']} | {f2(c['red_median'], 3)} | {c['faithful']} ({c['faithful_exact']}) | "
+    L.append(f"| {name} | {c['n']} | {c['exact']} | {c['red_lt_02']} | {c['red_ge_1']} | {f2(c['red_median'], 3)} | {c['faithful']} ({c['faithful_exact']} / {c['faithful_red02']} / {c['faithful_red1']}) | "
              f"{f['n']} | {f['exact']} | {f['red_lt_02']} | {f['red_ge_1']} | {f2(f['red_median'], 3)} | {pv(d.get('fisher_exact_p'))} | {pv(d.get('mannwhitney_red_p'))} |")
 L.append("")
 (OUT / "tables.md").write_text("\n".join(L) + "\n")
