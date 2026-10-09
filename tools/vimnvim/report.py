@@ -756,7 +756,7 @@ if prose.exists():
               f"Arms complete: " + ", ".join([f"{a} {n}/{len(cases)}" for a, n in n_arm.items() if n == len(cases)]
                                              + [f"{a} {n}/{want_loop}" for a, n in n_loop.items() if n == want_loop and n]) + ". "
               + ("**Still running or not started: " + ", ".join(pending) + ".** Every number of an incomplete arm below is over the cases "
-                 "it has finished and will change; re-render with the command in section 9." if pending else "All arms are complete."))
+                 "it has finished and will change; re-render with the command in section 12." if pending else "All arms are complete."))
 
     def step2_text() -> str:
         if not st2:
