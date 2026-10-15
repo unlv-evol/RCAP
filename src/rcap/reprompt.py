@@ -43,7 +43,8 @@ from rcap.accept import has_placeholder_leak
 from rcap.cochange import CoChangeNote
 from rcap.context import AdaptationContext
 from rcap.generate import Backend, GenerationRecord, effective_limit_chars, generate
-from rcap.request import AdaptationRequest, synthesize
+from rcap.request import (AdaptationRequest, conversation_hash, render_transcript,
+                          request_chars, synthesize)
 
 DEFAULT_K = 10
 SHRINK_LINE_RATIO = 0.70   # flag when < 70% of attempt 1's lines remain (> 30% dropped)
@@ -60,6 +61,55 @@ ECHO_RETRY_NOTE = (
 # restates the last FAILING candidate WITH its diagnostics. "feedback" is the
 # paper's memoryless variant, which loses the diagnostics after an echo.
 ECHO_POLICIES = ("retry", "feedback")
+
+# ---- dialogue mode (`run_reprompt_loop(dialogue=True)`) -------------------
+# Instead of a fresh single-turn repair request per attempt, each unit keeps
+# ONE conversation: the original request, the model's answer, then one short
+# user turn per failed attempt. Nothing is restated: the source change, the
+# fork's function and every earlier answer are already in the history.
+DIALOGUE_TEMPLATE_ID = "rcap-dialogue-v1"
+DIALOGUE_TEMPLATE_VERSION = "1"
+_DIALOGUE_RULES = (
+    "Keep the source change applied and make the smallest edit to your previous "
+    "answer that resolves this. Use only names the fork already has; where the "
+    "fork names something differently, use the fork's name; do not invent APIs. "
+    "Do not undo the change: an answer equal to the fork's original function is "
+    "rejected.\n"
+    "If no edit to this one function can work, because it depends on something "
+    "the fork does not have, answer with this single line instead:\n"
+    "CANNOT_ADAPT: needs <symbol or change> from <file>\n"
+    "Otherwise return ONLY the complete fixed function in one ```{lang} code "
+    "block, with no commentary.")
+_DIALOGUE_HEAD = {
+    "build": "Your answer does not compile inside the fork. The diagnostics "
+             "(line numbers are relative to the function you returned):",
+    "test": "Your answer compiles, but tests fail inside the fork:",
+}
+DIALOGUE_ECHO = ("Your last answer is identical to the fork's ORIGINAL function: the "
+                 "source change is not applied at all. That answer is rejected.")
+DIALOGUE_ECHO_BACK = ("Go back to your answer before that one and fix it instead. "
+                      "Its diagnostics were:")
+DIALOGUE_REPEAT = ("Your last answer is identical to the one you gave in attempt {n} of "
+                   "this conversation, which already failed with the diagnostics shown "
+                   "then. Repeating it cannot work: give a different fix.")
+
+
+def dialogue_turn(kind: str, error_text: str, language: str | None, *,
+                  earlier_errors: str | None = None, repeat_of: int | None = None) -> str:
+    """The user turn that follows a failed attempt in dialogue mode."""
+    if kind == "repeat":
+        head = DIALOGUE_REPEAT.format(n=repeat_of)
+    elif kind == "echo":
+        head = DIALOGUE_ECHO if not earlier_errors else (
+            DIALOGUE_ECHO + " " + DIALOGUE_ECHO_BACK + "\n\n" + earlier_errors.rstrip())
+    else:
+        head = _DIALOGUE_HEAD.get(kind, _DIALOGUE_HEAD["build"]) + "\n\n" + error_text.rstrip()
+    return head + "\n\n" + _DIALOGUE_RULES.format(lang=language or "java") + "\n"
+
+
+def assistant_turn(candidate: str, language: str | None) -> str:
+    """A code answer as it stands in the history: one fenced block."""
+    return f"```{language or 'java'}\n{candidate if candidate.endswith(chr(10)) else candidate + chr(10)}```"
 _DECLINE_DETAIL = re.compile(r"needs\s+(?P<symbol>.+?)\s+from\s+(?P<file>\S.*)$")
 
 _WS = re.compile(r"\s+")
@@ -337,6 +387,49 @@ def parse_decline(diagnostics: list[str]) -> dict[str, str | None]:
             "file": m.group("file").strip("`'\" .") if m else None}
 
 
+DIALOGUE_ANSWER_SLACK = 2.0      # a follow-up answer may explain itself before the code
+DIALOGUE_ANSWER_EXTRA = 1500     # characters
+
+
+def _dialogue_answer_chars(expected: int | None, history: list[dict[str, str]]) -> int | None:
+    """Expected length of a follow-up answer. In a conversation the model often
+    reasons in prose before the code block, and earlier answers show how long
+    the function really is: the single-turn estimate cut such an answer at the
+    output floor (Vim->Neovim case 187). None stays None (no cap)."""
+    if expected is None:
+        return None
+    longest = max((len(m["content"]) for m in history if m["role"] == "assistant"), default=0)
+    return int(max(expected, longest) * DIALOGUE_ANSWER_SLACK) + DIALOGUE_ANSWER_EXTRA
+
+
+def _dialogue_reprompt(units, targets, transcripts, kind, unit_feedback, feedback, backend,
+                       rejects, gens, gen_seconds, requests, raw, *,
+                       earlier: Validation | None = None, repeat_of: int | None = None) -> None:
+    """Send the next user turn of each targeted unit's conversation; results
+    go into the loop's per-unit lists in place."""
+    for i in targets:
+        u = units[i]
+        lang = u.request.language
+        text = dialogue_turn(
+            kind, unit_feedback.get(i, feedback), lang, repeat_of=repeat_of,
+            earlier_errors=(earlier.unit_feedback.get(i, earlier.feedback) if earlier else None))
+        history = list(transcripts[i])
+        request = AdaptationRequest(
+            case_id=u.request.case_id, language=lang,
+            template_id=DIALOGUE_TEMPLATE_ID, template_version=DIALOGUE_TEMPLATE_VERSION,
+            prompt=text, request_hash=conversation_hash(history, text),
+            answer_kind=u.request.answer_kind,
+            expected_answer_chars=_dialogue_answer_chars(u.request.expected_answer_chars, history),
+            history=history)
+        t0 = time.time()
+        gens[i] = generate(request, backend, expected_placeholders=u.expected_placeholders,
+                           allow_decline=True, reject=rejects[i])
+        gen_seconds[i] = round(time.time() - t0, 1)
+        requests[i] = request
+        if gens[i].outcome == "completion":
+            raw[i] = gens[i].candidate
+
+
 _STOP_FOR_OUTCOME = {
     # the model declined: a typed refusal, neither a parse failure nor a success
     "needs_cochange": "needs_cochange",
@@ -358,6 +451,7 @@ def run_reprompt_loop(
     on_attempt: Callable[[int, list[dict[str, object]]], None] | None = None,
     precheck: Callable[[int, Validation], list[dict[str, object]]] | None = None,
     repair_extras: Callable[[int, Validation], dict[str, object]] | None = None,
+    dialogue: bool = False, first_prompts: list[str] | None = None,
 ) -> dict[str, object]:
     """Run the loop for one case and return its record.
 
@@ -380,6 +474,16 @@ def run_reprompt_loop(
     request context (`cochanges`, `allowed_symbols`, `fork_context`, ...).
     A model answer `CANNOT_ADAPT: ...` also ends the loop with
     `needs_cochange` (`needs_cochange_source` says which of the two it was).
+
+    `dialogue=True`: each unit keeps one conversation instead of getting a
+    fresh request per attempt (see DIALOGUE_TEMPLATE_ID above). The first user
+    turn is the unit's own request, or `first_prompts[i]` when attempt 1 was
+    produced by another prompt (the driver then passes that prompt, so the
+    history is what the model actually saw). A candidate identical to an
+    earlier one does not end the loop at once: the model is told so, once; a
+    second repeat in a row ends it with `cycle`. `echo_policy` and
+    `repair_extras` do not apply (the history already holds the diagnostics).
+    A conversation that no longer fits the backend's window ends with `limits`.
     """
     if echo_policy not in ECHO_POLICIES:
         raise ValueError(f"echo_policy must be one of {ECHO_POLICIES}")
@@ -403,6 +507,16 @@ def run_reprompt_loop(
     from rcap.pipeline import duplicate_check
 
     rejects = [duplicate_check(u.context, u.request.language) for u in units]
+    # dialogue mode: one transcript per unit, [user, assistant, user, ...]
+    transcripts: list[list[dict[str, str]]] = [
+        [{"role": "user", "content": (first_prompts[i] if first_prompts else u.request.prompt)}]
+        for i, u in enumerate(units)] if dialogue else []
+    said: list[int] = [0] * len(units)     # attempt whose answer is the transcript's last turn
+    if dialogue:
+        record["dialogue"] = {"template_id": DIALOGUE_TEMPLATE_ID,
+                              "template_version": DIALOGUE_TEMPLATE_VERSION,
+                              "first_turn": "driver-supplied" if first_prompts else "unit request"}
+    repeated_last = False
 
     for attempt in range(1, k + 1):
         row: dict[str, object] = {
@@ -412,6 +526,8 @@ def run_reprompt_loop(
                 "reprompted": reprompted[i] if attempt > 1 else None,
                 "outcome": gens[i].outcome,
                 "prompt_chars": len(requests[i].prompt),
+                "conversation_chars": request_chars(requests[i]),
+                "history_turns": len(requests[i].history),
                 "prompt_sha256": hashlib.sha256(requests[i].prompt.encode()).hexdigest(),
                 "request_hash": requests[i].request_hash,
                 "exec_id": gens[i].exec_id,
@@ -442,7 +558,9 @@ def run_reprompt_loop(
             first_expanded = expanded
         if on_attempt:
             on_attempt(attempt, [{"unit": u.index, "entity": u.entity,
-                                  "prompt": requests[i].prompt, "candidate_raw": raw[i],
+                                  "prompt": (render_transcript(requests[i].history, requests[i].prompt)
+                                             if requests[i].history else requests[i].prompt),
+                                  "candidate_raw": raw[i],
                                   "candidate_expanded": expanded[i]}
                                  for i, u in enumerate(units)])
 
@@ -459,7 +577,37 @@ def run_reprompt_loop(
             "suspicious_shrink": bool(reasons), "shrink_reasons": reasons,
         })
 
+        if dialogue:
+            # the answers just judged join the conversation
+            for i, u in enumerate(units):
+                if said[i] < attempt and (attempt == 1 or reprompted[i]):
+                    if attempt > 1:
+                        transcripts[i].append({"role": "user", "content": requests[i].prompt})
+                    transcripts[i].append({"role": "assistant",
+                                           "content": assistant_turn(raw[i], u.request.language)})
+                    said[i] = attempt
+
         signature = tuple(_norm(c) for c in expanded)
+        repeat_of = seen.index(signature) + 1 if signature in seen else None
+        if dialogue and repeat_of is not None and not repeated_last and attempt < k:
+            # Same answer again, but the next request is not the same request:
+            # the conversation is longer. Say so once instead of stopping.
+            row.update({"verdict": "REPEAT", "cycle_of_attempt": repeat_of})
+            repeated_last = True
+            # Only the units that were asked for a fix and answered as before
+            # repeated themselves; a unit nobody asked kept its answer and has
+            # no error to fix (PR-12250 ClusterTestExtensions).
+            targets = [i for i in range(len(units)) if reprompted[i]] or list(range(len(units)))
+            row["reprompt_units"] = targets
+            reprompted = [i in targets for i in range(len(units))]
+            _dialogue_reprompt(units, targets, transcripts, "repeat", {}, "", backend,
+                               rejects, gens, gen_seconds, requests, raw, repeat_of=repeat_of)
+            truncated, fb_chars = [False] * len(units), [None] * len(units)
+            for i in range(len(units)):
+                if i not in targets:
+                    gen_seconds[i] = None
+            continue
+        repeated_last = False
         if signature in seen:
             # Deterministic generation: the same candidate fails the same way
             # and yields the same next prompt. Validating it again is wasted.
@@ -509,6 +657,28 @@ def run_reprompt_loop(
         if attempt == k:
             record["stop_reason"] = "k_exhausted"
             break
+
+        if dialogue:
+            # ---- dialogue mode: the next turn of each unit's conversation
+            targets = validation.units_with_errors or list(range(len(units)))
+            row["reprompt_units"] = targets
+            reprompted = [i in targets for i in range(len(units))]
+            echoed = validation.verdict in ("ECHO", "REVERTED")
+            earlier = last_failing[1] if echoed and last_failing is not None else None
+            if not echoed:
+                last_failing = (list(raw), validation, attempt)
+            _dialogue_reprompt(
+                units, targets, transcripts, "echo" if echoed else (validation.kind or "build"),
+                validation.unit_feedback, validation.feedback, backend, rejects, gens,
+                gen_seconds, requests, raw,
+                earlier=earlier)
+            for i in range(len(units)):
+                truncated[i] = False
+                fb_chars[i] = ((len(validation.unit_feedback.get(i, validation.feedback)),) * 2
+                               if i in targets and not echoed else None)
+                if i not in targets:
+                    gen_seconds[i] = None
+            continue
 
         basis, basis_attempt = list(raw), attempt
         echo_notes: list[str] = []
@@ -565,7 +735,7 @@ def run_reprompt_loop(
     # The final verdict is that of the last attempt that was actually judged:
     # a cycle or an unusable re-prompt leaves the previous verdict standing.
     judged = [a["verdict"] for a in attempts
-              if a.get("verdict") not in (None, "CYCLE", "NO_CANDIDATE", "DECLINED")]
+              if a.get("verdict") not in (None, "CYCLE", "REPEAT", "NO_CANDIDATE", "DECLINED")]
     record["final_verdict"] = judged[-1] if judged else "NO_CANDIDATE"
     record["attempts_run"] = len(attempts)
     return record

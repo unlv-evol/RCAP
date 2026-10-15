@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Steps 3 and 4: re-prompting on compile failures, with rcap.reprompt unchanged.
 
-  run_loop.py --out DIR --arm loop_feedback|loop_retry|ctx_B|ctx_C|ctx_C2 [--only SUBSTR] [--limit N] [--offline]
+  run_loop.py --out DIR --arm loop_feedback|loop_retry|ctx_B|ctx_C|ctx_C2|dialogue [--only SUBSTR] [--limit N] [--offline]
 
 Subset (fixed by the config, written to DIR/subset.json on first use): the cases
 the compile check can reach (the developer's own function compiles in the tree)
@@ -15,6 +15,12 @@ temperature 0, cycle detection, echo / reversion guard, CANNOT_ADAPT decline.
 The loop's only signal is the compile check. It never sees the developer's port.
 
 loop_*: k = 10.  ctx_B / ctx_C: k = 2 (exactly one re-prompt), paired.
+
+dialogue (exploratory, k = 10): the same loop with `dialogue=True`. One
+conversation per case instead of fresh requests: turn 1 is the prompt that
+really produced the stored attempt 1 (the baseline harness's own, rebuilt and
+checked against the stored prompt length), turn 2 that answer, then one short
+user turn per failed attempt (compile errors only).
 Resumable by case_id; writes DIR/arms/<arm>.jsonl, DIR/attempts/<arm>/ and the caches.
 """
 import argparse, json, sys, time, traceback
@@ -70,6 +76,14 @@ symbols = None
 if a.arm == "ctx_C" or arm.get("symbol_context"):
     from symctx import SymbolContexts
     symbols = SymbolContexts(cfg, arm.get("similar_floor", 0.6))
+build_first = None
+if arm.get("dialogue"):
+    import hashlib, importlib.util
+    hp = Path(cfg["stored"]["harness"])
+    assert hashlib.sha256(hp.read_bytes()).hexdigest() == cfg["stored_sha256"]["harness"], "baseline harness changed"
+    spec = importlib.util.spec_from_file_location("ppathf_harness", hp)
+    _h = importlib.util.module_from_spec(spec); spec.loader.exec_module(_h)
+    build_first = lambda case: _h.build_prompt(case, False)  # noqa: E731
 # every request that reaches the backend is kept, also one answered by a decline
 _current = {"dir": None}
 _generate = backend.generate
@@ -144,10 +158,16 @@ with out.open("a") as fh:
                     "decline_prefill": arm.get("decline_prefill", True)}
 
         row = {"arm": a.arm, "case_id": cid, "attempt1_source": "stored.baseline", "provenance": prov}
+        first = None
+        if build_first is not None:
+            first = build_first(case)
+            # the conversation must open with what the model was really asked
+            assert len(first) == stored[cid]["prompt_chars"], f"{cid}: rebuilt baseline prompt differs from the stored one"
         try:
             rec = run_reprompt_loop([state], backend, validate, k=arm["k"],
                                     echo_policy=arm.get("echo_policy", "feedback"), on_attempt=on_attempt,
-                                    repair_extras=extras if symbols is not None else None)
+                                    repair_extras=extras if symbols is not None else None,
+                                    dialogue=bool(arm.get("dialogue")), first_prompts=[first] if first else None)
             for at in rec["attempts"]:
                 (at.get("validation") or {}).pop("_errors", None)
                 extra = attempts.get(at["attempt"], {})

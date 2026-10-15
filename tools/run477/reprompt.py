@@ -37,13 +37,16 @@ ap.add_argument("--fork", required=True); ap.add_argument("--out", required=True
 ap.add_argument("--baseline", required=True)
 ap.add_argument("--k", type=int, default=10)
 ap.add_argument("--echo-policy", default="feedback", choices=["feedback", "retry"])
+ap.add_argument("--dialogue", action="store_true",
+                help="one conversation per unit (rcap.reprompt dialogue mode) instead of fresh repair requests")
+ap.add_argument("--attempts-dir", help="where per-attempt artifacts go (default: next to --out)")
 ap.add_argument("--gradle-bin-file", default=str(RUN / "validate/gradle_bin.txt"))
 ap.add_argument("--old-verdicts", default=str(RUN / "validate/verdicts-linkedin__kafka.v2.jsonl"))
 ap.add_argument("--old-candidates", default=str(RUN / "validate/candidates"))
 ap.add_argument("--only"); ap.add_argument("--limit", type=int)
 a = ap.parse_args()
 
-FORK = Path(a.fork).resolve(); OUT = Path(a.out); ATT = OUT.parent / ("attempts" if a.echo_policy == "feedback" else f"attempts-echo-{a.echo_policy}")
+FORK = Path(a.fork).resolve(); OUT = Path(a.out); ATT = Path(a.attempts_dir) if a.attempts_dir else OUT.parent / ("attempts" if a.echo_policy == "feedback" else f"attempts-echo-{a.echo_policy}")
 GRADLE = Path(a.gradle_bin_file).read_text().strip()
 BASE = Path(a.baseline); baseline = json.loads(BASE.read_text()) if BASE.exists() else {}
 TEST_TIMEOUT = int(os.environ.get("TEST_TIMEOUT", "1800")); BUILD_TIMEOUT = 1800
@@ -209,8 +212,20 @@ old = {}
 if Path(a.old_verdicts).exists():
     old = {json.loads(l)["key"]: json.loads(l) for l in open(a.old_verdicts)}
 OUT.parent.mkdir(parents=True, exist_ok=True)
-backend = OllamaBackend()
-PROV = run_provenance(backend, driver="reprompt.py", k=a.k, echo_policy=a.echo_policy)
+class Recorded:
+    """The backend, with every call kept: the messages sent and the reply exactly as
+    the model wrote it (also when no code could be taken from it)."""
+    def __init__(self, inner): self.inner = inner; self.calls = []
+    def __getattr__(self, name): return getattr(self.inner, name)
+    def generate(self, request, **kw):
+        call = {"messages": [*(getattr(request, "history", None) or []), {"role": "user", "content": request.prompt}]}
+        self.calls.append(call)
+        call["reply"] = self.inner.generate(request, **kw)
+        call["done_reason"] = getattr(self.inner, "last_done_reason", None)
+        return call["reply"]
+
+backend = Recorded(OllamaBackend())
+PROV = run_provenance(backend, driver="reprompt.py", k=a.k, echo_policy=a.echo_policy, dialogue=a.dialogue)
 print(f"backend {backend.model} digest={backend.model_digest} params={backend.params}; "
       f"k={a.k}; {len(todo)} to run ({len(done)} done)", flush=True)
 
@@ -221,6 +236,7 @@ for n, s in enumerate(todo, 1):
     o = old.get(key, {})
     row = {"key": key, "group": s.get("group"), "new_sap": s["new_dir"],
            "old_verdict": o.get("verdict"), "old_build_cause": o.get("build_cause"), "k": a.k}
+    backend.calls = []
     try:
         manifest = json.loads((sap_dir.parent / "pr.json").read_text())
         sap = json.loads((sap_dir / "sap.json").read_text())
@@ -260,7 +276,7 @@ for n, s in enumerate(todo, 1):
         (case_dir / "target_original.json").write_text(json.dumps(
             [{"unit": u.index, "entity": u.entity, "target_original": u.target_original} for u in units], indent=1))
         rec = run_reprompt_loop(units, backend, make_validator(case_dir, sap["target_file"], units, lambda: current["raw"]),
-                                k=a.k, echo_policy=a.echo_policy, on_attempt=on_attempt)
+                                k=a.k, echo_policy=a.echo_policy, on_attempt=on_attempt, dialogue=a.dialogue)
         if rec["attempts"]:
             for u in rec["attempts"][0]["units"]: u["gen_seconds"] = round(gen1 / max(1, len(units)), 1)
         row.update(rec)
@@ -268,6 +284,9 @@ for n, s in enumerate(todo, 1):
         row.update({"stop_reason": "refused", "final_verdict": "NO_CANDIDATE", "first_success_attempt": None,
                     "attempts": [], "error": f"{type(exc).__name__}: {exc}"[:400],
                     "stage": getattr(exc, "stage", None), "traceback": traceback.format_exc()[-800:]})
+    with (case_dir / "calls.jsonl").open("w") as fh:        # every model call of this case, in order
+        for c in backend.calls: fh.write(json.dumps(c) + "\n")
+    row["model_calls"] = len(backend.calls)
     row["seconds"] = round(time.time() - t_case, 1)
     row["provenance"] = PROV
     with OUT.open("a") as fh: fh.write(json.dumps(row) + "\n")

@@ -21,7 +21,7 @@ from rcap.accept import has_placeholder_leak  # noqa: F401  (re-exported: its ho
 from rcap.backend_ollama import CHARS_PER_TOKEN_IMPLAUSIBLE, admissible_chars
 
 from rcap.regions import merge_regions, region_shape_error
-from rcap.request import AdaptationRequest
+from rcap.request import AdaptationRequest, request_chars
 from rcap.unitkind import FILE, FUNCTION, REGION, TYPE, WHOLE_KINDS, text_kind
 
 # Why a unit was not attempted, or its answer not used, for a reason that lies
@@ -162,12 +162,15 @@ def generate(request: AdaptationRequest, backend: Backend,
         f"{backend.name}:{backend.model}:{request.request_hash}".encode()).hexdigest()[:16]
 
     usage: dict[str, int] = {}
+    # What the backend has to read: the prompt, plus the earlier turns of the
+    # conversation in dialogue mode. Every size check below is on this.
+    sent_chars = request_chars(request)
     # Explicit limits (rcap.backend_ollama.GenerationLimits): the budget of
     # this request. A backend without them keeps the request-size check only.
     declared = getattr(backend, "limits", None)
     plan: dict[str, object] = {}
     if declared is not None and hasattr(declared, "plan"):
-        plan = declared.plan(len(request.prompt), getattr(request, "expected_answer_chars", None),
+        plan = declared.plan(sent_chars, getattr(request, "expected_answer_chars", None),
                              getattr(request, "language", None))
         if limit_chars:
             plan["request_limit_chars"] = limit_chars
@@ -186,9 +189,9 @@ def generate(request: AdaptationRequest, backend: Backend,
     # outcome, refused BEFORE invocation against the backend's own declared
     # acceptance limit — an oversized request silently truncated by the runtime
     # is a garbage completion, not a measurement.
-    if limit_chars and len(request.prompt) > limit_chars:
+    if limit_chars and sent_chars > limit_chars:
         return record("limits_exceeded", capacity="request_too_large", diag=[
-            (f"request is {len(request.prompt)} chars; backend declares an "
+            (f"request is {sent_chars} chars; backend declares an "
              f"acceptance limit of {limit_chars} chars")])
     # The window holds the prompt AND the answer. When the two cannot fit, the
     # request is refused here instead of being generated until the runtime
@@ -196,7 +199,7 @@ def generate(request: AdaptationRequest, backend: Backend,
     # answers, and with no cap it runs until the client times out).
     if plan.get("fits_window") is False:
         return record("limits_exceeded", capacity="answer_cannot_fit_window", diag=[
-            (f"prompt (~{plan['expected_prompt_tokens']} tokens for {len(request.prompt)} chars) plus the "
+            (f"prompt (~{plan['expected_prompt_tokens']} tokens for {sent_chars} chars) plus the "
              f"expected answer (~{plan['expected_output_tokens']} tokens for "
              f"{plan['expected_answer_chars']} chars) exceed the {plan['num_ctx']}-token window; "
              "not generated")])
@@ -240,7 +243,7 @@ def generate(request: AdaptationRequest, backend: Backend,
     in_tok = usage.get("input_tokens", 0)
     if num_ctx and in_tok:
         pinned = in_tok == num_ctx // 2 + 2
-        ratio = len(request.prompt) / in_tok
+        ratio = sent_chars / in_tok
         # The ratio test needs a precondition: truncation is only possible if the
         # prompt filled the window, and it pins the reported count at
         # num_ctx // 2 + 2, so a count far below that cannot be a truncation
@@ -252,7 +255,7 @@ def generate(request: AdaptationRequest, backend: Backend,
                 could_be_truncated and ratio > CHARS_PER_TOKEN_IMPLAUSIBLE):
             return record("limits_exceeded", capacity="input_truncated", diag=[
                 (f"runtime evaluated {in_tok} prompt tokens for a "
-                 f"{len(request.prompt)}-char prompt ({ratio:.2f} chars/token, "
+                 f"{sent_chars}-char prompt ({ratio:.2f} chars/token, "
                  f"window {num_ctx}"
                  + (", pinned at the truncation value" if pinned else "")
                  + "); the input was truncated by the runtime")])

@@ -31,14 +31,17 @@ class CachedBackend:
     def generate(self, request, **budget):
         """`budget` (num_predict, timeout) goes to the backend on a live call only; a cached answer was
         written without a cap or within one, and is the same text either way."""
-        h = sha(request.prompt); d, own = self._cached(h)
+        # a dialogue turn is identified by its whole transcript, not by its last message
+        hist = getattr(request, "history", None) or []
+        h = sha(json.dumps(hist, sort_keys=True, ensure_ascii=False) + "\n" + request.prompt) if hist else sha(request.prompt)
+        d, own = self._cached(h)
         self.last_done_reason = None; self.last_timing = None
         if self.expected:
             # outcomes the 477 run recorded for this SAP's units (it kept no prompt hash for failures, so
             # identity is checked by prompt length). Looked up by that length, not by position: a unit that
             # is refused before the backend is called, or that is sent as several region requests, would
             # shift a positional queue.
-            hit = next((n for n, (_, chars) in enumerate(self.expected) if chars == len(request.prompt)), None)
+            hit = next((n for n, (_, chars) in enumerate(self.expected) if chars == len(request.prompt) and not hist), None)
             outcome = self.expected.pop(hit)[0] if hit is not None else "completion"
             if outcome != "completion" and outcome not in self.regenerate \
                     and h not in self.replay and d is None:
@@ -65,7 +68,8 @@ class CachedBackend:
             self.last_done_reason = getattr(self.inner, "last_done_reason", None); self.last_timing = getattr(self.inner, "last_timing", None)
             f.write_text(json.dumps({"raw": raw, "usage": usage, "model": self.model, "params": self.params,
                                      "template_id": request.template_id, "case_id": request.case_id,
-                                     "done_reason": self.last_done_reason, "timing": self.last_timing, "budget": budget}))
+                                     "done_reason": self.last_done_reason, "timing": self.last_timing, "budget": budget,
+                                     **({"history_turns": len(hist)} if hist else {})}))
         self.last_usage = usage or None; self.last_source = src; self.sources[src] += 1
         return raw
 

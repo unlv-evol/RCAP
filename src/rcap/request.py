@@ -12,8 +12,9 @@ yield an identical request and hash.
 from __future__ import annotations
 
 import hashlib
+import json
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from rcap.context import AdaptationContext
 from rcap.regions import RegionPlan, plan_regions
@@ -418,6 +419,31 @@ class AdaptationRequest(BaseModel):
     # Region requests only: {"index", "of", "start", "end", "lines", "text",
     # "hunks", "anchors"}: the exact span of the target text the answer replaces.
     region: dict | None = None
+    # Dialogue mode (rcap.reprompt, `dialogue=True`): the earlier turns of the
+    # conversation this request continues, oldest first, as
+    # {"role": "user" | "assistant", "content": ...}. `prompt` is the new user
+    # turn. Empty for every single-turn request, which is every request the
+    # ordinary pipeline writes.
+    history: list[dict[str, str]] = Field(default_factory=list)
+
+
+def request_chars(request: AdaptationRequest) -> int:
+    """Characters the backend has to read for this request: the prompt plus,
+    in dialogue mode, every earlier turn it is sent with."""
+    return len(request.prompt) + sum(len(m.get("content", "")) for m in getattr(request, "history", None) or [])
+
+
+def conversation_hash(history: list[dict[str, str]], prompt: str) -> str:
+    """Identity of a dialogue request: its whole transcript, not the last turn."""
+    return hashlib.sha256(json.dumps([*history, {"role": "user", "content": prompt}],
+                                     sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def render_transcript(history: list[dict[str, str]], prompt: str) -> str:
+    """The conversation as one readable text, for stored artifacts."""
+    turns = [*history, {"role": "user", "content": prompt}]
+    return "".join(f"===== turn {n} [{m['role']}] =====\n{m['content'].rstrip()}\n\n"
+                   for n, m in enumerate(turns, 1))
 
 
 def expected_answer_chars(asked_back: str, before: str, after: str) -> int:

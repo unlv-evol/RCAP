@@ -399,3 +399,166 @@ def test_generate_accepts_repair_requests(sap_dir, pr_manifest, kind):
                         error_text="- x")
     _, req = fit_feedback(unit.context, fb, None)
     assert generate(req, backend).outcome == "completion"
+
+
+# ---- dialogue mode: one conversation per unit instead of fresh requests -----
+
+def test_dialogue_keeps_one_conversation_and_never_restates(sap_dir, pr_manifest):
+    backend = ScriptedBackend([FIRST, _fn("check(c); a(c);"), _fn("check(c); b(c);")])
+    units = _units(sap_dir, pr_manifest, backend)
+    first = units[0].request.prompt
+    calls = []
+
+    def validate(attempt, expanded):
+        calls.append(attempt)
+        return Validation(verdict="VALID" if "b(c)" in expanded[0] else "BUILD_FAIL", kind="build",
+                          feedback=f"- F.java:3: cannot find symbol (attempt {attempt})")
+
+    rec = run_reprompt_loop(units, backend, validate, k=10, dialogue=True)
+    assert rec["stop_reason"] == "success" and rec["first_success_attempt"] == 3 and calls == [1, 2, 3]
+    r2, r3 = backend.requests[1], backend.requests[2]
+    assert r2.template_id == r3.template_id == "rcap-dialogue-v1"
+    assert [m["role"] for m in r2.history] == ["user", "assistant"]
+    assert r2.history[0]["content"] == first and FIRST_BODY in r2.history[1]["content"]
+    assert "(attempt 1)" in r2.prompt and "## Source function" not in r2.prompt, "nothing is restated"
+    assert [m["role"] for m in r3.history] == ["user", "assistant", "user", "assistant"]
+    assert r3.history[2]["content"] == r2.prompt and "a(c)" in r3.history[3]["content"]
+    assert "(attempt 2)" in r3.prompt and r2.request_hash != r3.request_hash
+    assert rec["attempts"][2]["units"][0]["history_turns"] == 4
+    assert rec["attempts"][2]["units"][0]["conversation_chars"] > len(r3.prompt)
+
+
+def test_dialogue_first_turn_can_be_the_prompt_that_really_made_attempt_one(sap_dir, pr_manifest):
+    backend = ScriptedBackend([FIRST, _fn("check(c); a(c);")])
+    units = _units(sap_dir, pr_manifest, backend)
+    run_reprompt_loop(units, backend, _failing([]), k=2, dialogue=True, first_prompts=["THE REAL FIRST PROMPT"])
+    assert backend.requests[1].history[0] == {"role": "user", "content": "THE REAL FIRST PROMPT"}
+
+
+def test_dialogue_repeat_is_said_once_then_ends_as_cycle(sap_dir, pr_manifest):
+    backend = ScriptedBackend([FIRST, _fn("check(c); other(c);"), FIRST, FIRST])
+    units = _units(sap_dir, pr_manifest, backend)
+    calls = []
+    rec = run_reprompt_loop(units, backend, _failing(calls), k=10, dialogue=True)
+    assert [a["verdict"] for a in rec["attempts"]] == ["BUILD_FAIL", "BUILD_FAIL", "REPEAT", "CYCLE"]
+    assert [c[0] for c in calls] == [1, 2], "a repeated candidate is never rebuilt"
+    assert "identical to the one you gave in attempt 1" in backend.requests[3].prompt
+    assert rec["stop_reason"] == "cycle" and rec["final_verdict"] == "BUILD_FAIL"
+
+
+def test_dialogue_repeat_then_a_new_answer_goes_on(sap_dir, pr_manifest):
+    backend = ScriptedBackend([FIRST, FIRST, _fn("check(c); fixed(c);")])
+    units = _units(sap_dir, pr_manifest, backend)
+
+    def validate(attempt, expanded):
+        return Validation(verdict="VALID" if "fixed" in expanded[0] else "BUILD_FAIL", kind="build", feedback="- e")
+
+    rec = run_reprompt_loop(units, backend, validate, k=10, dialogue=True)
+    assert [a["verdict"] for a in rec["attempts"]] == ["BUILD_FAIL", "REPEAT", "VALID"]
+    assert rec["first_success_attempt"] == 3
+
+
+def test_dialogue_echo_is_rejected_and_points_back_at_the_failing_answer(sap_dir, pr_manifest):
+    backend = ScriptedBackend([FIRST])
+    units = _units(sap_dir, pr_manifest, backend)
+    echo = "```java\n" + units[0].context.transformation["target"] + "```"
+    backend = ScriptedBackend([FIRST, echo, _fn("check(c); fixed(c);")])
+    units = _units(sap_dir, pr_manifest, backend)
+    calls = []
+
+    def validate(attempt, expanded):
+        calls.append(attempt)
+        return Validation(verdict="VALID" if "fixed" in expanded[0] else "BUILD_FAIL", kind="build",
+                          feedback="- F.java:3: cannot find symbol")
+
+    rec = run_reprompt_loop(units, backend, validate, k=5, dialogue=True)
+    assert rec["attempts"][1]["verdict"] == "ECHO" and calls == [1, 3]
+    turn = backend.requests[2].prompt
+    assert "identical to the fork's ORIGINAL function" in turn and "cannot find symbol" in turn
+    assert len(backend.requests[2].history) == 4 and rec["first_success_attempt"] == 3
+
+
+def test_dialogue_that_outgrows_the_window_ends_as_limits(sap_dir, pr_manifest):
+    backend = ScriptedBackend([FIRST] + [_fn(f"check(c); v{i}(c);") for i in range(20)])
+    units = _units(sap_dir, pr_manifest, backend)
+    backend.request_limit_chars = len(units[0].request.prompt) + 1200   # room for about one more turn
+    backend.request_limit_chars_is_explicit = True
+    rec = run_reprompt_loop(units, backend, _failing([]), k=10, dialogue=True)
+    assert rec["stop_reason"] == "limits" and rec["final_verdict"] == "BUILD_FAIL"
+    assert rec["attempts"][-1]["units"][0]["outcome"] == "limits_exceeded"
+
+
+def test_history_reaches_the_backend_and_the_cache_key(tmp_path, monkeypatch):
+    import sys
+    from pathlib import Path
+
+    from rcap.backend_ollama import OllamaBackend
+    from rcap.request import AdaptationRequest, conversation_hash
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "run477"))
+    from gencache import CachedBackend
+
+    sent = []
+
+    def fake_api(self, path, payload=None, timeout=None):
+        if path == "/api/show":
+            return {"details": {}}
+        sent.append(payload["messages"])
+        return {"message": {"content": f"answer {len(sent)}"}, "prompt_eval_count": 5, "eval_count": 2}
+
+    monkeypatch.setattr(OllamaBackend, "_api", fake_api)
+    backend = CachedBackend(OllamaBackend(), tmp_path)
+    hist = [{"role": "user", "content": "first"}, {"role": "assistant", "content": "```c\nx\n```"}]
+
+    def req(history):
+        return AdaptationRequest(case_id="c", language="c", prompt="same last turn",
+                                 request_hash=conversation_hash(history, "same last turn"), history=history)
+
+    assert backend.generate(req([])) == "answer 1" and sent[0] == [{"role": "user", "content": "same last turn"}]
+    assert backend.generate(req(hist)) == "answer 2", "same last turn, other history: not a cache hit"
+    assert sent[1] == [*hist, {"role": "user", "content": "same last turn"}]
+    assert backend.generate(req(hist)) == "answer 2" and len(sent) == 2, "same transcript: cached"
+
+
+def test_dialogue_follow_up_gets_room_to_explain_itself():
+    from rcap.reprompt import _dialogue_answer_chars
+    hist = [{"role": "user", "content": "x" * 9000}, {"role": "assistant", "content": "y" * 1000}]
+    assert _dialogue_answer_chars(None, hist) is None
+    assert _dialogue_answer_chars(900, hist) == 1000 * 2 + 1500, "the longer of estimate and earlier answer, with slack"
+    assert _dialogue_answer_chars(4000, hist) == 4000 * 2 + 1500
+
+
+def test_dialogue_repeat_goes_only_to_the_unit_that_repeated(sap_dir, pr_manifest):
+    # PR-12250 ClusterTestExtensions: unit 0 was right from the start and never asked
+    # again; the repeat notice must not tell it that its answer failed.
+    backend = ScriptedBackend([FIRST])
+    base = _units(sap_dir, pr_manifest, backend)[0]
+    second = base.model_copy() if hasattr(base, "model_copy") else __import__("copy").copy(base)
+    second.index = 1
+    second.request = base.request.model_copy(update={"case_id": "unit-1"})
+    answers = {"unit-1": [FIRST, _fn("check(c); other(c);"), FIRST, _fn("check(c); fixed(c);")]}
+    asked = {}
+
+    class PerUnit(ScriptedBackend):
+        def generate(self, request):
+            self.requests.append(request)
+            n = asked[request.case_id] = asked.get(request.case_id, 0) + 1
+            seq = answers.get(request.case_id, [_fn("check(c); good(c);")])
+            return seq[min(n - 1, len(seq) - 1)]
+
+    backend = PerUnit([FIRST])
+    units = [base, second]
+    units[0].generation = generate(units[0].request, backend)
+    units[1].generation = generate(units[1].request, backend)
+
+    def validate(attempt, expanded):
+        ok = "fixed" in expanded[1]
+        return Validation(verdict="VALID" if ok else "BUILD_FAIL", kind="build",
+                          feedback="- F.java:3: cannot find symbol", units_with_errors=[] if ok else [1],
+                          unit_feedback={} if ok else {1: "- F.java:3: cannot find symbol"})
+
+    rec = run_reprompt_loop(units, backend, validate, k=10, dialogue=True)
+    assert [a["verdict"] for a in rec["attempts"]] == ["BUILD_FAIL", "BUILD_FAIL", "REPEAT", "VALID"]
+    assert rec["attempts"][2]["reprompt_units"] == [1]
+    assert asked[base.request.case_id] == 1, "unit 0 is never asked again"
+    repeat_turns = [r for r in backend.requests if "identical to the one you gave" in r.prompt]
+    assert [r.case_id for r in repeat_turns] == ["unit-1"]

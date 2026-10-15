@@ -197,7 +197,9 @@ class OllamaBackend:
         try:
             data = self._api("/api/chat", {
                 "model": self.model,
-                "messages": [{"role": "user", "content": request.prompt}],
+                # dialogue mode: the earlier turns, then this one
+                "messages": [*(getattr(request, "history", None) or []),
+                             {"role": "user", "content": request.prompt}],
                 "stream": False,
                 "options": options,
             }, timeout=timeout)
