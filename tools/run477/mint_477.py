@@ -72,10 +72,17 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--only-non-kafka", action="store_true")
     ap.add_argument("--max-files", type=int, default=100)
+    ap.add_argument("--pr-bases", type=Path, help="JSON of case_id -> {merge_base, ...} from GitHub's record of each PR "
+                    "(its base branch): authoritative, so these cases get that base and no size guard")
+    ap.add_argument("--only", type=Path, help="file of case ids to mint (default: all)")
     a = ap.parse_args()
     rows = [json.loads(l) for l in open(DATA)]
     if a.only_non_kafka:
         rows = [r for r in rows if slug(r["target_repo"]) != "linkedin/kafka"]
+    pr_bases = json.loads(a.pr_bases.read_text()) if a.pr_bases else {}
+    if a.only:
+        only = set(a.only.read_text().split())
+        rows = [r for r in rows if r["case_id"] in only]
     print(f"{len(rows)} case(s)")
 
     # 1. PR heads, batched per source repo (one network round trip each)
@@ -121,7 +128,8 @@ def main():
         if trev and got and not trev.startswith(got[:12]) and not got.startswith(trev[:12]):
             mism.append((r["case_id"], trev[:12], got[:12]))
         head = git(sc, "rev-parse", f"refs/pull/{pr}/head^{{commit}}")
-        base, how = pr_base(sc, head)
+        recorded = pr_bases.get(r["case_id"])
+        base, how = (recorded["merge_base"], "github_pr_base") if recorded else pr_base(sc, head)
         # cross-check only: does the dataset's own base_revision match ours?
         ds_base = r.get("base_revision")
         ds_agrees = bool(ds_base) and base is not None and ds_base.startswith(base[:12])
@@ -137,7 +145,7 @@ def main():
                      if l.rsplit(".", 1)[-1].lower() in {"java", "scala", "sc"}])
         # No base is authoritative, so the guard applies to all of them: a diff
         # this large is far more likely to be a bad base than a real PR.
-        if n_par > MAX_PLAUSIBLE_FILES:
+        if n_par > MAX_PLAUSIBLE_FILES and not recorded:
             stats["skipped_implausible_diff"] += 1
             big.append((r["case_id"], how, n_par))
             log.append({**base_rec, "outcome": "skipped_implausible_diff",

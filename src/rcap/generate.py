@@ -68,6 +68,38 @@ def placeholder_report(candidate: str, expected: set[str]) -> dict[str, list[str
             "unknown": unknown}
 
 
+import os as _os
+
+RELAXED = _os.environ.get("RCAP_RELAXED") == "1"
+RELAXED_TAG = "RELAXED_CANDIDATE:\n"
+
+
+def relaxed_candidate(raw: str, expected: set[str] | None, lang: str, *,
+                      need_closed_block: bool) -> str | None:
+    """The PPatHF-style acceptance rules applied to an answer RCAP rejected (diagnostic
+    experiment): the first closed code block (a cut answer counts if one closed before
+    the cut), parseable, and no leaked placeholder (duplicated or unknown); a MISSING
+    placeholder is allowed (the code it stood for is simply dropped, as PPatHF-style
+    answers that omit it); no duplicated-block check."""
+    m = _CODE_BLOCK.search(raw)
+    if m is None and need_closed_block:
+        return None
+    cand = (m.group(1) if m else raw).strip() + "\n"
+    if not cand.strip():
+        return None
+    grammar = grammar_for(lang)
+    if grammar is None:
+        return None
+    ok = lambda t: (lambda tr: tr is not None and not tr.root_node.has_error)(parse(t, grammar))  # noqa: E731
+    if not (ok("class __RcapProbe {\n" + cand + "\n}") or ok(cand)):
+        return None
+    if expected is not None:
+        rep = placeholder_report(cand, expected)
+        if rep["duplicated"] or rep["unknown"]:
+            return None
+    return cand
+
+
 class Backend(Protocol):
     name: str
     model: str
@@ -175,8 +207,19 @@ def generate(request: AdaptationRequest, backend: Backend,
         if limit_chars:
             plan["request_limit_chars"] = limit_chars
 
+    raw_box: dict[str, str] = {}
+
     def record(outcome: str, candidate: str | None = None, *, diag: list[str] | None = None,
                capacity: str | None = None):
+        # Diagnostic experiment only (RCAP_RELAXED=1; outcomes never change): for an answer
+        # rejected by a placeholder, duplicated-block or output-budget rule, keep the
+        # candidate the PPatHF-style rules would accept, for the caller to use or ignore.
+        if RELAXED and raw_box.get("raw") and (outcome in ("placeholder_violation", "duplicated_block")
+                                               or capacity == "output_budget_exhausted"):
+            lenient = relaxed_candidate(raw_box["raw"], expected_placeholders, request.language or "java",
+                                        need_closed_block=capacity == "output_budget_exhausted")
+            if lenient:
+                diag = list(diag or []) + [RELAXED_TAG + lenient]
         return GenerationRecord(
             case_id=request.case_id, outcome=outcome, candidate=candidate,
             diagnostics=diag or [], generation_config=theta, usage=dict(usage),
@@ -215,6 +258,7 @@ def generate(request: AdaptationRequest, backend: Backend,
             # the backend was too slow for this answer: capacity, not a model error
             return record("limits_exceeded", capacity="generation_timeout", diag=[str(exc)])
         return record("backend_error", diag=[str(exc)])
+    raw_box["raw"] = raw or ""
     reported = getattr(backend, "last_usage", None)
     if reported:
         usage.update({k: v for k, v in reported.items() if isinstance(v, int)})

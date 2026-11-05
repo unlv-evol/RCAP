@@ -11,6 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from rcap.backend_ollama import OllamaBackend
 from rcap.pipeline import run_case
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gencache import CachedBackend
 from rcap.provenance import run_provenance
 
 root = Path(sys.argv[1]); out = Path(sys.argv[2])
@@ -48,6 +50,9 @@ if per_pair:
 if limit: saps = saps[:limit]
 
 backend = OllamaBackend()
+# --gen-cache DIR: answers by prompt hash (shared with order_pr.py); only DIR is written
+if "--gen-cache" in sys.argv:
+    backend = CachedBackend(backend, sys.argv[sys.argv.index("--gen-cache") + 1])
 PROV = run_provenance(backend, driver="run_477.py", k=1)
 print(f"backend {backend.name}/{backend.model} digest={backend.model_digest} "
       f"limit={backend.request_limit_chars}", flush=True)

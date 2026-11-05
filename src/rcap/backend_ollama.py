@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import socket
 import urllib.error
 import urllib.request
@@ -18,8 +19,9 @@ from dataclasses import asdict, dataclass, field
 
 from rcap.request import AdaptationRequest
 
-DEFAULT_MODEL = "qwen3-coder:30b"
-DEFAULT_URL = "http://localhost:11435"
+# RCAP_MODEL / RCAP_OLLAMA_URL select another model or server (e.g. on the cluster)
+DEFAULT_MODEL = os.environ.get("RCAP_MODEL", "qwen3-coder:30b")
+DEFAULT_URL = os.environ.get("RCAP_OLLAMA_URL", "http://localhost:11435")
 
 # Lowest chars-per-token MEASURED per language on this backend, used to convert
 # the token window into a character bound. A floor, not an average: the bound has
@@ -161,6 +163,10 @@ class OllamaBackend:
         # An operator-supplied limit is honoured verbatim; a derived one is
         # refined per language at generation time.
         self.request_limit_chars_is_explicit = request_limit_chars is not None
+        # Thinking models (qwen3.5+, ...) would spend the shared window on hidden
+        # reasoning first; ask for the answer directly unless RCAP_THINK=1.
+        # Models without the capability get no `think` field, as before.
+        self.think: bool | None = None
         self.model_digest = self._digest()
 
     def _api(self, path: str, payload: dict | None = None, timeout: float | None = None) -> dict:
@@ -177,8 +183,12 @@ class OllamaBackend:
         try:
             data = self._api("/api/show", {"model": self.model})
             details = data.get("details", {})
-            return f"{details.get('family')}/{details.get('parameter_size')}/" \
-                   f"{details.get('quantization_level')}"
+            digest = f"{details.get('family')}/{details.get('parameter_size')}/" \
+                     f"{details.get('quantization_level')}"
+            if "thinking" in (data.get("capabilities") or []):
+                self.think = os.environ.get("RCAP_THINK") == "1"
+                digest += "/think=" + ("on" if self.think else "off")
+            return digest
         except (urllib.error.URLError, OSError, KeyError):
             return None
 
@@ -202,6 +212,7 @@ class OllamaBackend:
                              {"role": "user", "content": request.prompt}],
                 "stream": False,
                 "options": options,
+                **({"think": self.think} if self.think is not None else {}),
             }, timeout=timeout)
         except (TimeoutError, socket.timeout) as exc:
             raise TimeoutError(f"generation timed out after {timeout or self.timeout:.0f}s") from exc

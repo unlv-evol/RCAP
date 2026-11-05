@@ -5,7 +5,7 @@ from (a) candidates stored by the 477 run (`replay`), (b) this branch's own cach
 (c) read-only cache directories of earlier rounds. `sources` counts where each answer came from.
 Only the first cache directory is ever written.
 """
-import collections, glob, hashlib, json
+import collections, glob, hashlib, json, os
 from pathlib import Path
 
 
@@ -60,13 +60,15 @@ class CachedBackend:
             self.last_done_reason = d.get("done_reason"); self.last_timing = d.get("timing")
         else:
             f = self.dir / f"{h}.json"
+            if os.environ.get("RCAP_CACHE_ONLY"):   # build/test pass: the model ran earlier on a GPU, never here
+                self.sources["cache-miss"] += 1; raise RuntimeError("cache-only: no stored answer for this prompt")
             try: raw = self.inner.generate(request, **budget) if self.accepts_budget else self.inner.generate(request)
             except Exception as exc:      # a timeout is paid for once
                 f.write_text(json.dumps({"error": f"{type(exc).__name__}: {exc}"[:300], "case_id": request.case_id, "budget": budget}))
                 self.sources["live-error"] += 1; raise
             usage = self.inner.last_usage; src = "live"
             self.last_done_reason = getattr(self.inner, "last_done_reason", None); self.last_timing = getattr(self.inner, "last_timing", None)
-            f.write_text(json.dumps({"raw": raw, "usage": usage, "model": self.model, "params": self.params,
+            f.write_text(json.dumps({"raw": raw, "usage": usage, "model": self.model, "params": self.params, "think": getattr(self.inner, "think", None),
                                      "template_id": request.template_id, "case_id": request.case_id,
                                      "done_reason": self.last_done_reason, "timing": self.last_timing, "budget": budget,
                                      **({"history_turns": len(hist)} if hist else {})}))

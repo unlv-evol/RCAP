@@ -36,7 +36,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gencache import CachedBackend, load_replay  # noqa: E402
-from harness import Harness, lang_of, screen_unit  # noqa: E402
+from harness import Harness, MavenHarness, lang_of, screen_unit  # noqa: E402
 from rcap import blame  # noqa: E402
 from rcap import cochange as cc  # noqa: E402
 from rcap import prorder as po  # noqa: E402
@@ -54,12 +54,17 @@ RUN = Path("/home/adam/Documents/work/rcap-class-project/run477")
 ap = argparse.ArgumentParser()
 ap.add_argument("--sample", required=True); ap.add_argument("--salp-out", required=True)
 ap.add_argument("--old-salp-out", default=str(RUN / "salp-477-out"))
+ap.add_argument("--new-salp-only", action="store_true",
+                help="read every SAP from --salp-out alone (a mint whose SAP names differ from the old one)")
 ap.add_argument("--fork", required=True); ap.add_argument("--baseline", required=True)
 ap.add_argument("--repo-cache", required=True); ap.add_argument("--source-repo", default="apache__kafka.git")
 ap.add_argument("--out-dir", required=True); ap.add_argument("--tag", required=True)
 ap.add_argument("--placeholder-retry", action="store_true", help="one targeted retry per placeholder violation (default off)")
+ap.add_argument("--generate-only", action="store_true", help="only ask the model (fills --gen-cache; no splice/build/test, fork untouched); a later run with the same --gen-cache replays every answer")
 ap.add_argument("--no-fix-imports", action="store_true"); ap.add_argument("--no-mech", action="store_true")
 ap.add_argument("--gradle-bin-file", default=str(RUN / "validate/gradle_bin.txt"))
+ap.add_argument("--build", choices=["gradle", "maven"], default="gradle", help="the fork's build tool (maven: the non-Kafka pairs)")
+ap.add_argument("--mvn-arg", action="append", default=[], help="extra Maven argument, e.g. -Dsomething (repeatable)")
 ap.add_argument("--old-candidates", default=str(RUN / "validate/candidates"))
 ap.add_argument("--old-results", default=str(RUN / "results-477-v2.jsonl"))
 ap.add_argument("--gen-cache", required=True); ap.add_argument("--gen-cache-ro", action="append", default=[])
@@ -68,9 +73,25 @@ ap.add_argument("--max-bisect", type=int, default=40, help="subset builds per la
 ap.add_argument("--max-reinstate", type=int, default=30, help="re-tries per layer of groups taken out for a compile error")
 ap.add_argument("--plan-only", action="store_true", help="stop after the dependency graph: no build, no test")
 ap.add_argument("--no-regions", action="store_true", help="whole-file units are always asked for the whole file (as before rcap.regions)")
+ap.add_argument("--override-candidates", help="JSONL of {unit_id: PR-N/<sap>::<fn>, outcome, candidate}: these units' answers replace "
+               "RCAP's (another treatment, e.g. tools/ppathf_style); every other unit keeps RCAP's answer")
+ap.add_argument("--relax-units", help="file of unit ids (PR-N/<sap>::<fn>, one per line or a JSONL with unit_id): for these units "
+               "an answer RCAP rejected for placeholders, a duplicated block or the output budget is used under the "
+               "PPatHF-style rules instead (needs RCAP_RELAXED=1; diagnostic experiment)")
 a = ap.parse_args()
+RELAX = set()
+if a.relax_units:
+    for line in open(a.relax_units):
+        line = line.strip()
+        if line: RELAX.add(json.loads(line)["unit_id"] if line.startswith("{") else line)
+OVERRIDE = {}
+if a.override_candidates:
+    for line in open(a.override_candidates):
+        r = json.loads(line)
+        OVERRIDE[r["unit_id"]] = r.get("candidate") if r.get("outcome") == "completion" else None
 
-H = Harness(a.fork, Path(a.gradle_bin_file).read_text().strip()); FORK = H.fork
+H = (MavenHarness(a.fork, extra=a.mvn_arg) if a.build == "maven"
+     else Harness(a.fork, Path(a.gradle_bin_file).read_text().strip())); FORK = H.fork
 OUTD = Path(a.out_dir).resolve() / a.tag; OUT = OUTD / "pr-results.jsonl"
 SRC = Path(a.repo_cache).resolve() / a.source_repo
 BASE = Path(a.baseline); baseline = json.loads(BASE.read_text()) if BASE.exists() else {}
@@ -83,11 +104,20 @@ def sgit(*args):
     r = subprocess.run(["git", "--git-dir", str(SRC), *args], capture_output=True, text=True, errors="replace")
     return r.stdout if r.returncode == 0 else None
 
+def stem(sap, fn):
+    """File-name stem of one unit's attempt files: '<sap>.<fn>', shortened with a hash when it would pass
+    the 255-byte file-name limit (yardstick dscore.py uses the same rule)."""
+    import hashlib
+    st = f"{sap}.{fn}"
+    return st if len(st) <= 200 else f"{sap[:90]}~{hashlib.sha1(st.encode()).hexdigest()[:12]}.{fn[:80]}"
+
 def slug(n): return re.sub(r"[^A-Za-z0-9]+", "-", n).strip("-")[:80]
 
 def sap_dirs(pair, pr):
     """reprompt_pr.sap_dirs: SAPs the new mint merged by name collision are read from the old mint."""
     old_root = Path(a.old_salp_out) / pair / pr; new_root = Path(a.salp_out) / pair / pr
+    if a.new_salp_only:
+        return [(d.name, d, "new") for d in sorted(new_root.glob("sap-*"))], new_root, new_root
     olds = {}
     for d in sorted(old_root.glob("sap-*")):
         try: olds[d.name] = json.loads((d / "sap.json").read_text())["source_file"]
@@ -112,9 +142,14 @@ def pr_base(head):
     return None, "ambiguous_merge_head_already_landed"
 
 def run_tests(proj, classes):
-    rdir = FORK / proj.strip(":").replace(":", "/") / "build/test-results/test"
-    for f in rdir.glob("*.xml"): f.unlink()
-    rc, log, secs = H.gradle(f"{proj}:test", *[x for c in classes for x in ("--tests", c)], timeout=TEST_TIMEOUT)
+    if a.build == "maven":
+        rdir = H.test_results_dir(proj)
+        for f in rdir.glob("*.xml"): f.unlink()
+        rc, log, secs = H.test(proj, classes, timeout=TEST_TIMEOUT)
+    else:
+        rdir = FORK / proj.strip(":").replace(":", "/") / "build/test-results/test"
+        for f in rdir.glob("*.xml"): f.unlink()
+        rc, log, secs = H.gradle(f"{proj}:test", *[x for c in classes for x in ("--tests", c)], timeout=TEST_TIMEOUT)
     ran, failures = {}, []
     for f in sorted(rdir.glob("*.xml")):
         n, fl = parse_junit_failures([str(f)])
@@ -203,6 +238,39 @@ def run_pr(pair, pr, backend):
                    "regions": u.generation.regions,
                    "region_plan": (u.region_plan.as_dict() if u.region_plan is not None and u.request.answer_kind != "function" else None)}
             generation[key] = gen
+            ov = f"{pr}/{key}"
+            if ov in OVERRIDE:
+                # another treatment's answer for this unit: the full function, no RCAP placeholders, no retry
+                gen["override"] = {"rcap_outcome": u.generation.outcome, "has_candidate": OVERRIDE[ov] is not None}
+                retry = None
+                if OVERRIDE[ov] is None:
+                    srow["missing_units"].append({"unit": key, "outcome": "override_no_answer", "diagnostics": [],
+                                                  "placeholder_retry": None, "capacity": None, "request": "override"})
+                    no_cand[key] = "override_no_answer"; continue
+                art = next((x for x in u.context.program_context if x.role == "target" and x.entity == ent), None)
+                raw = exp = OVERRIDE[ov]
+                st = U(key=key, sap=name, file=sap["target_file"], index=i, fn=fn, sdir=str(sdir), raw=raw, expanded=exp,
+                       first_expanded=exp, target_original=recover(art) if art else "", is_test="/src/test/" in sap["target_file"],
+                       placeholder_retry=None, status=None, detail={}, flags=["override"], template="override")
+                units[key] = st; srow["units"].append(key)
+                (adir / f"{stem(name, fn)}.target_original.txt").write_text(st.target_original)
+                continue
+            relaxed = None
+            if ov in RELAX and u.generation.outcome != "completion":
+                relaxed = next((d[len("RELAXED_CANDIDATE:\n"):] for d in u.generation.diagnostics
+                                if d.startswith("RELAXED_CANDIDATE:\n")), None)
+                gen["relaxed"] = {"rcap_outcome": u.generation.outcome, "capacity": u.generation.capacity,
+                                  "has_candidate": relaxed is not None}
+            if relaxed is not None:
+                art = next((x for x in u.context.program_context if x.role == "target" and x.entity == ent), None)
+                exp = relaxed
+                for e in (art.placeholders if art else []): exp = exp.replace(PLACEHOLDER.format(n=e.ph_id), e.original_text, 1)
+                st = U(key=key, sap=name, file=sap["target_file"], index=i, fn=fn, sdir=str(sdir), raw=relaxed, expanded=exp,
+                       first_expanded=exp, target_original=recover(art) if art else "", is_test="/src/test/" in sap["target_file"],
+                       placeholder_retry=retry, status=None, detail={}, flags=["relaxed"], template=u.generation.request_hash)
+                units[key] = st; srow["units"].append(key)
+                (adir / f"{stem(name, fn)}.target_original.txt").write_text(st.target_original)
+                continue
             if u.generation.outcome != "completion":
                 outcome = u.generation.outcome; diags = list(u.generation.diagnostics)[:2]
                 if outcome == "backend_error" and diags and diags[0].startswith("stored-477 outcome: "):
@@ -218,8 +286,8 @@ def run_pr(pair, pr, backend):
                    target_original=recover(art) if art else "", is_test="/src/test/" in sap["target_file"],
                    placeholder_retry=retry, status=None, detail={}, flags=[], template=u.generation.request_hash)
             units[key] = st; srow["units"].append(key)
-            (adir / f"{name}.{fn}.target_original.txt").write_text(st.target_original)
-            (adir / f"{name}.{fn}.prompt.txt").write_text(
+            (adir / f"{stem(name, fn)}.target_original.txt").write_text(st.target_original)
+            (adir / f"{stem(name, fn)}.prompt.txt").write_text(
                 "\n\n".join(f"===== region request {n} of {len(u.region_requests)} =====\n{r.prompt}"
                             for n, r in enumerate(u.region_requests, 1)) if u.region_requests else u.request.prompt)
     for name, sdir, origin in saps:      # functions the pipeline never turned into a unit (null transformation per unit, ...)
@@ -227,6 +295,9 @@ def run_pr(pair, pr, backend):
             if r.key.startswith(name + "::") and r.key not in units and r.key not in no_cand: no_cand[r.key] = "no_unit:not_adaptable"
     row["attempt1_generation"] = {"seconds": round(time.time() - t_gen, 1), "sources": dict(backend.sources)}
     row["generation"] = generation
+    if a.generate_only:
+        row.update(units_total=len(regions), units_with_candidate=len(units), seconds=round(time.time() - t_pr, 1))
+        return row
     region_of = {r.key: r for r in regions}
     cc.classify_hunks(files, regions)
 
@@ -409,7 +480,10 @@ def run_pr(pair, pr, backend):
         return row
 
     # ---------------------------------------------------------------- applying a state
-    touched = sorted({g.file for g in groups})
+    # every file any member of any group writes: an atomic rename group spans several files, and
+    # g.file names only one of them (restoring g.file alone left the others modified in the fork)
+    touched = sorted({g.file for g in groups} | {units[m].file if m in units else mech[m]["target"]
+                                                 for g in groups for m in g.ids if m in units or m in mech})
     def restore():
         tr = [p for p in touched if p in tracked]
         if tr: subprocess.run(["git", "checkout", "-q", "--", *tr], cwd=FORK)
@@ -493,7 +567,8 @@ def run_pr(pair, pr, backend):
             builds.append({"tag": tag, "groups": len(gids), "rc": None, "seconds": 0, "unwritable": sorted(bad_merge)})
             return blame.BuildResult(None, applied=ap, unwritable=bad_merge)
         projs = sorted({H.project_of(p) for p in spans if H.project_of(p)})
-        rc, log, secs = H.gradle(*[f"{p}:testClasses" for p in projs], timeout=BUILD_TIMEOUT)
+        rc, log, secs = (H.build(projs, timeout=BUILD_TIMEOUT) if a.build == "maven"
+                         else H.gradle(*[f"{p}:testClasses" for p in projs], timeout=BUILD_TIMEOUT))
         (rdir / f"{tag}.build.log").write_text(log)
         builds.append({"tag": tag, "groups": len(gids), "rc": rc, "seconds": secs, "projects": projs})
         print(f"    {pr} {tag}: {len(gids)} group(s) -> rc={rc} ({secs}s)", flush=True)
@@ -601,10 +676,13 @@ def run_pr(pair, pr, backend):
                 usable = []
                 for c in sorted(tcls):
                     b = baseline[f"{tproj}|{c}"]
-                    (unusable if b["rc"] == "timeout" or (b["ran"] == 0 and not b.get("new_class")) else usable).append(c)
+                    # a class with no passing test before the change (did not run, or every test already
+                    # fails, e.g. it crashes on startup) cannot show anything about the change
+                    (unusable if b["rc"] == "timeout" or (b["ran"] == 0 and not b.get("new_class"))
+                     or (b["ran"] > 0 and len(b["failed"]) >= b["ran"]) else usable).append(c)
                 if not usable: continue
                 ran, failures, trc, tlog, tsecs = run_tests(tproj, usable)
-                (rdir / f"tests-{test_rounds:02d}.{tproj.strip(':').replace(':', '-')}.log").write_text(tlog)
+                (rdir / f"tests-{test_rounds:02d}.{tproj.strip(':').replace(':', '-').replace('/', '-')}.log").write_text(tlog)
                 if trc == "timeout": timed_out_classes |= set(usable)
                 bfailed = {f for c in usable for f in baseline[f"{tproj}|{c}"]["failed"]}
                 mine = [f for f in failures if f.name not in bfailed and any(f.name.startswith(c + ".") for c in usable)]
@@ -626,6 +704,7 @@ def run_pr(pair, pr, backend):
             hit = {g: t for g, t in hit.items() if g in accepted}
             if not hit: break
             for g, t in hit.items():
+                if g not in accepted: continue             # already taken out as a dependent of an earlier one
                 accepted.remove(g); fail(g, "TEST_FAIL", error=t[:300])
             if accepted:                                   # what is left must still compile together
                 kept = settle(f"after-tests-{test_rounds:02d}", [], list(accepted), prefix="after a sibling was taken out: ")
@@ -668,7 +747,7 @@ def run_pr(pair, pr, backend):
             "soft_providers_missing": soft_missing + prod_missing,
             "import_fix_in_file": bool(merge_log.get("imports", {}).get(u.file, {}).get("added")) and gid in accepted,
             "candidate_changed_by_driver": u.expanded != u.first_expanded}
-        (adir / f"{u.sap}.{u.fn}.candidate.json").write_text(json.dumps(
+        (adir / f"{stem(u.sap, u.fn)}.candidate.json").write_text(json.dumps(
             {"unit": key, "file": u.file, "candidate_raw": u.raw, "candidate_expanded": u.first_expanded,
              "candidate_applied": u.expanded, "status": status}, indent=1))
     out_mech = {}
@@ -707,6 +786,11 @@ for n, (pair, pr) in enumerate(todo, 1):
         row = run_pr(pair, pr, backend)
     except Exception as exc:
         row = {"pr": pr, "pair": pair, "error": f"{type(exc).__name__}: {exc}"[:400], "traceback": traceback.format_exc()[-2500:]}
+        subprocess.run(["git", "checkout", "-q", "--", "."], cwd=FORK)
+    # isolation guard: whatever run_pr left behind, the next PR starts from the fork's HEAD
+    left = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=FORK, capture_output=True, text=True).stdout.strip()
+    if left:
+        row["fork_left_dirty"] = left.splitlines()
         subprocess.run(["git", "checkout", "-q", "--", "."], cwd=FORK)
     with OUT.open("a") as fh: fh.write(json.dumps(row, default=str) + "\n")
     us = row.get("units", {})

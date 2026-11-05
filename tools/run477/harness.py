@@ -7,7 +7,7 @@ outside the fork clone's working tree.
 import collections, glob, os, re, subprocess, time, xml.etree.ElementTree as ET
 from pathlib import Path
 
-JAVA_HOME = "/usr/lib/jvm/java-11-openjdk-amd64"
+JAVA_HOME = os.environ.get("RCAP_JAVA_HOME", "/usr/lib/jvm/java-11-openjdk-amd64")
 
 
 def screen_unit(target_original, candidate_expanded, upstream_before="", upstream_after="", language=None):
@@ -159,3 +159,76 @@ class Harness:
                          f"*/{pkg.replace('.', '/')}/*.scala", f"*/{pkg.replace('.', '/')}/*.java")
         if decl: return f"declared in the fork: {decl[0].split(':', 1)[-1]}"
         return None
+
+
+# ---------------------------------------------------------------- Maven forks (the non-Kafka pairs)
+# javac through Maven prints "[ERROR] /abs/File.java:[12,5] msg"; rcap.feedback reads the Gradle/javac
+# form "/abs/File.java:12:5: error: msg", so build logs are rewritten to that form before parsing.
+_MVN_ERR = re.compile(r"^\[ERROR\] (/[^:\n]+\.java):\[(\d+),(\d+)\] (?:error: )?(.*)$", re.M)
+_MVN_WARN = re.compile(r"^\[WARNING\] (/[^:\n]+\.java):\[(\d+),(\d+)\] (?:warning: )?(.*)$", re.M)
+_MVN_CONT = re.compile(r"^\[ERROR\] (?=\s)", re.M)   # "[ERROR]   symbol: ..." detail lines of the summary copy
+MVN_SKIPS = ["-Dcheckstyle.skip", "-Dlicense.skip=true", "-Denforcer.skip=true", "-Dmaven.javadoc.skip=true",
+             "-Dspotbugs.skip=true", "-Dpmd.skip=true", "-Dcpd.skip=true", "-Djacoco.skip=true"]
+
+
+class MavenHarness(Harness):
+    """The Harness interface over Maven: a 'project' is a module directory (the part of the path before
+    /src/, '.' for the root), built with -am so the modules it depends on compile from source too, as
+    Gradle's :proj:testClasses does. Same exclusions in spirit as EXCLUDES: style and analysis checks off."""
+
+    def __init__(self, fork, mvn_bin="mvn", extra=()):
+        super().__init__(fork, mvn_bin); self.extra = list(extra)
+        self.generated = set(self._unsourced_resources())   # build-made files (no src counterpart) at start
+
+    def _unsourced_resources(self):
+        """Non-class files in target/classes and target/test-classes with no file under src/<set>/resources.
+        Maven copies resources but never deletes a copy whose source is gone (Gradle does), so a resource a
+        candidate added (e.g. a database migration) would otherwise stay in every later build and test."""
+        for out, src in (("classes", "main"), ("test-classes", "test")):
+            for t in self.fork.glob(f"*/target/{out}"):
+                res = t.parent.parent / "src" / src / "resources"
+                for f in t.rglob("*"):
+                    if f.is_file() and f.suffix != ".class" and not (res / f.relative_to(t)).exists():
+                        yield f
+
+    def mvn(self, *args, timeout):
+        for f in self._unsourced_resources():
+            if f not in self.generated: f.unlink()
+        rc, log, secs = self.sh([self.gradle_bin, "-o", "-B", *MVN_SKIPS, *self.extra, *args], timeout,
+                                env_java=True)
+        log = _MVN_ERR.sub(lambda m: f"{m.group(1)}:{m.group(2)}:{m.group(3)}: error: {m.group(4)}", log)
+        log = _MVN_WARN.sub(lambda m: f"{m.group(1)}:{m.group(2)}:{m.group(3)}: warning: {m.group(4)}", log)
+        log = _MVN_CONT.sub("", log)
+        log = re.sub(r"^(\[(?:ERROR|INFO|WARNING)\] \S)", r"\n\1", log, flags=re.M)   # ends an error block
+        return rc, log, secs
+
+    def sh(self, cmd, timeout, stdin=None, env_java=False):
+        if not env_java: return super().sh(cmd, timeout, stdin)
+        t = time.time(); env = dict(os.environ, JAVA_HOME=JAVA_HOME)
+        try:
+            r = subprocess.run(cmd, cwd=self.fork, capture_output=True, text=True, timeout=timeout, errors="replace", env=env)
+            return r.returncode, r.stdout + r.stderr, round(time.time() - t, 1)
+        except subprocess.TimeoutExpired as e:
+            out = (e.stdout or b"") + (e.stderr or b"")
+            return "timeout", out.decode(errors="replace") if isinstance(out, bytes) else out, round(time.time() - t, 1)
+
+    def build(self, projs, timeout):
+        mods = sorted({p for p in projs if p})
+        return self.mvn("-q", *(["-pl", ",".join(mods), "-am"] if mods and mods != ["."] else []), "test-compile",
+                        timeout=timeout)
+
+    def test(self, proj, classes, timeout):
+        return self.mvn(*(["-pl", proj, "-am"] if proj != "." else []), "test", "-Dtest=" + ",".join(classes), "-DfailIfNoTests=false",
+                        "-Dsurefire.failIfNoSpecifiedTests=false", "-DskipUnitTests=false", timeout=timeout)
+
+    def test_results_dir(self, proj):
+        return self.fork / proj / "target/surefire-reports"
+
+    def build_facts(self):
+        return {"build": "maven", "checkstyle": False, "scala_version": None, "scala_fatal_warnings": False}
+
+    def project_of(self, path):
+        if path.startswith("src/"): return "."
+        if "/src/" not in path: return None
+        mod = path.split("/src/")[0]
+        return mod if (self.fork / mod / "pom.xml").exists() else None
