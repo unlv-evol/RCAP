@@ -215,6 +215,13 @@ class UnitRegion:
     before_text: str = ""
     old_source_file: str | None = None
 
+    def extent(self, added: bool) -> int:
+        """How many lines the unit spans on one side (its text's, without a span)."""
+        span = self.after_span if added else self.before_span
+        if span is not None:
+            return span[1] - span[0] + 1
+        return (self.after_text if added else self.before_text).count("\n") + 1
+
     def holds_added(self, path: str | None, line: int, text: str) -> bool:
         if path != self.source_file:
             return False
@@ -250,7 +257,9 @@ def locate(needle: str, haystack: str) -> tuple[int, int] | None:
 
 def classify_hunks(files: Sequence[FileDiff], regions: Sequence[UnitRegion]) -> None:
     """Mark every hunk with the units that cover it: `full` when every changed
-    (non-blank) line lies in a unit, `partial` when some do, else `none`."""
+    (non-blank) line lies in a unit, `partial` when some do, else `none`. A line
+    inside several units (a method unit inside a class unit) belongs to the
+    narrowest one."""
     for f in files:
         for h in f.hunks:
             changed = [(True, n, t) for n, t in h.added if t.strip()] \
@@ -258,9 +267,13 @@ def classify_hunks(files: Sequence[FileDiff], regions: Sequence[UnitRegion]) -> 
             keys: list[str] = []
             inside = 0
             for is_add, n, t in changed:
-                owner = next((r.key for r in regions
-                              if (r.holds_added(h.new_path, n, t) if is_add
-                                  else r.holds_removed(h.old_path, n, t))), None)
+                # the narrowest unit holding the line owns it: a class or file unit
+                # (a field or import hunk's) also spans the methods inside it, whose
+                # own units are the ones that change those lines
+                holders = [r for r in regions
+                           if (r.holds_added(h.new_path, n, t) if is_add
+                               else r.holds_removed(h.old_path, n, t))]
+                owner = min(holders, key=lambda r: r.extent(is_add)).key if holders else None
                 if owner is not None:
                     inside += 1
                     if owner not in keys:

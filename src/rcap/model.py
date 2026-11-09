@@ -67,6 +67,11 @@ class Transformation(BaseModel):
     f_s_ref: str | None = None
     f_s_prime_ref: str | None = None
     f_t_ref: str | None = None
+    # The hunk's own lines on each side, context included, verbatim from the
+    # source file (SALP region.before/after, newer SALP only). RCAP uses them in
+    # place of an oversized source context (rcap.materialize.REGION_THRESHOLD_CHARS).
+    region_before_ref: str | None = None
+    region_after_ref: str | None = None
 
 
 class FunctionEntry(BaseModel):

@@ -549,6 +549,18 @@ def test_diff_parsing_and_coverage_by_change_group():
     assert cov["Meta.json@@1"] == ("none", []) and cov["New.java@@1"] == ("none", [])
 
 
+def test_line_inside_a_class_unit_and_a_method_unit_belongs_to_the_method():
+    """A class unit (a field hunk's) spans the whole class; the method's own
+    unit still owns the method's lines, so a rename through both has two members."""
+    files = cc.parse_unified_diff(DIFF)
+    cls = cc.UnitRegion(key="sap-Buffer::Buffer", source_file="s/src/main/java/a/Buffer.java",
+                        after_span=(1, 21), before_span=(1, 21))
+    cc.classify_hunks(files, [cls] + _regions())
+    cov = {h.hunk_id.split("/")[-1]: (h.coverage, h.covered_by) for f in files for h in f.hunks}
+    assert cov["Buffer.java@@1"] == ("full", ["sap-Buffer::make"])
+    assert cov["Buffer.java@@3"] == ("full", ["sap-Buffer::Buffer"]), "the declaration: only the class holds it"
+
+
 def test_precheck_evidence_declaration_outside_the_unit():
     files = cc.parse_unified_diff(DIFF)
     regions = _regions()

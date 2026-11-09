@@ -92,10 +92,11 @@ class GenerationLimits:
     output_floor_tokens: int = 512
     # generation timeout = base + expected prompt tokens / prompt rate
     #                           + output budget / minimum generation rate
-    timeout_base_s: float = 180.0
+    # RCAP_TIMEOUT_BASE_S: a slower local GPU/CPU can wait longer; never changes the answer, only when it is abandoned
+    timeout_base_s: float = float(os.environ.get("RCAP_TIMEOUT_BASE_S", "180"))
     prompt_tokens_per_second: float = 100.0
     min_output_tokens_per_second: float = 8.0
-    timeout_max_s: float = 3600.0
+    timeout_max_s: float = float(os.environ.get("RCAP_TIMEOUT_MAX_S", "3600"))
 
     def expected_cpt(self, language: str | None) -> float:
         return self.chars_per_token_expected.get(

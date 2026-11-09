@@ -38,7 +38,13 @@ from salp.structural import (
 )
 from salp.structural.grammars import ControlFlow, Grammar
 
+# Fields newer SALP versions added to Grammar; passed only when this SALP has them,
+# so RCAP runs against both the pinned and the newer SALP.
+_NEWER = {"comment": frozenset({"comment"})}
+_HAS = set(getattr(Grammar, "__dataclass_fields__", {}))
+
 C = Grammar(
+    **{k: v for k, v in _NEWER.items() if k in _HAS},
     name="C",
     module="tree_sitter_c",
     extensions=frozenset({"c", "h"}),
