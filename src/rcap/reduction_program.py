@@ -19,7 +19,10 @@ aligning source.before with the target (`target_hunk_lines`). Before this rule
 the target was protected only by evidence identifiers, and a source side that
 cut nothing (its only compound statement holds the change) left the target
 filter empty, which meant "cut every removable subtree": the whole body of
-e.g. KafkaLog4jAppender.close() (PR-15922) became one placeholder.
+e.g. KafkaLog4jAppender.close() (PR-15922) became one placeholder. The target
+is first cut as before; only when a placeholder covers a hunk-mapped line is
+it cut again with those lines protected, so a target without the problem keeps
+exactly its previous cut (and its prompt stays byte-identical).
 """
 
 from __future__ import annotations
@@ -320,14 +323,23 @@ def reduce_program(
                              config.min_placeholder_lines, None, case.language)
         removable_norm = {_normalize(p.original_text)
                           for p in art_s.placeholders + art_sp.placeholders}
-        hunk_t: set[int] = set()
-        how = None
-        if config.protect_target_hunks:
-            hunk_t, how = target_hunk_lines(f_s, f_sp, f_t)
-        art_t = _reduce_one(entity, "target", f_t,
-                            _lines_naming(f_t, names) | hunk_t, grammar,
+        names_t = _lines_naming(f_t, names)
+        art_t = _reduce_one(entity, "target", f_t, names_t, grammar,
                             config.min_placeholder_lines, removable_norm or None, case.language)
         if config.protect_target_hunks:
+            # Only a target whose cut hides a hunk-mapped line is reduced again,
+            # with those lines protected; every other target keeps exactly the
+            # cut it had (protecting a line can make the walk descend into a
+            # block and cut smaller pieces of it, which would change prompts
+            # that never had the problem).
+            hunk_t, how = target_hunk_lines(f_s, f_sp, f_t)
+            if _covering(art_t, hunk_t):
+                art_t = _reduce_one(entity, "target", f_t, names_t | hunk_t, grammar,
+                                    config.min_placeholder_lines, removable_norm or None,
+                                    case.language)
+                how += ":reduced_again"
+            # recorded as protected either way, so the overlap check below holds it
+            art_t.protected_lines = sorted(names_t | hunk_t)
             art_t.hunk_protected_lines = sorted(hunk_t)
             art_t.protection_rule = f"{TARGET_HUNK_PROTECTION_RULE}:{how}"
 
@@ -336,6 +348,25 @@ def reduce_program(
             record.artifacts.append(art)
 
     return record
+
+
+def _line_spans(text: str) -> list[tuple[int, int]]:
+    """Byte span of each line (placeholder spans are byte offsets)."""
+    offsets, pos = [], 0
+    for line in text.splitlines(keepends=True):
+        n = len(line.encode())
+        offsets.append((pos, pos + n))
+        pos += n
+    return offsets
+
+
+def _covering(art: ReducedArtifact, lines: set[int]) -> bool:
+    """Does any placeholder of `art` cover one of `lines` (0-based)?"""
+    if not lines or not art.placeholders:
+        return False
+    offsets = _line_spans(recover(art))
+    return any(e.start_byte < offsets[p][1] and offsets[p][0] < e.end_byte
+               for e in art.placeholders for p in lines if p < len(offsets))
 
 
 def _assert_no_protected_overlap(case: CaseModel, art: ReducedArtifact) -> None:

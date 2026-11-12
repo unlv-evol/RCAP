@@ -104,7 +104,7 @@ def test_close_body_stays_visible(close_sap):
     lines = CLOSE_TARGET.splitlines()
     assert [lines[i].strip() for i in t.hunk_protected_lines] == ["producer.close();"]
     assert set(t.hunk_protected_lines) <= set(t.protected_lines)
-    assert t.protection_rule == f"{TARGET_HUNK_PROTECTION_RULE}:aligned"
+    assert t.protection_rule == f"{TARGET_HUNK_PROTECTION_RULE}:aligned:reduced_again"
 
 
 def test_close_old_rule_reproduces_the_defect(close_sap):
@@ -257,6 +257,70 @@ def test_fork_only_block_is_still_cut_when_source_cuts_nothing(tmp_path_factory)
     assert len(t.placeholders) == 1
     assert "drainOne();" in t.placeholders[0].original_text
     assert "producer.close();" in t.reduced_text
+
+
+def _target(stages, on):
+    cfg = ExecutionConfig(protect_target_hunks=on)
+    return reduce_program(*stages, cfg).artifact("functions/fn-1", "target")
+
+
+def test_target_without_the_problem_is_unchanged(sap_dir, pr_manifest, tmp_path_factory):
+    """A target whose old cut hid no hunk line keeps exactly that cut."""
+    cases = [_stages(sap_dir, pr_manifest),
+             _stages(*_build(tmp_path_factory, "two2", (TWO_BLOCKS_BEFORE, TWO_BLOCKS_AFTER,
+                                                         TWO_BLOCKS_BEFORE, "@@ -1 +1 @@\n")))]
+    for stages in cases:
+        on, off = _target(stages, True), _target(stages, False)
+        assert on.reduced_text == off.reduced_text and on.placeholders == off.placeholders
+        assert on.protection_rule.endswith(":aligned")
+
+
+NESTED_BEFORE = """void poll() {
+    if (open) {
+        for (Record r : buffer) {
+            handle(r);
+            seen++;
+        }
+        lastPoll = now();
+    }
+}
+"""
+NESTED_AFTER = NESTED_BEFORE.replace("lastPoll = now();", "lastPoll = clock.now();")
+# the fork's outer if differs (so it is not a mirrored cut), the inner loop is identical
+NESTED_TARGET = NESTED_BEFORE.replace("if (open) {", "if (open && !paused) {")
+
+
+def test_outer_block_with_the_hunk_kept_inner_mirrored_block_cut(tmp_path_factory):
+    """Old cut: nothing (the outer if is not mirrored, the walk never descends).
+    No hunk line was hidden, so the cut is kept as it was: nothing cut."""
+    stages = _stages(*_build(tmp_path_factory, "nested",
+                             (NESTED_BEFORE, NESTED_AFTER, NESTED_TARGET, "@@ -1 +1 @@\n")))
+    on, off = _target(stages, True), _target(stages, False)
+    assert on == off.model_copy(update={"protected_lines": on.protected_lines,
+                                        "hunk_protected_lines": on.hunk_protected_lines,
+                                        "protection_rule": on.protection_rule})
+    assert on.placeholders == []
+
+
+@pytest.mark.parametrize("seed", range(24))
+def test_random_targets_without_the_problem_are_unchanged(tmp_path_factory, seed):
+    rng = random.Random(12535 + seed)
+    before = _random_function(rng, rng.randint(2, 6))
+    after = _mutate(rng, before)
+    target = _drift(rng, before)
+    if before == after:
+        pytest.skip("mutation was a no-op")
+    stages = _stages(*_build(tmp_path_factory, f"same{seed}",
+                             ("\n".join(before) + "\n", "\n".join(after) + "\n",
+                              "\n".join(target) + "\n", "@@ -1 +1 @@\n")))
+    on, off = _target(stages, True), _target(stages, False)
+    hunk, _ = target_hunk_lines(*(stages[2].by_role("functions/fn-1")[r].content
+                                  for r in ("source.before", "source.after", "target")))
+    if _overlapping(off, hunk):
+        assert on.protection_rule.endswith(":reduced_again")
+        assert _overlapping(on, hunk) == []
+    else:
+        assert on.reduced_text == off.reduced_text
 
 
 def test_reduce_one_unprotected_still_cuts():
