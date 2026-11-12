@@ -10,6 +10,16 @@ a recovery map so the artifact is reconstructable. A placeholder may never
 overlap a protected region — that is a context-construction failure, not a
 smaller cut. Parsing reuses SALP's structural layer (tree-sitter, per-language
 Grammar), so the stage inherits Java and Scala support.
+
+Target-side hunk protection (TARGET_HUNK_PROTECTION_RULE): the target lines an
+upstream hunk maps to are protected exactly like the changed source lines, so
+the code the model has to edit is never hidden behind a placeholder. SALP
+localizes a hunk only to the target FUNCTION, so the lines are found by
+aligning source.before with the target (`target_hunk_lines`). Before this rule
+the target was protected only by evidence identifiers, and a source side that
+cut nothing (its only compound statement holds the change) left the target
+filter empty, which meant "cut every removable subtree": the whole body of
+e.g. KafkaLog4jAppender.close() (PR-15922) became one placeholder.
 """
 
 from __future__ import annotations
@@ -34,6 +44,11 @@ REMOVABLE_TYPES = frozenset({
 })
 
 PLACEHOLDER = "/* RCAP_PH_{n} */"
+# Recorded in every target artifact and in run provenance; bump when the rule changes.
+TARGET_HUNK_PROTECTION_RULE = "target-hunk-protection-v1"
+# A changed line that the alignment cannot place is also looked up by its text,
+# but only when it is distinctive enough (normalized length) to mean the same code.
+_TEXT_MATCH_MIN_CHARS = 8
 _WS = re.compile(r"\s+")
 
 
@@ -61,6 +76,10 @@ class ReducedArtifact(BaseModel):
     nodes_before: int
     nodes_after: int
     reduction_reason: str | None = None  # why reduction was a no-op, when it was
+    # target only: the subset of protected_lines that an upstream hunk maps to,
+    # and the rule that computed it (None: the rule was off)
+    hunk_protected_lines: list[int] = Field(default_factory=list)
+    protection_rule: str | None = None
 
 
 class ProgramReductionRecord(BaseModel):
@@ -90,6 +109,57 @@ def _changed_lines(a: str, b: str) -> tuple[set[int], set[int]]:
         if tag in ("replace", "insert"):
             changed_b.update(range(j1, j2))
     return changed_a, changed_b
+
+
+def target_hunk_lines(f_s: str, f_sp: str, f_t: str) -> tuple[set[int], str]:
+    """0-based lines of the target `f_t` that the upstream change f_s -> f_sp maps to.
+
+    1. Hunk lines of source.before: every line the diff replaces or deletes, and
+       both neighbours of a pure insertion (where the new lines go).
+    2. Each is carried to the target by a line alignment of source.before with
+       the target (whitespace-insensitive): an equal line maps to its partner, a
+       line in a replaced block maps to the whole replacing block of the target,
+       a line the target lacks maps to the two target lines around the gap.
+    3. A hunk line the alignment could not pair with an identical target line is
+       also matched by its text anywhere in the target, when it is distinctive.
+    When source.before has hunk lines but none of them reaches the target, the
+    change cannot be placed at all and EVERY target line is returned: keep the
+    code visible rather than guess. Returns (lines, how) for the record."""
+    s, sp, t = f_s.splitlines(), f_sp.splitlines(), f_t.splitlines()
+    if not t:
+        return set(), "empty_target"
+    hunk_s: set[int] = set()
+    sm = difflib.SequenceMatcher(a=s, b=sp, autojunk=False)
+    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
+        if tag in ("replace", "delete"):
+            hunk_s.update(range(i1, i2))
+        elif tag == "insert":
+            hunk_s.update(i for i in (i1 - 1, i1) if 0 <= i < len(s))
+    if not hunk_s:
+        return set(), "no_source_change"
+
+    ns, nt = [_normalize(x) for x in s], [_normalize(x) for x in t]
+    out: set[int] = set()
+    unpaired: set[int] = set()
+    al = difflib.SequenceMatcher(a=ns, b=nt, autojunk=False)
+    for tag, i1, i2, j1, j2 in al.get_opcodes():
+        hit = [i for i in range(i1, i2) if i in hunk_s]
+        if not hit:
+            continue
+        if tag == "equal":
+            out.update(j1 + (i - i1) for i in hit)
+            continue
+        unpaired.update(hit)
+        if tag == "replace":
+            out.update(range(j1, j2))
+        elif tag == "delete":
+            out.update(j for j in (j1 - 1, j1) if 0 <= j < len(t))
+    for i in sorted(unpaired):
+        if len(ns[i]) >= _TEXT_MATCH_MIN_CHARS:
+            out.update(j for j, line in enumerate(nt) if line == ns[i])
+    if not out:
+        return set(range(len(t))), "unmapped_all_protected"
+    return out, "aligned"
 
 
 def _evidence_identifiers(case: CaseModel, reduction: SemanticReductionManifest) -> set[str]:
@@ -213,7 +283,9 @@ def reduce_program(
     """One code path for all four harness configs (section 15): `enabled=False`
     passes artifacts through unreduced; `evidence_protection=False` (the
     Program-Reduction-Only config) protects only the changed regions, mirroring
-    PPatHF, so the semantic contribution to the protected set is isolable."""
+    PPatHF, so the semantic contribution to the protected set is isolable.
+    The changed regions include their target counterpart (`target_hunk_lines`)
+    whenever `config.protect_target_hunks` is on (the default), in every config."""
     config = config or ExecutionConfig()
     grammar = grammar_for(case.language)
     if grammar is None:
@@ -248,9 +320,16 @@ def reduce_program(
                              config.min_placeholder_lines, None, case.language)
         removable_norm = {_normalize(p.original_text)
                           for p in art_s.placeholders + art_sp.placeholders}
+        hunk_t: set[int] = set()
+        how = None
+        if config.protect_target_hunks:
+            hunk_t, how = target_hunk_lines(f_s, f_sp, f_t)
         art_t = _reduce_one(entity, "target", f_t,
-                            _lines_naming(f_t, names), grammar,
+                            _lines_naming(f_t, names) | hunk_t, grammar,
                             config.min_placeholder_lines, removable_norm or None, case.language)
+        if config.protect_target_hunks:
+            art_t.hunk_protected_lines = sorted(hunk_t)
+            art_t.protection_rule = f"{TARGET_HUNK_PROTECTION_RULE}:{how}"
 
         for art in (art_s, art_sp, art_t):
             _assert_no_protected_overlap(case, art)

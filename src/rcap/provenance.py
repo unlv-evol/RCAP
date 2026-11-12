@@ -66,5 +66,8 @@ def run_provenance(backend: object | None = None, **extra: object) -> dict[str, 
             # the capacity configuration: what decides a capacity refusal
             out["limits"] = limits.as_dict()
     out.update(code_version())
+    # program-reduction rule version (on by default: ExecutionConfig.protect_target_hunks)
+    from rcap.reduction_program import TARGET_HUNK_PROTECTION_RULE
+    out["target_hunk_protection"] = TARGET_HUNK_PROTECTION_RULE
     out.update(extra)
     return out

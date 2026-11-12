@@ -61,3 +61,6 @@ class ExecutionConfig(BaseModel):
     generation_params: dict[str, object] = Field(default_factory=dict)
     # Program-context reduction tuning (recorded, never hard-coded).
     min_placeholder_lines: int = 3
+    # Never placehold a target line an upstream hunk maps to (rcap.reduction_program
+    # .target_hunk_lines). Off reproduces the reduction of ede1b40 and earlier.
+    protect_target_hunks: bool = True

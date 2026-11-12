@@ -62,8 +62,12 @@ def _element(oid: str, element: str, state: EvidenceState, **kw) -> EvidenceObje
     )
 
 
-def build_fixture_pr(root: Path, *, enriched: bool = False) -> Path:
+def build_fixture_pr(root: Path, *, enriched: bool = False,
+                     payloads: tuple[str, str, str, str] | None = None) -> Path:
     """Write one PR grouping with one single-hunk mapped SAP; return the PR dir.
+
+    `payloads` = (source.before, source.after, target, hunk.diff) replaces the
+    default Validator payloads (the evidence is the same).
 
     `enriched=True` simulates SALP edge promotion: extra evidence elements and
     typed relationship edges beyond `aligned_to`, so relationship-guided
@@ -164,10 +168,11 @@ def build_fixture_pr(root: Path, *, enriched: bool = False) -> Path:
         functions={"fn-1": fn}, hunks=[hunk], hunk_order=["H-1"],
         provenance=_prov("fixture", repo="apache/kafka", commit="a" * 40),
     )
-    sap.add_payload(fn.source_before_ref, F_S)
-    sap.add_payload(fn.source_after_ref, F_S_PRIME)
-    sap.add_payload(fn.target_ref, F_T)
-    sap.add_payload("hunks/H-1/hunk.diff", HUNK_DIFF)
+    f_s, f_sp, f_t, diff = payloads or (F_S, F_S_PRIME, F_T, HUNK_DIFF)
+    sap.add_payload(fn.source_before_ref, f_s)
+    sap.add_payload(fn.source_after_ref, f_sp)
+    sap.add_payload(fn.target_ref, f_t)
+    sap.add_payload("hunks/H-1/hunk.diff", diff)
 
     profile = Characterizer().characterize(categories)
     write_sap(sap, pr_dir / sap_id, profiles={"H-1": profile})
