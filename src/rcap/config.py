@@ -64,3 +64,8 @@ class ExecutionConfig(BaseModel):
     # Never placehold a target line an upstream hunk maps to (rcap.reduction_program
     # .target_hunk_lines). Off reproduces the reduction of ede1b40 and earlier.
     protect_target_hunks: bool = True
+    # Edit evidence (rcap.evidence): a function unit's prompt also shows the same
+    # change's edits outside functions in its file (removed/added lines) and the
+    # signatures of the functions the PR edits in its other files. Off reproduces
+    # the prompts of c24f060 and earlier byte for byte.
+    edit_evidence: bool = False

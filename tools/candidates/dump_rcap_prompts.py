@@ -9,6 +9,10 @@ one row per unit the pipeline refused before any request (e.g. over the request 
 
 --mode semantic_reduction_only is "RCAP without program reduction": no placeholders on any payload.
 (Semantic reduction has no admissible edge on these SAPs, so full_rcap is in effect program reduction only.)
+
+The run overrides apply exactly as in run_477.py (rcap.runoverrides: <repo root>/cand32k-overrides.json or
+RCAP_OVERRIDES, RCAP_EDIT_EVIDENCE); --overrides PATH|none picks the file explicitly. Under a unit allowlist
+only listed units are recorded (the others are still built, as evidence) and SAPs without one are skipped.
 """
 import argparse, hashlib, json, os, sys, time
 from pathlib import Path
@@ -17,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from rcap.backend_ollama import OllamaBackend  # noqa: E402
 from rcap.config import EvaluationMode, ExecutionConfig  # noqa: E402
 from rcap.pipeline import run_case  # noqa: E402
+from rcap import runoverrides  # noqa: E402
 
 
 class Recorder:
@@ -46,8 +51,17 @@ def main():
     ap.add_argument("--mode", default="full_rcap", choices=[m.value for m in EvaluationMode])
     ap.add_argument("--num-ctx", type=int, default=32768)
     ap.add_argument("--pairs")
+    ap.add_argument("--overrides", help="overrides file, or none (default: as run_477.py)")
     a = ap.parse_args()
-    cfg = ExecutionConfig(mode=EvaluationMode(a.mode))
+    if a.overrides and a.overrides.lower() == "none":
+        ov = runoverrides.Overrides()
+        import os
+        if os.environ.get("RCAP_EDIT_EVIDENCE") in ("0", "1"):
+            ov.edit_evidence = os.environ["RCAP_EDIT_EVIDENCE"] == "1"
+    else:
+        ov = runoverrides.load(a.overrides)
+    cfg = ov.apply(ExecutionConfig(mode=EvaluationMode(a.mode)))
+    print(f"edit_evidence={cfg.edit_evidence} allowlist={ov.allowlist_path} variant={ov.variant}", flush=True)
     pairs = set(a.pairs.split(",")) if a.pairs else None
     n = 0; t0 = time.time()
     with open(a.out, "w") as out:
@@ -60,10 +74,15 @@ def main():
                     continue
                 manifest = json.loads(man.read_text())
                 for sap in sorted(pr_dir.glob("sap-*")):
+                    allowed = ov.units_for(pair.name, pr_dir.name, sap.name)
+                    if allowed is not None and not allowed:
+                        continue
                     be = Recorder(a.num_ctx)
                     base = {"pair": pair.name, "pr": pr_dir.name, "sap": sap.name, "mode": a.mode, "num_ctx": a.num_ctx}
+                    if ov.variant:
+                        base["variant"] = ov.variant
                     try:
-                        res = run_case(sap, manifest, be, cfg)
+                        res = run_case(sap, manifest, be, cfg, generate_units=allowed)
                     except Exception as exc:
                         out.write(json.dumps({**base, "kind": "sap_refused", "outcome": f"REFUSED:{type(exc).__name__}",
                                               "stage": getattr(exc, "stage", None),
@@ -74,6 +93,8 @@ def main():
                         uid = getattr(u.unit, "entity", None) or getattr(u.unit, "unit_id", None)
                         reqs = list(getattr(u, "region_requests", None) or []) or [u.request]
                         reqs = [r for r in reqs if r is not None]
+                        if u.generation.outcome == "not_in_allowlist":
+                            continue
                         if not any(id(r) in sent for r in reqs):
                             # refused before the backend (limits, packaging): no request left the pipeline
                             out.write(json.dumps({**base, "kind": "unit_refused", "unit": str(uid),

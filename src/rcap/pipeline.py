@@ -12,7 +12,14 @@ from rcap.accept import describe_duplicates, duplicated_blocks
 from rcap.config import ExecutionConfig
 from rcap.context import AdaptationContext, build_context
 from rcap.coupling import CouplingRecord, detect_units
-from rcap.generate import Backend, generate, generate_regions, generate_with_placeholder_retry
+from rcap.evidence import pr_functions as pr_function_signatures
+from rcap.generate import (
+    Backend,
+    GenerationRecord,
+    generate,
+    generate_regions,
+    generate_with_placeholder_retry,
+)
 from rcap.intake import load_case
 from rcap.materialize import materialize
 from rcap.package import AdaptationPackage, build_package
@@ -89,7 +96,7 @@ def run_case(
     sap_dir, pr_manifest: dict | None, backend: Backend,
     config: ExecutionConfig | None = None,
     *, placeholder_retry: bool = False, narrow_whole_file_targets: bool = True,
-    region_requests: bool = True,
+    region_requests: bool = True, generate_units=None,
 ) -> CaseResult:
     """`narrow_whole_file_targets` (default ON): a unit whose source payloads are
     one function but whose target payload is the fork's whole file is narrowed
@@ -105,11 +112,19 @@ def run_case(
     `placeholder_retry` (default OFF): when a unit's answer is rejected for
     its placeholder comments, issue ONE targeted repair request
     (rcap.generate.generate_with_placeholder_retry). Off, the requests and
-    outcomes are exactly those of the plain pipeline."""
+    outcomes are exactly those of the plain pipeline.
+
+    `generate_units` (default None: every unit): a set of unit entities
+    ("functions/<fn>"). Every unit's context and request are still built (so a
+    unit outside the set still serves as its siblings' evidence, and every
+    prompt is the same as without the set), but only the units in the set are
+    sent to the backend; the others get the outcome `not_in_allowlist`."""
     config = config or ExecutionConfig()
     semantic_on = config.mode.semantic_reduction
     program_on = config.mode.program_reduction
     case = load_case(sap_dir, pr_manifest=pr_manifest)
+    evidence = config.edit_evidence
+    pr_funcs = tuple(pr_function_signatures(sap_dir, pr_manifest)) if evidence else ()
     reduction = None
     try:
         selection = select(case)
@@ -136,7 +151,8 @@ def run_case(
             # Single-unit case: the plain path (unit=None keeps the context
             # and request byte-identical to a non-composite build).
             context = build_context(case, reduction, materialized, program,
-                                    helpers=helpers)
+                                    helpers=helpers, edit_evidence=evidence,
+                                    pr_functions=pr_funcs)
             unit_results.append(UnitResult(units[0] if units else None,
                                            context, None, None))
         else:
@@ -146,7 +162,7 @@ def run_case(
                 context = build_context(
                     case, reduction, materialized, program, unit=unit,
                     siblings=tuple(s for s in units if s is not unit),
-                    helpers=helpers)
+                    helpers=helpers, edit_evidence=evidence, pr_functions=pr_funcs)
                 unit_results.append(UnitResult(unit, context, None, None))
         for ur in unit_results:
             ur.request = synthesize(ur.context)
@@ -166,6 +182,15 @@ def run_case(
         raise
 
     for ur in unit_results:
+        if generate_units is not None:
+            entity = ur.unit.entity if ur.unit is not None \
+                else ur.context.target_localization.get("function")
+            if entity not in generate_units:
+                ur.generation = GenerationRecord(
+                    case_id=ur.request.case_id, outcome="not_in_allowlist",
+                    diagnostics=[f"{entity}: not in the unit allowlist; built as evidence, not sent"],
+                    request_hash=ur.request.request_hash, exec_id="")
+                continue
         reject = duplicate_check(ur.context, case.language)
         if ur.region_requests:
             ur.generation, ur.placeholder_retry = generate_regions(

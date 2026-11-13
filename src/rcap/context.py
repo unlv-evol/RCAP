@@ -16,6 +16,7 @@ import re
 from pydantic import BaseModel, Field
 
 from rcap.coupling import Unit
+from rcap.evidence import OtherEdit, PRFunction, other_edits
 from rcap.materialize import MaterializationRecord
 from rcap.model import CaseModel
 from rcap.reduction_program import (
@@ -44,13 +45,18 @@ class ContextValidityFailure(ContextConstructionFailure):
         self.stage = "context_construction"
 
 
-def signature_of(payload_text: str) -> str | None:
+def signature_of(payload_text: str, bodyless: bool = False) -> str | None:
     """The declaration header of a function payload: the text up to the first
     body brace, whitespace-collapsed. Derived from SAP evidence (the payload
     itself), never invented; None when the payload has no brace (not a
-    function body)."""
+    function body). `bodyless` (edit evidence only): a declaration without a
+    body (an interface or abstract method, `...);`) is its own signature."""
     head, brace, _ = payload_text.partition("{")
     if not brace:
+        if bodyless:
+            head, semi, _ = payload_text.partition(";")
+            if semi and "(" in head:
+                return _WS.sub(" ", head).strip() or None
         return None
     return _WS.sub(" ", head).strip() or None
 
@@ -101,6 +107,9 @@ class AdaptationContext(BaseModel):
     # unit info means a plain single-unit case.
     unit: dict[str, object] = Field(default_factory=dict)
     siblings: list[SiblingSignature] = Field(default_factory=list)
+    # Edit evidence (rcap.evidence; ExecutionConfig.edit_evidence). Empty when off.
+    other_edits: list[OtherEdit] = Field(default_factory=list)
+    pr_functions: list[PRFunction] = Field(default_factory=list)
     transformation: dict[str, str]              # role -> reduced text
     edit_regions: list[str]
     # Section 9(2): file, region, containing function, match kind, and — when
@@ -264,6 +273,8 @@ def build_context(
     unit: Unit | None = None,
     siblings: tuple[Unit, ...] = (),
     helpers: tuple[str, ...] = (),
+    edit_evidence: bool = False,
+    pr_functions: tuple[PRFunction, ...] = (),
 ) -> AdaptationContext:
     """Build the context for one processing unit (section 13: per-unit
     processing). A composite case must name its unit explicitly — building
@@ -351,6 +362,13 @@ def build_context(
     # Section 13: sibling-edit signatures — the signatures (never bodies) of
     # the other units edited by this change, from their materialized payloads.
     sibling_sigs: list[SiblingSignature] = []
+    edits: list[OtherEdit] = []
+    if edit_evidence:
+        # Non-function siblings (imports, fields, class/file-level code) leave the
+        # signature list (where they could only show as `?`) for the edit-evidence
+        # section, as the lines their change removes and adds.
+        edits, moved = other_edits([s.entity for s in siblings], materialized, case.language)
+        siblings = tuple(s for s in siblings if s.entity not in moved)
     for sib in siblings:
         roles = materialized.by_role(sib.entity)
         if not roles:
@@ -358,7 +376,7 @@ def build_context(
 
         def sig(role: str, roles=roles) -> str | None:
             payload = roles.get(role)
-            return signature_of(payload.content) if payload else None
+            return signature_of(payload.content, bodyless=edit_evidence) if payload else None
 
         sibling_sigs.append(SiblingSignature(
             entity=sib.entity, hunk_ids=sib.hunk_ids,
@@ -379,6 +397,8 @@ def build_context(
         case_id=case.case_id,
         unit=unit.model_dump() if unit is not None else {},
         siblings=sibling_sigs,
+        other_edits=edits,
+        pr_functions=list(pr_functions) if edit_evidence else [],
         transformation={role: arts[role].reduced_text for role in arts},
         edit_regions=unit_edit_regions,
         target_localization=_with_narrowing(_localization(case, retained, entity),

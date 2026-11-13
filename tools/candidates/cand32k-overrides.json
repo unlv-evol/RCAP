@@ -1,0 +1,6 @@
+{
+ "name": "cand32k-ev1",
+ "edit_evidence": true,
+ "unit_allowlist": "tools/candidates/shared-units.tsv",
+ "about": "Study 2026-11-candidates-32k: RCAP sends only the 2,604 shared Java function units, with edit evidence. Active when copied to the repo root as cand32k-overrides.json (rcap.runoverrides). RCAP_EDIT_EVIDENCE=0 = the ablation (old prompts)."
+}

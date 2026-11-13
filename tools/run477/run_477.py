@@ -8,6 +8,14 @@ Usage: run_477.py <salp-out-root> <results.jsonl> [--limit N] [--mode full_rcap|
 
 --mode picks the evaluation configuration (rcap.config.EvaluationMode, default full_rcap);
 semantic_reduction_only = RCAP without program reduction.
+--gen-cache-ro DIR (repeatable): read-only answer caches of other runs (only --gen-cache is written).
+
+Overrides (rcap.runoverrides): when <repo root>/cand32k-overrides.json exists (or RCAP_OVERRIDES names a
+file), its settings apply to this run without any new flag: edit evidence on/off and a unit allowlist
+(only listed units are sent to the model; the others are still built, as their siblings' evidence; a SAP
+with no listed unit gets an outcome `not_in_allowlist` row without running). RCAP_EDIT_EVIDENCE=0/1
+forces edit evidence. Every row then carries `variant`; on resume only rows of the same variant count as
+done, and an output file holding rows of another variant is moved aside to <out>.superseded-N first.
 """
 import json, sys, time, traceback, os
 from pathlib import Path
@@ -18,12 +26,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gencache import CachedBackend
 from rcap.provenance import run_provenance
 from rcap.config import EvaluationMode, ExecutionConfig
+from rcap import runoverrides
 
+OV = runoverrides.load()
 root = Path(sys.argv[1]); out = Path(sys.argv[2])
 limit = int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else None
 # --per-pair N samples N SAPs from EACH pair, so a smoke test covers every
 # repository rather than N SAPs of whichever pair sorts first.
 per_pair = int(sys.argv[sys.argv.index("--per-pair") + 1]) if "--per-pair" in sys.argv else None
+
+def _variant_of(line):
+    try: return json.loads(line).get("variant")
+    except Exception: return None
+
+if out.exists() and OV.active:
+    # never resume across settings: rows written under other settings are moved aside, not mixed in
+    lines = [l for l in out.open() if l.strip()]
+    if any(_variant_of(l) != OV.variant for l in lines):
+        n = 1
+        while out.with_name(f"{out.name}.superseded-{n}").exists(): n += 1
+        aside = out.with_name(f"{out.name}.superseded-{n}")
+        out.rename(aside)
+        print(f"{out.name}: {len(lines)} rows of other settings moved aside to {aside.name}", flush=True)
 
 done = set()
 if out.exists():
@@ -54,30 +78,46 @@ if per_pair:
 if limit: saps = saps[:limit]
 
 MODE = sys.argv[sys.argv.index("--mode") + 1] if "--mode" in sys.argv else EvaluationMode.FULL.value
-CONFIG = ExecutionConfig(mode=EvaluationMode(MODE))
+CONFIG = OV.apply(ExecutionConfig(mode=EvaluationMode(MODE)))
 backend = OllamaBackend()
 # --gen-cache DIR: answers by prompt hash (shared with order_pr.py); only DIR is written
+RO_DIRS = [sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--gen-cache-ro"]
 if "--gen-cache" in sys.argv:
-    backend = CachedBackend(backend, sys.argv[sys.argv.index("--gen-cache") + 1])
+    backend = CachedBackend(backend, sys.argv[sys.argv.index("--gen-cache") + 1], RO_DIRS)
 PROV = run_provenance(backend, driver="run_477.py", k=1)
 print(f"backend {backend.name}/{backend.model} digest={backend.model_digest} "
       f"limit={backend.request_limit_chars}", flush=True)
+if OV.active:
+    print(f"overrides: {'; '.join(OV.notes)} -> variant {OV.variant}, edit_evidence={CONFIG.edit_evidence}, "
+          f"allowlist={OV.allowlist_path} ({sum(len(v) for v in (OV.allowlist or {}).values())} units)"
+          + (f", read-only caches {RO_DIRS}" if RO_DIRS else ""), flush=True)
 print(f"{len(done)} already recorded; {len(saps)} to run", flush=True)
 
 t_start = time.time()
 for i, (key, pair, pr_dir, sap) in enumerate(saps, 1):
     manifest = json.loads((pr_dir / "pr.json").read_text())
     row = {"key": key, "pair": pair, "pr": pr_dir.name, "sap": sap, "mode": MODE, "provenance": PROV}
+    if OV.active:
+        row["variant"] = OV.variant
+    allowed = OV.units_for(pair, pr_dir.name, sap)
+    if allowed is not None and not allowed:
+        row.update(outcome="not_in_allowlist", units=0, seconds=0.0)
+        with out.open("a") as fh:
+            fh.write(json.dumps(row) + "\n")
+        continue
     t0 = time.time()
     try:
-        res = run_case(pr_dir / sap, manifest, backend, CONFIG)
+        res = run_case(pr_dir / sap, manifest, backend, CONFIG, generate_units=allowed)
         row["units"] = len(res.units)
+        row["unit_entities"] = [(u.unit.entity if u.unit is not None
+                                 else u.context.target_localization.get("function")) for u in res.units]
         row["unit_outcomes"] = [u.generation.outcome for u in res.units]
         row["prompt_chars"] = [len(u.request.prompt) for u in res.units]
         row["language"] = res.units[0].request.language if res.units else None
+        sent = [o for o in row["unit_outcomes"] if o != "not_in_allowlist"]
         row["outcome"] = ("completion"
-                          if all(o == "completion" for o in row["unit_outcomes"])
-                          else next(o for o in row["unit_outcomes"] if o != "completion"))
+                          if all(o == "completion" for o in sent)
+                          else next(o for o in sent if o != "completion"))
         row["diagnostics"] = [d for u in res.units
                               for d in (u.generation.diagnostics or [])][:3]
         row["has_package"] = res.package is not None

@@ -17,6 +17,7 @@ import json
 from pydantic import BaseModel, Field
 
 from rcap.context import AdaptationContext
+from rcap.evidence import render_sections as render_evidence_sections
 from rcap.regions import RegionPlan, plan_regions
 from rcap.unitkind import FILE, FUNCTION, REGION, WHOLE_KINDS, text_kind
 
@@ -550,6 +551,8 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
             "## Other functions edited by this same change (signatures only)\n"
             "This change also edits the functions below; keep any shared names\n"
             "and signatures consistent with these edits.\n" + "\n".join(lines))
+    # Edit evidence (rcap.evidence): empty unless ExecutionConfig.edit_evidence.
+    sections.extend(render_evidence_sections(context, lang))
     helper_arts = [a for a in context.program_context
                    if a.role == "target"
                    and a.entity != context.target_localization.get("function")]
