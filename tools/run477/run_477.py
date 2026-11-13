@@ -4,7 +4,10 @@ Resumable by design: it will run for days and across sessions, so every SAP's
 row is flushed immediately and any SAP already present in the output is skipped
 on restart. Kill and relaunch it freely.
 
-Usage: run_477.py <salp-out-root> <results.jsonl> [--limit N]
+Usage: run_477.py <salp-out-root> <results.jsonl> [--limit N] [--mode full_rcap|semantic_reduction_only|...]
+
+--mode picks the evaluation configuration (rcap.config.EvaluationMode, default full_rcap);
+semantic_reduction_only = RCAP without program reduction.
 """
 import json, sys, time, traceback, os
 from pathlib import Path
@@ -14,6 +17,7 @@ from rcap.pipeline import run_case
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gencache import CachedBackend
 from rcap.provenance import run_provenance
+from rcap.config import EvaluationMode, ExecutionConfig
 
 root = Path(sys.argv[1]); out = Path(sys.argv[2])
 limit = int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else None
@@ -49,6 +53,8 @@ if per_pair:
     saps = sampled
 if limit: saps = saps[:limit]
 
+MODE = sys.argv[sys.argv.index("--mode") + 1] if "--mode" in sys.argv else EvaluationMode.FULL.value
+CONFIG = ExecutionConfig(mode=EvaluationMode(MODE))
 backend = OllamaBackend()
 # --gen-cache DIR: answers by prompt hash (shared with order_pr.py); only DIR is written
 if "--gen-cache" in sys.argv:
@@ -61,10 +67,10 @@ print(f"{len(done)} already recorded; {len(saps)} to run", flush=True)
 t_start = time.time()
 for i, (key, pair, pr_dir, sap) in enumerate(saps, 1):
     manifest = json.loads((pr_dir / "pr.json").read_text())
-    row = {"key": key, "pair": pair, "pr": pr_dir.name, "sap": sap, "provenance": PROV}
+    row = {"key": key, "pair": pair, "pr": pr_dir.name, "sap": sap, "mode": MODE, "provenance": PROV}
     t0 = time.time()
     try:
-        res = run_case(pr_dir / sap, manifest, backend)
+        res = run_case(pr_dir / sap, manifest, backend, CONFIG)
         row["units"] = len(res.units)
         row["unit_outcomes"] = [u.generation.outcome for u in res.units]
         row["prompt_chars"] = [len(u.request.prompt) for u in res.units]

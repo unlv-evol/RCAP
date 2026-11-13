@@ -1,5 +1,5 @@
 """PPatHF-style treatment, generation (roadmap item 8): send each eligible prompt of build_inputs.py to the model
-with RCAP's settings (temperature 0, seed 12535, num_ctx 16384, k=1, thinking off as in RCAP's backend), take
+with RCAP's settings (temperature 0, seed 12535, num_ctx RCAP_NUM_CTX (default 16384), k=1, thinking off as in RCAP's backend), take
 the answer and put PPatHF's removed pieces back (Reducer.do_recovering, Java profile).
 
 The user message is PPatHF's prompt byte for byte. A zero-shot chat model needs to be told the answer format
@@ -33,7 +33,7 @@ sys.path.insert(0, str(HERE))
 
 OLLAMA_BASE = os.environ.get("RCAP_OLLAMA_URL", "http://127.0.0.1:11435")
 MODEL = os.environ.get("RCAP_MODEL", "qwen3-coder:30b")
-NUM_CTX = 16384
+NUM_CTX = int(os.environ.get("RCAP_NUM_CTX", "16384"))  # same window as RCAP's backend
 TIMEOUT_S = 600
 MAX_OUTPUT_TOKENS = 4096  # above every answer of the local qwen3-coder run; stops a run-on answer that never closes a block
 
@@ -125,6 +125,13 @@ def make_reducer():
     return Reducer(tolerant=True)
 
 
+def unit_key(r):
+    """pr/unit, prefixed by the repository pair when the input names one (one upstream PR can be ported
+    into two forks, e.g. bitcoinj PR-1760 into bisq and dogecoinj)."""
+    k = r["pr"] + "/" + r["unit"]
+    return r["pair"] + "/" + k if r.get("pair") else k
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("inputs"); ap.add_argument("out")
@@ -134,7 +141,7 @@ def main():
     g.add_argument("--no-recover", action="store_true"); g.add_argument("--recover-only", action="store_true")
     a = ap.parse_args()
     if a.recover_only:
-        removed = {r["pr"] + "/" + r["unit"]: r["removed_pieces_target"]
+        removed = {unit_key(r): r["removed_pieces_target"]
                    for r in map(json.loads, open(a.inputs)) if r.get("eligible")}
         reducer = make_reducer()
         recs = [json.loads(l) for l in open(a.out) if l.strip()]
@@ -161,11 +168,11 @@ def main():
     think = model_think()
     digest = post("/api/show", {"model": MODEL}, 60).get("digest")
     reducer = None if a.no_recover else make_reducer()
-    print(f"{MODEL} think={think} {len(rows)} units, {len(done & {r['pr'] + '/' + r['unit'] for r in rows})} done",
+    print(f"{MODEL} think={think} {len(rows)} units, {len(done & {unit_key(r) for r in rows})} done",
           flush=True)
     with open(a.out, "a") as out:
         for i, r in enumerate(rows, 1):
-            uid = r["pr"] + "/" + r["unit"]
+            uid = unit_key(r)
             if uid in done:
                 continue
             system = FORMAT_NOTE + ("\n" + PLACEHOLDER_NOTE if r["placeholders"] else "")
@@ -173,7 +180,7 @@ def main():
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": r["prompt"]}],
                     **({"think": think} if think is not None else {}),
                     "options": {"temperature": 0, "seed": 12535, "num_ctx": NUM_CTX, "num_predict": MAX_OUTPUT_TOKENS}}
-            rec = {"unit_id": uid, "pr": r["pr"], "sap": r["sap"], "fn": r["fn"], "model": MODEL, "model_digest": digest,
+            rec = {"unit_id": uid, **({"pair": r["pair"]} if r.get("pair") else {}), "pr": r["pr"], "sap": r["sap"], "fn": r["fn"], "model": MODEL, "model_digest": digest,
                    "think": think, "prompt_sha256": r["prompt_sha256"], "system": system,
                    "placeholders": r["placeholders"]}
             t0 = time.time()

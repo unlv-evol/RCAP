@@ -8,6 +8,7 @@ A unit is eligible when all three payloads are exactly one function (rcap.unitki
 reducer has a profile for; every other unit is written with the reason it is not, never dropped.
 
     python build_inputs.py <SALP out dir of one pair> <source repo> <target repo> <out.jsonl> [--prs PR-1,PR-2]
+                           [--direct direct.jsonl]
 """
 import argparse
 import hashlib
@@ -45,16 +46,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pair_dir"); ap.add_argument("src"); ap.add_argument("tgt"); ap.add_argument("out")
     ap.add_argument("--prs", help="comma-separated PR ids (default: all)")
+    ap.add_argument("--direct", help="also write the Direct LLM inputs here: every eligible triple, unreduced")
+    ap.add_argument("--pair", help="name of the repository pair, recorded in every row (needed when one input file "
+                                   "holds several pairs: the same PR can be ported into two forks)")
     a = ap.parse_args()
     only = set(a.prs.split(",")) if a.prs else None
     from reducer import Reducer
     reducers = {}
+    direct = open(a.direct, "w") if a.direct else None
     with open(a.out, "w") as out:
         for pr in sorted(Path(a.pair_dir).glob("PR-*"), key=lambda p: int(p.name[3:])):
             if only and pr.name not in only:
                 continue
             for fd in sorted(pr.glob("sap-*/functions/*")):
-                row = {"pr": pr.name, "sap": fd.parent.parent.name, "fn": fd.name,
+                row = {**({"pair": a.pair} if a.pair else {}), "pr": pr.name, "sap": fd.parent.parent.name, "fn": fd.name,
                        "unit": f"{fd.parent.parent.name}::{fd.name}"}
                 texts = {k: next(iter(sorted(fd.glob(k + ".*"))), None) for k in ("source.before", "source.after", "target")}
                 tf = texts["target"]
@@ -94,6 +99,12 @@ def main():
                                    removed_pieces_target={str(k): v for k, v in o["removed_pieces_mapped"].items()},
                                    target_original=ft)
                 out.write(json.dumps(row) + "\n"); out.flush()
+                if direct and row.get("eligible"):
+                    # Direct LLM: the same triple and template, nothing removed
+                    direct.write(json.dumps({**row, "treatment": "direct", "placeholders": 0, "target_reduced_chars": len(ft),
+                                             "prompt": raw, "prompt_chars": len(raw),
+                                             "prompt_sha256": hashlib.sha256(raw.encode()).hexdigest(),
+                                             "removed_pieces_target": {}}) + "\n")
 
 
 if __name__ == "__main__":

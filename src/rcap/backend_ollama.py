@@ -143,12 +143,14 @@ class GenerationLimits:
 
 class OllamaBackend:
     def __init__(self, model: str = DEFAULT_MODEL, url: str = DEFAULT_URL,
-                 *, num_ctx: int = 16384, timeout: int = 600,
+                 *, num_ctx: int | None = None, timeout: int = 600,
                  request_limit_chars: int | None = None,
                  limits: GenerationLimits | None = None):
         self.name = "ollama"
         self.model = model
         self.url = url
+        # RCAP_NUM_CTX sets the window for a whole run (default 16384, as before)
+        num_ctx = num_ctx if num_ctx is not None else int(os.environ.get("RCAP_NUM_CTX", "16384"))
         self.num_ctx = num_ctx
         # `timeout` is the fallback for calls without a budget (metadata calls,
         # requests of unknown answer size); budgeted calls use limits.plan().
