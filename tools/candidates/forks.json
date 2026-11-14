@@ -1,0 +1,42 @@
+{
+ "DSpace/DSpace": {
+  "rev": "b7e4eaa9819bea42eefd18e0fbcc66228715da59",
+  "source": "validation-data/dataset.jsonl target_revision (the commit make_gacpd's cutoff resolved to; 0 mismatches in gacpd-a/mint.out)"
+ },
+ "Willena/sqlite-jdbc-crypt": {
+  "rev": "c586deca7b6d35d9748c4d872ab44dd597eb734d",
+  "source": "validation-data/dataset.jsonl target_revision (the commit make_gacpd's cutoff resolved to; 0 mismatches in gacpd-a/mint.out)"
+ },
+ "apache/kafka": {
+  "rev": "6c1d5fec60ddb509558dac34ff7880917e9f9f59",
+  "source": "validation-data/dataset.jsonl target_revision (the commit make_gacpd's cutoff resolved to; 0 mismatches in gacpd-a/mint.out)"
+ },
+ "bisq-network/bitcoinj": {
+  "rev": "23ce3ee46df2fa3297dcceea98d93ed5ca028ade",
+  "source": "validation-data/dataset.jsonl target_revision (the commit make_gacpd's cutoff resolved to; 0 mismatches in gacpd-a/mint.out)"
+ },
+ "eisop/checker-framework": {
+  "rev": "de9b6390911b39526b1f3b0a845083f779942f2c",
+  "source": "validation-data/dataset.jsonl target_revision (the commit make_gacpd's cutoff resolved to; 0 mismatches in gacpd-a/mint.out)"
+ },
+ "langerhans/dogecoinj-new": {
+  "rev": "06a73e1e816bde473f9022676c009a28829dc14f",
+  "source": "validation-data/dataset.jsonl target_revision (the commit make_gacpd's cutoff resolved to; 0 mismatches in gacpd-a/mint.out)"
+ },
+ "linkedin/kafka": {
+  "rev": "fdb9fd013ad0fa86adb01c6d1d2852d396b93b04",
+  "source": "validation-data/dataset.jsonl target_revision (the commit make_gacpd's cutoff resolved to; 0 mismatches in gacpd-a/mint.out)"
+ },
+ "tulipcc/ParserGeneratorCC": {
+  "rev": "fed93885fef2ef1be1d9d6d6d200d2da355bc34d",
+  "source": "validation-data/dataset.jsonl target_revision (the commit make_gacpd's cutoff resolved to; 0 mismatches in gacpd-a/mint.out)"
+ },
+ "typetools/checker-framework": {
+  "rev": "69fbadd295706f7865a1ec36b9b16e608c35ad09",
+  "source": "validation-data/dataset.jsonl target_revision (the commit make_gacpd's cutoff resolved to; 0 mismatches in gacpd-a/mint.out)"
+ },
+ "ufal/clarin-dspace": {
+  "rev": "82e33e817a1ab031fd387ae22d97c71d69789beb",
+  "source": "validation-data/dataset.jsonl target_revision (the commit make_gacpd's cutoff resolved to; 0 mismatches in gacpd-a/mint.out)"
+ }
+}
