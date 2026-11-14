@@ -4,11 +4,13 @@ A batch job's command line is frozen when it is submitted, so a study that must 
 already-queued jobs run RCAP does it with a file the drivers read at start-up:
 
     <repo root>/cand32k-overrides.json        (or the path in RCAP_OVERRIDES; RCAP_OVERRIDES=none: ignore)
-    {"name": "cand32k-ev1",
+    {"name": "cand32k-ev2",
      "edit_evidence": true,                                # ExecutionConfig.edit_evidence
+     "evidence_filter": "names",                           # ExecutionConfig.evidence_filter (none | names)
      "unit_allowlist": "tools/candidates/shared-units.tsv"} # relative to the repo root; TSV pair, pr, sap, unit
 
 RCAP_EDIT_EVIDENCE=0 / =1 forces edit evidence off / on whatever the file says (the ablation).
+RCAP_EVIDENCE_FILTER=none / =names forces the relevance filter (none = the unfiltered evidence of 08e7a59).
 No file and no environment variable: nothing changes (`Overrides.active` is False).
 """
 
@@ -28,20 +30,22 @@ class Overrides:
     path: str | None = None
     name: str | None = None
     edit_evidence: bool | None = None          # None: leave the config as it is
+    evidence_filter: str | None = None         # None: leave the config as it is
     allowlist_path: str | None = None
     allowlist: dict[tuple[str, str, str], set[str]] | None = None   # (pair, pr, sap) -> {"functions/<fn>"}
     notes: list[str] = field(default_factory=list)
 
     @property
     def active(self) -> bool:
-        return self.path is not None or self.edit_evidence is not None
+        return self.path is not None or self.edit_evidence is not None or self.evidence_filter is not None
 
     @property
     def variant(self) -> str | None:
         """A tag for every result row, so a resumed run never mixes rows written under other settings."""
         if not self.active:
             return None
-        return f"{self.name or 'overrides'}:ev={int(bool(self.edit_evidence))}:allow={int(self.allowlist is not None)}"
+        tag = f"{self.name or 'overrides'}:ev={int(bool(self.edit_evidence))}:allow={int(self.allowlist is not None)}"
+        return tag + (f":filter={self.evidence_filter}" if self.evidence_filter is not None else "")
 
     def units_for(self, pair: str, pr: str, sap: str) -> set[str] | None:
         """The units of this SAP that may be sent (None: all of them)."""
@@ -51,9 +55,12 @@ class Overrides:
 
     def apply(self, config):
         """The ExecutionConfig with the overrides applied (a copy)."""
-        if self.edit_evidence is None:
-            return config
-        return config.model_copy(update={"edit_evidence": self.edit_evidence})
+        update = {}
+        if self.edit_evidence is not None:
+            update["edit_evidence"] = self.edit_evidence
+        if self.evidence_filter is not None:
+            update["evidence_filter"] = self.evidence_filter
+        return config.model_copy(update=update) if update else config
 
 
 def load_allowlist(path: str | Path) -> dict[tuple[str, str, str], set[str]]:
@@ -77,6 +84,8 @@ def load(path: str | Path | None = None) -> Overrides:
         ov.name = raw.get("name")
         if "edit_evidence" in raw:
             ov.edit_evidence = bool(raw["edit_evidence"])
+        if raw.get("evidence_filter") is not None:
+            ov.evidence_filter = _filter_value(raw["evidence_filter"], f"{path}: evidence_filter")
         if raw.get("unit_allowlist"):
             al = Path(raw["unit_allowlist"])
             al = al if al.is_absolute() else REPO_ROOT / al
@@ -87,4 +96,15 @@ def load(path: str | Path | None = None) -> Overrides:
     if flag in ("0", "1"):
         ov.edit_evidence = flag == "1"
         ov.notes.append(f"RCAP_EDIT_EVIDENCE={flag}")
+    filt = os.environ.get("RCAP_EVIDENCE_FILTER")
+    if filt:
+        ov.evidence_filter = _filter_value(filt, "RCAP_EVIDENCE_FILTER")
+        ov.notes.append(f"RCAP_EVIDENCE_FILTER={filt}")
     return ov
+
+
+def _filter_value(value, where: str) -> str:
+    from rcap.evidence import EVIDENCE_FILTERS
+    if value not in EVIDENCE_FILTERS:
+        raise ValueError(f"{where}: {value!r} is not one of {', '.join(EVIDENCE_FILTERS)}")
+    return value

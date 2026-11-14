@@ -11,7 +11,7 @@ one row per unit the pipeline refused before any request (e.g. over the request 
 (Semantic reduction has no admissible edge on these SAPs, so full_rcap is in effect program reduction only.)
 
 The run overrides apply exactly as in run_477.py (rcap.runoverrides: <repo root>/cand32k-overrides.json or
-RCAP_OVERRIDES, RCAP_EDIT_EVIDENCE); --overrides PATH|none picks the file explicitly. Under a unit allowlist
+RCAP_OVERRIDES, RCAP_EDIT_EVIDENCE, RCAP_EVIDENCE_FILTER); --overrides PATH|none picks the file explicitly. Under a unit allowlist
 only listed units are recorded (the others are still built, as evidence) and SAPs without one are skipped.
 """
 import argparse, hashlib, json, os, sys, time
@@ -58,10 +58,12 @@ def main():
         import os
         if os.environ.get("RCAP_EDIT_EVIDENCE") in ("0", "1"):
             ov.edit_evidence = os.environ["RCAP_EDIT_EVIDENCE"] == "1"
+        if os.environ.get("RCAP_EVIDENCE_FILTER"):
+            ov.evidence_filter = os.environ["RCAP_EVIDENCE_FILTER"]
     else:
         ov = runoverrides.load(a.overrides)
     cfg = ov.apply(ExecutionConfig(mode=EvaluationMode(a.mode)))
-    print(f"edit_evidence={cfg.edit_evidence} allowlist={ov.allowlist_path} variant={ov.variant}", flush=True)
+    print(f"edit_evidence={cfg.edit_evidence} evidence_filter={cfg.evidence_filter} allowlist={ov.allowlist_path} variant={ov.variant}", flush=True)
     pairs = set(a.pairs.split(",")) if a.pairs else None
     n = 0; t0 = time.time()
     with open(a.out, "w") as out:

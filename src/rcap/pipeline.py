@@ -152,7 +152,7 @@ def run_case(
             # and request byte-identical to a non-composite build).
             context = build_context(case, reduction, materialized, program,
                                     helpers=helpers, edit_evidence=evidence,
-                                    pr_functions=pr_funcs)
+                                    pr_functions=pr_funcs, evidence_filter=config.evidence_filter)
             unit_results.append(UnitResult(units[0] if units else None,
                                            context, None, None))
         else:
@@ -162,7 +162,8 @@ def run_case(
                 context = build_context(
                     case, reduction, materialized, program, unit=unit,
                     siblings=tuple(s for s in units if s is not unit),
-                    helpers=helpers, edit_evidence=evidence, pr_functions=pr_funcs)
+                    helpers=helpers, edit_evidence=evidence, pr_functions=pr_funcs,
+                    evidence_filter=config.evidence_filter)
                 unit_results.append(UnitResult(unit, context, None, None))
         for ur in unit_results:
             ur.request = synthesize(ur.context)

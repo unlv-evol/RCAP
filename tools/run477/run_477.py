@@ -11,10 +11,11 @@ semantic_reduction_only = RCAP without program reduction.
 --gen-cache-ro DIR (repeatable): read-only answer caches of other runs (only --gen-cache is written).
 
 Overrides (rcap.runoverrides): when <repo root>/cand32k-overrides.json exists (or RCAP_OVERRIDES names a
-file), its settings apply to this run without any new flag: edit evidence on/off and a unit allowlist
+file), its settings apply to this run without any new flag: edit evidence on/off, its relevance filter
+(evidence_filter none|names) and a unit allowlist
 (only listed units are sent to the model; the others are still built, as their siblings' evidence; a SAP
 with no listed unit gets an outcome `not_in_allowlist` row without running). RCAP_EDIT_EVIDENCE=0/1
-forces edit evidence. Every row then carries `variant`; on resume only rows of the same variant count as
+forces edit evidence, RCAP_EVIDENCE_FILTER=none|names the filter. Every row then carries `variant`; on resume only rows of the same variant count as
 done, and an output file holding rows of another variant is moved aside to <out>.superseded-N first.
 """
 import json, sys, time, traceback, os
@@ -89,6 +90,7 @@ print(f"backend {backend.name}/{backend.model} digest={backend.model_digest} "
       f"limit={backend.request_limit_chars}", flush=True)
 if OV.active:
     print(f"overrides: {'; '.join(OV.notes)} -> variant {OV.variant}, edit_evidence={CONFIG.edit_evidence}, "
+          f"evidence_filter={CONFIG.evidence_filter}, "
           f"allowlist={OV.allowlist_path} ({sum(len(v) for v in (OV.allowlist or {}).values())} units)"
           + (f", read-only caches {RO_DIRS}" if RO_DIRS else ""), flush=True)
 print(f"{len(done)} already recorded; {len(saps)} to run", flush=True)

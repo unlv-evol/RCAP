@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -69,3 +70,7 @@ class ExecutionConfig(BaseModel):
     # signatures of the functions the PR edits in its other files. Off reproduces
     # the prompts of c24f060 and earlier byte for byte.
     edit_evidence: bool = False
+    # Relevance filter of the edit evidence (rcap.evidence, "Relevance filter"): "none" shows every
+    # entry (the prompts of 08e7a59); "names" keeps only the entries whose declared, imported or
+    # re-signed names the function uses. No effect unless edit_evidence is on.
+    evidence_filter: Literal["none", "names"] = "none"

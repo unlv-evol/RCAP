@@ -16,7 +16,14 @@ import re
 from pydantic import BaseModel, Field
 
 from rcap.coupling import Unit
-from rcap.evidence import OtherEdit, PRFunction, other_edits
+from rcap.evidence import (
+    OtherEdit,
+    PRFunction,
+    filter_other_edits,
+    function_names,
+    other_edits,
+    signature_relevant,
+)
 from rcap.materialize import MaterializationRecord
 from rcap.model import CaseModel
 from rcap.reduction_program import (
@@ -110,6 +117,8 @@ class AdaptationContext(BaseModel):
     # Edit evidence (rcap.evidence; ExecutionConfig.edit_evidence). Empty when off.
     other_edits: list[OtherEdit] = Field(default_factory=list)
     pr_functions: list[PRFunction] = Field(default_factory=list)
+    # True when the relevance filter chose them (ExecutionConfig.evidence_filter = "names").
+    evidence_filtered: bool = False
     transformation: dict[str, str]              # role -> reduced text
     edit_regions: list[str]
     # Section 9(2): file, region, containing function, match kind, and — when
@@ -275,6 +284,7 @@ def build_context(
     helpers: tuple[str, ...] = (),
     edit_evidence: bool = False,
     pr_functions: tuple[PRFunction, ...] = (),
+    evidence_filter: str = "none",
 ) -> AdaptationContext:
     """Build the context for one processing unit (section 13: per-unit
     processing). A composite case must name its unit explicitly — building
@@ -384,6 +394,20 @@ def build_context(
             signature_after=sig("source.after"),
             target_signature=sig("target")))
 
+    filtered = edit_evidence and evidence_filter == "names"
+    pr_funcs = list(pr_functions) if edit_evidence else []
+    if filtered:
+        # Relevance filter (rcap.evidence): keep only the entries whose names this function uses,
+        # from its unreduced payloads (so both evaluation modes keep the same entries).
+        roles = materialized.by_role(entity)
+        names = function_names(*(roles[r].content if r in roles else None
+                                 for r in ("source.before", "source.after", "target")))
+        edits = filter_other_edits(edits, names)[0]
+        sibling_sigs = [s for s in sibling_sigs if signature_relevant(
+            s.signature_before, s.signature_after, names, same_file=True)]
+        pr_funcs = [f for f in pr_funcs
+                    if signature_relevant(f.signature_before, f.signature_after, names)]
+
     unit_edit_regions = (unit.edit_regions if unit is not None
                          else [er for t in case.transformations for er in t.edit_regions])
 
@@ -398,7 +422,8 @@ def build_context(
         unit=unit.model_dump() if unit is not None else {},
         siblings=sibling_sigs,
         other_edits=edits,
-        pr_functions=list(pr_functions) if edit_evidence else [],
+        pr_functions=pr_funcs,
+        evidence_filtered=filtered,
         transformation={role: arts[role].reduced_text for role in arts},
         edit_regions=unit_edit_regions,
         target_localization=_with_narrowing(_localization(case, retained, entity),
