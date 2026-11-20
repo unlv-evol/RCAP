@@ -166,6 +166,7 @@ def run_case(
                     evidence_filter=config.evidence_filter)
                 unit_results.append(UnitResult(unit, context, None, None))
         for ur in unit_results:
+            ur.context.placeholder_scheme = config.placeholder_scheme
             ur.request = synthesize(ur.context)
             if region_requests:
                 ur.region_requests, ur.region_plan = synthesize_regions(ur.context)
@@ -193,19 +194,20 @@ def run_case(
                     request_hash=ur.request.request_hash, exec_id="")
                 continue
         reject = duplicate_check(ur.context, case.language)
+        policy = "tolerant" if config.placeholder_scheme == "shared-v1" else "strict"
         if ur.region_requests:
             ur.generation, ur.placeholder_retry = generate_regions(
                 ur.request, ur.region_requests, ur.context.transformation["target"], backend,
                 expected_placeholders=_expected_placeholders(ur.context), reject=reject,
-                placeholder_retry=placeholder_retry)
-        elif placeholder_retry:
+                placeholder_retry=placeholder_retry, placeholder_policy=policy)
+        elif placeholder_retry and policy == "strict":
             ur.generation, ur.placeholder_retry = generate_with_placeholder_retry(
                 ur.request, backend,
                 expected_placeholders=_expected_placeholders(ur.context), reject=reject)
         else:
             ur.generation = generate(ur.request, backend,
                                      expected_placeholders=_expected_placeholders(ur.context),
-                                     reject=reject)
+                                     reject=reject, placeholder_policy=policy)
 
     package: AdaptationPackage | None = None
     if all(ur.generation.outcome == "completion" for ur in unit_results):

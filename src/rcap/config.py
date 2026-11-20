@@ -74,3 +74,14 @@ class ExecutionConfig(BaseModel):
     # entry (the prompts of 08e7a59); "names" keeps only the entries whose declared, imported or
     # re-signed names the function uses. No effect unless edit_evidence is on.
     evidence_filter: Literal["none", "names"] = "none"
+    # Placeholder scheme of the program cut (rcap.reduction_program, rcap.generate).
+    # "rcap-v1": each of source.before, source.after and the target is cut on its own, with
+    # per-side ids (source.before.N / source.after.N / target.N); the prompt tells the model to
+    # keep the placeholders; an answer that loses, repeats or invents one is rejected
+    # (placeholder_violation). "shared-v1" is PPatHF's scheme: a block is cut only when it is in
+    # all three sides, under ONE id the three share (copying upstream code then copies a
+    # placeholder the fork has too); the prompt says nothing about placeholders; and an answer
+    # is recovered tolerantly: a lost placeholder drops its code and is counted
+    # (GenerationRecord.placeholders_lost), a repeated or invented one is removed. Default
+    # "rcap-v1" reproduces the prompts and outcomes of 11b66e4 and earlier.
+    placeholder_scheme: Literal["rcap-v1", "shared-v1"] = "rcap-v1"

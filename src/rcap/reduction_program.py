@@ -248,15 +248,22 @@ def _reduce_one(
         nodes = [n for n in nodes
                  if _normalize(text[n.start_byte:n.end_byte]) in removable_norm]
 
+    return _splice(entity, role, text, grammar, protected, nodes_before,
+                   [(n, f"{role}.{i}") for i, n in enumerate(
+                       sorted(nodes, key=lambda n: n.start_byte), 1)])
+
+
+def _splice(entity: str, role: str, text: str, grammar, protected: set[int],
+            nodes_before: int, cut: list[tuple[object, str]]) -> ReducedArtifact:
+    """Replace each (node, ph_id) of `cut` by its placeholder comment."""
     # tree-sitter offsets are BYTE offsets: splice in bytes, decode once at the
     # end. Splicing the str with byte offsets silently corrupts any payload
     # containing non-ASCII characters before a placeheld node.
     raw = text.encode()
     reduced_bytes = raw
     placeholders: list[PlaceholderEntry] = []
-    for i, node in enumerate(sorted(nodes, key=lambda n: n.start_byte, reverse=True), 1):
+    for node, ph_id in sorted(cut, key=lambda c: c[0].start_byte, reverse=True):
         original = raw[node.start_byte:node.end_byte].decode()
-        ph_id = f"{role}.{len(nodes) - i + 1}"
         placeholders.insert(0, PlaceholderEntry(
             ph_id=ph_id, start_byte=node.start_byte, end_byte=node.end_byte,
             original_text=original,
@@ -272,6 +279,52 @@ def _reduce_one(
         protected_lines=sorted(protected), nodes_before=nodes_before,
         nodes_after=nodes_after,
     )
+
+
+def _reduce_shared(entity: str, texts: dict[str, str], protected: dict[str, set[int]],
+                   grammar, min_lines: int, language: str | None,
+                   next_id: list[int]) -> dict[str, ReducedArtifact]:
+    """PPatHF's cut (placeholder_scheme "shared-v1"): a removable block is cut only
+    when the same block (normalized text) is removable in ALL THREE of
+    source.before, source.after and the target, and the three copies get ONE
+    shared id. Copies are paired in source order; a block in only one or two
+    sides stays in full everywhere. Ids count up across the whole case
+    (`next_id`), so a helper's placeholder never shares an id with the unit's."""
+    roles = ("source.before", "source.after", "target")
+    found: dict[str, list] = {}
+    trees: dict[str, int] = {}
+    for role in roles:
+        root = parse(texts[role], grammar).root_node
+        trees[role] = _count_nodes(root)
+        found[role] = sorted(_candidates(root, texts[role], protected[role], min_lines,
+                                         removable_types(language, REMOVABLE_TYPES),
+                                         tolerates_parse_errors(language)),
+                             key=lambda n: n.start_byte)
+
+    raw = {role: texts[role].encode() for role in roles}
+
+    def norm(role, node):  # tree-sitter offsets are byte offsets
+        return _normalize(raw[role][node.start_byte:node.end_byte].decode())
+
+    free = {role: [(norm(role, n), n) for n in found[role]] for role in roles[1:]}
+    cut: dict[str, list] = {role: [] for role in roles}
+    for node in found["source.before"]:
+        key = norm("source.before", node)
+        picks = {}
+        for role in roles[1:]:
+            hit = next((i for i, (k, _) in enumerate(free[role]) if k == key), None)
+            if hit is None:
+                break
+            picks[role] = hit
+        if len(picks) != 2:
+            continue
+        ph_id = str(next_id[0])
+        next_id[0] += 1
+        cut["source.before"].append((node, ph_id))
+        for role, hit in picks.items():
+            cut[role].append((free[role].pop(hit)[1], ph_id))
+    return {role: _splice(entity, role, texts[role], grammar, protected[role],
+                          trees[role], cut[role]) for role in roles}
 
 
 def reduce_program(
@@ -297,6 +350,7 @@ def reduce_program(
 
     record = ProgramReductionRecord(case_id=case.case_id)
     names = _evidence_identifiers(case, reduction) if evidence_protection else set()
+    next_id = [1]  # shared-v1: placeholder ids count up across the case
 
     for entity in reduction.materialize:
         roles = materialized.by_role(entity)
@@ -313,6 +367,25 @@ def reduce_program(
                     protected_lines=sorted(protected),
                     nodes_before=n, nodes_after=n,
                     reduction_reason="program_reduction_disabled"))
+            continue
+
+        if config.placeholder_scheme == "shared-v1":
+            names_t = _lines_naming(f_t, names)
+            hunk_t, how = (target_hunk_lines(f_s, f_sp, f_t) if config.protect_target_hunks
+                           else (set(), "off"))
+            arts = _reduce_shared(
+                entity, {"source.before": f_s, "source.after": f_sp, "target": f_t},
+                {"source.before": ch_s | _lines_naming(f_s, names),
+                 "source.after": ch_sp | _lines_naming(f_sp, names),
+                 "target": names_t | hunk_t},
+                grammar, config.min_placeholder_lines, case.language, next_id)
+            art_t = arts["target"]
+            art_t.hunk_protected_lines = sorted(hunk_t)
+            art_t.protection_rule = (f"{TARGET_HUNK_PROTECTION_RULE}:{how}:shared-v1"
+                                     if config.protect_target_hunks else None)
+            for art in arts.values():
+                _assert_no_protected_overlap(case, art)
+                record.artifacts.append(art)
             continue
 
         art_s = _reduce_one(entity, "source.before", f_s,

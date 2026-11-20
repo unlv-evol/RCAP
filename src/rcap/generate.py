@@ -68,6 +68,41 @@ def placeholder_report(candidate: str, expected: set[str]) -> dict[str, list[str
             "unknown": unknown}
 
 
+# Stray placeholder marks a tolerant recovery removes: the well-formed comment and the
+# spellings models invent (`/*RCAP_PH_1*/`, `// RCAP_PH_1`, `/* RCAP_PHname */`).
+_PH_STRAY = re.compile(r"/\*\s*RCAP_PH[\w.]*\s*\*/|//\s*RCAP_PH[\w.]*[^\n]*")
+
+
+def tolerate_placeholders(candidate: str, expected: set[str]) -> tuple[str, dict[str, int]]:
+    """PPatHF's tolerant recovery (ExecutionConfig.placeholder_scheme "shared-v1"):
+    nothing is rejected for its placeholders. The first copy of each expected
+    placeholder stays (it is expanded downstream, rcap.pipeline); a missing one
+    is counted (`lost`), its code is simply not in the answer; a repeated copy and
+    any other placeholder mark are removed (`removed`), and a line left blank by a
+    removal is dropped. Returns (candidate, {"lost", "removed"})."""
+    seen: set[str] = set()
+    removed = 0
+
+    def keep_or_drop(m: re.Match) -> str:
+        nonlocal removed
+        # any spelling of an expected id counts as that placeholder (PPatHF reads
+        # `placeholder_(\d+)` whatever surrounds it), written back canonically
+        ph = re.search(r"RCAP_PH_([\w.]+)", m.group(0))
+        mark = f"/* RCAP_PH_{ph.group(1)} */" if ph else None
+        if mark in expected and mark not in seen:
+            seen.add(mark)
+            return mark
+        removed += 1
+        return "\x00"
+
+    text = _PH_STRAY.sub(keep_or_drop, candidate)
+    if removed:
+        text = "".join(ln.replace("\x00", "") for ln in text.splitlines(keepends=True)
+                       if ln.replace("\x00", "").strip() or "\x00" not in ln)
+    return text, {"lost": len(expected - seen), "removed": removed}
+
+
+
 import os as _os
 
 RELAXED = _os.environ.get("RCAP_RELAXED") == "1"
@@ -142,6 +177,9 @@ class GenerationRecord(BaseModel):
     # A whole-target unit answered region by region: one entry per region
     # request (lines, outcome, request hash, usage).
     regions: list[dict[str, object]] = Field(default_factory=list)
+    # Tolerant placeholder recovery only (placeholder_policy "tolerant"): {"lost": expected
+    # placeholders the answer dropped, "removed": repeated or invented marks taken out}.
+    placeholders: dict[str, int] = Field(default_factory=dict)
     request_hash: str
     # exec_id is the deterministic (backend, model, request) anchor; the
     # timestamp (section 11: "a timestamp may be added") makes repeated runs —
@@ -167,7 +205,8 @@ def effective_limit_chars(backend: Backend, language: str | None) -> int | None:
 def generate(request: AdaptationRequest, backend: Backend,
              *, expected_placeholders: set[str] | None = None,
              allow_decline: bool = False,
-             reject: Callable[[str], tuple[str, list[str]] | None] | None = None) -> GenerationRecord:
+             reject: Callable[[str], tuple[str, list[str]] | None] | None = None,
+             placeholder_policy: str = "strict") -> GenerationRecord:
     """`allow_decline` (repair requests): an answer `CANNOT_ADAPT: ...` instead
     of code is the distinct outcome `needs_cochange` -- a typed refusal, not an
     unparseable answer and not a completion. Off by default, so the ordinary
@@ -176,7 +215,13 @@ def generate(request: AdaptationRequest, backend: Backend,
     `reject(candidate)` is the caller's last acceptance check on an answer that
     passed everything else; it returns None, or (outcome, diagnostics) for a
     typed failure (the pipeline uses it for `duplicated_block`, which needs the
-    fork and upstream texts this function does not have)."""
+    fork and upstream texts this function does not have).
+
+    `placeholder_policy`: "strict" (default) rejects an answer that loses,
+    repeats or invents a placeholder (`placeholder_violation`); "tolerant" is
+    PPatHF's recovery (`tolerate_placeholders`): never a rejection, the counts
+    are kept in `placeholders`."""
+    ph_stats: dict[str, int] = {}
     # θ must make a weight change distinguishable from an evidence change
     # (sections 10-12): record generation params and model version when the
     # backend exposes them, not just its name.
@@ -223,7 +268,7 @@ def generate(request: AdaptationRequest, backend: Backend,
         return GenerationRecord(
             case_id=request.case_id, outcome=outcome, candidate=candidate,
             diagnostics=diag or [], generation_config=theta, usage=dict(usage),
-            limits=dict(plan), capacity=capacity,
+            limits=dict(plan), capacity=capacity, placeholders=dict(ph_stats),
             request_hash=request.request_hash, exec_id=exec_id,
             executed_at=datetime.datetime.now(datetime.UTC)
             .isoformat(timespec="seconds"))
@@ -356,7 +401,10 @@ def generate(request: AdaptationRequest, backend: Backend,
         why = region_shape_error((request.region or {}).get("text", ""), candidate)
         if why:
             return record("shape_mismatch", diag=[f"the answer is not the adapted part: {why}"])
-        if expected_placeholders is not None:
+        if expected_placeholders is not None and placeholder_policy == "tolerant":
+            candidate, stats = tolerate_placeholders(candidate, expected_placeholders)
+            ph_stats.update(stats)
+        elif expected_placeholders is not None:
             report = placeholder_report(candidate, expected_placeholders)
             if report["missing"]:
                 return record("placeholder_violation",
@@ -406,7 +454,10 @@ def generate(request: AdaptationRequest, backend: Backend,
                 f"is {'one function' if got == FUNCTION else 'not a complete ' + wanted} "
                 f"({candidate.count(chr(10))} lines, kind {got})"])
 
-    if expected_placeholders is not None:
+    if expected_placeholders is not None and placeholder_policy == "tolerant":
+        candidate, stats = tolerate_placeholders(candidate, expected_placeholders)
+        ph_stats.update(stats)
+    elif expected_placeholders is not None:
         report = placeholder_report(candidate, expected_placeholders)
         if report["missing"]:
             # wording unchanged since the 477 run, so stored outcomes stay comparable
@@ -431,6 +482,7 @@ def generate(request: AdaptationRequest, backend: Backend,
 def generate_regions(
     whole: AdaptationRequest, regions: list[AdaptationRequest], target: str, backend: Backend, *,
     expected_placeholders: set[str] | None = None,
+    placeholder_policy: str = "strict",
     reject: Callable[[str], tuple[str, list[str]] | None] | None = None,
     placeholder_retry: bool = False,
 ) -> tuple[GenerationRecord, dict[str, object] | None]:
@@ -456,7 +508,8 @@ def generate_regions(
             rec, info = generate_with_placeholder_retry(r, backend, expected_placeholders=exp)
             retry_info = info or retry_info
         else:
-            rec = generate(r, backend, expected_placeholders=exp)
+            rec = generate(r, backend, expected_placeholders=exp,
+                           placeholder_policy=placeholder_policy)
         records.append(rec)
         for k, v in rec.usage.items():
             usage[k] = usage.get(k, 0) + v
@@ -504,7 +557,10 @@ def generate_regions(
     if grammar is not None and parses(target) and not parses(merged):
         return record("unparseable", diag=[
             f"the target with the adapted part(s) spliced in no longer parses as {lang}"]), retry_info
-    if expected_placeholders is not None:
+    ph_stats: dict[str, int] = {}
+    if expected_placeholders is not None and placeholder_policy == "tolerant":
+        merged, ph_stats = tolerate_placeholders(merged, expected_placeholders)
+    elif expected_placeholders is not None:
         report = placeholder_report(merged, expected_placeholders)
         if report["missing"] or report["duplicated"] or report["unknown"]:
             return record("placeholder_violation", diag=[
@@ -514,7 +570,9 @@ def generate_regions(
         refused = reject(merged)
         if refused:
             return record(refused[0], diag=list(refused[1])), retry_info
-    return record("completion", merged), retry_info
+    done = record("completion", merged)
+    done.placeholders = ph_stats
+    return done, retry_info
 
 
 def generate_with_placeholder_retry(

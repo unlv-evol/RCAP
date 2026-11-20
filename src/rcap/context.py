@@ -117,6 +117,9 @@ class AdaptationContext(BaseModel):
     # Edit evidence (rcap.evidence; ExecutionConfig.edit_evidence). Empty when off.
     other_edits: list[OtherEdit] = Field(default_factory=list)
     pr_functions: list[PRFunction] = Field(default_factory=list)
+    # ExecutionConfig.placeholder_scheme; "shared-v1" drops the placeholder rule from the
+    # prompt (rcap.request). Excluded from dumps: an rcap-v1 context hashes as before.
+    placeholder_scheme: str = Field(default="rcap-v1", exclude=True)
     # True when the relevance filter chose them (ExecutionConfig.evidence_filter = "names").
     evidence_filtered: bool = False
     transformation: dict[str, str]              # role -> reduced text

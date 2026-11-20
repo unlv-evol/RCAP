@@ -89,7 +89,9 @@ class GenerationLimits:
     chars_per_token_expected_default: float = CHARS_PER_TOKEN_EXPECTED_DEFAULT
     # the answer may be this much longer than expected before generation is cut
     output_slack: float = 1.5
-    output_floor_tokens: int = 512
+    # RCAP_OUTPUT_FLOOR_TOKENS=4096 gives every answer at least the baselines' flat
+    # budget (Direct / PPatHF-f use num_predict 4096); 512 is the budget of 11b66e4 and earlier
+    output_floor_tokens: int = int(os.environ.get("RCAP_OUTPUT_FLOOR_TOKENS", "512"))
     # generation timeout = base + expected prompt tokens / prompt rate
     #                           + output budget / minimum generation rate
     # RCAP_TIMEOUT_BASE_S: a slower local GPU/CPU can wait longer; never changes the answer, only when it is abandoned

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 
 from pydantic import BaseModel, Field
 
@@ -462,6 +463,20 @@ def unit_kinds(context: AdaptationContext) -> tuple[str, str, str]:
             text_kind(t.get("target"), lang))
 
 
+
+# PPatHF's prompt says nothing about placeholders (ExecutionConfig.placeholder_scheme
+# "shared-v1"): the sentence is taken out of whichever template the unit uses.
+_PH_RULE = re.compile(r" ?Placeholder comments of the form\s+/\* RCAP_PH_\.\.\. \*/ stand for "
+                      r"elided code:\s+keep each one exactly where it\s+is, character for character, "
+                      r"and do not\s+invent code for it\.\n?")
+
+
+def placeholder_rule(task: str, context) -> str:
+    """`task` as the context's placeholder scheme words it."""
+    if getattr(context, "placeholder_scheme", "rcap-v1") != "shared-v1":
+        return task
+    return _PH_RULE.sub(lambda m: "" if task[m.start() - 1:m.start()] == "\n" else "\n", task)
+
 def synthesize(context: AdaptationContext) -> AdaptationRequest:
     # Every fence is labelled with the case's own language: a Scala function
     # fenced as ```java misdescribes the input and invites a Java-shaped answer.
@@ -491,6 +506,7 @@ def synthesize(context: AdaptationContext) -> AdaptationRequest:
             task = WHOLE_INSTRUCTIONS_ADDED.format(lang=lang, noun=noun)
         else:
             task = WHOLE_INSTRUCTIONS_FUNCTION.format(lang=lang, noun=noun)
+        task = placeholder_rule(task, context)
     else:
         task = w((REPAIR_V3_INSTRUCTIONS if v3 else REPAIR_INSTRUCTIONS)
                  .format(lang=lang, decline=DECLINE_TOKEN))
@@ -704,6 +720,7 @@ def synthesize_regions(context: AdaptationContext,
         return [], plan
     excerpt = REGION in (before_kind, after_kind)
     task = (REGION_INSTRUCTIONS_EXCERPT if excerpt else REGION_INSTRUCTIONS_FUNCTION).format(lang=lang)
+    task = placeholder_rule(task, context)
     out: list[AdaptationRequest] = []
     for n, region in enumerate(plan.regions, 1):
         if excerpt:
