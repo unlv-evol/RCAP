@@ -15,6 +15,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.5"]
+# the Vim -> Neovim evaluation (rcap.grammars C, rcap.ppathf_metrics, tools/vimnvim)
+vimnvim = ["tree-sitter-c>=0.24", "editdistance>=0.8", "scipy>=1.11"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/rcap"]

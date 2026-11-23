@@ -1,6 +1,7 @@
 """Run RCAP end-to-end on the minted PR-12535 SAPs with the local LLM backend."""
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -18,7 +19,7 @@ from rcap.reduction_semantic import reduce_semantic
 from rcap.request import synthesize
 from rcap.selection import select
 
-PR_DIR = Path("/home/adam/Documents/work/SALP/data/out/linkedinKafka-apacheKafka/PR-12535")
+PR_DIR = Path(os.environ.get("SALP_HOME", "/home/adam/Documents/work/SALP")) / "data/out/linkedinKafka-apacheKafka/PR-12535"
 OUT = Path(__file__).resolve().parent.parent / "out" / "PR-12535"
 
 

@@ -15,7 +15,10 @@ stages treat the payload as a clean function body.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
+import os
+from collections import Counter
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -23,26 +26,135 @@ from pydantic import BaseModel, Field
 from rcap.intake import repo_pin
 from rcap.model import CaseModel
 from rcap.reduction_semantic import SemanticReductionManifest
+from rcap.unitkind import FUNCTION, text_kind
 
 _ROLES = ("source.before", "source.after", "target")
 
+# A source context (the enclosing method, class or file SALP wrote as source.before /
+# source.after) is replaced by the entity's hunk regions (SALP region.before /
+# region.after: the hunks' own lines, context included, verbatim from the file) when
+#   * it is longer than this many characters on either side, or
+#   * it is a class or file context (never a method) that carries changes belonging to
+#     other hunks (a class or file context around a
+#     field or import hunk also holds every edit SALP gave to the methods inside it; the
+#     model then redoes those edits in the class unit, which collides with the method
+#     units). Off with RCAP_REGION_ON_FOREIGN_CHANGES=0.
+# REGION_THRESHOLD_CHARS = 0 turns all replacement off.
+REGION_THRESHOLD_CHARS = int(os.environ.get("RCAP_REGION_THRESHOLD_CHARS", "8000"))
+REGION_ON_FOREIGN_CHANGES = os.environ.get("RCAP_REGION_ON_FOREIGN_CHANGES", "1") != "0"
+
+
+def _changed_lines(before: str, after: str) -> Counter:
+    """The lines a before/after pair removes and adds, as a multiset of
+    ("-"|"+", stripped line); blank lines are ignored."""
+    a, b = before.splitlines(), after.splitlines()
+    out: Counter = Counter()
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        out.update(("-", x.strip()) for x in a[i1:i2] if x.strip())
+        out.update(("+", x.strip()) for x in b[j1:j2] if x.strip())
+    return out
+
+
+def foreign_changes(before: str, after: str, regions: list[tuple[str, str]]) -> int:
+    """How many changed lines of the context (before -> after) none of the
+    entity's own hunk regions accounts for."""
+    own: Counter = Counter()
+    for rb, ra in regions:
+        own.update(_changed_lines(rb, ra))
+    return sum((_changed_lines(before, after) - own).values())
+
+
+def use_hunk_regions(case: CaseModel, record: MaterializationRecord, entities,
+                     threshold: int | None = None) -> None:
+    """Swap a source context for the entity's hunk regions, in place, when the
+    context is oversized or carries other hunks' changes.
+
+    Both sides switch together, so a unit never pairs a whole class with a
+    region. Nothing changes when a hunk of the entity has no region files
+    (older SALP), when the regions would be no shorter, or when they carry no
+    change. Each swapped payload keeps its SAP `ref` and records `derivation`."""
+    threshold = REGION_THRESHOLD_CHARS if threshold is None else threshold
+    if threshold <= 0:
+        return
+    sap_dir = Path(case.sap_dir)
+    for entity in entities:
+        fn_id = entity.split("/", 1)[1]
+        roles = record.by_role(entity)
+        before, after = roles.get("source.before"), roles.get("source.after")
+        if before is None or after is None:
+            continue
+        size = max(len(before.content), len(after.content))
+        oversized = size > threshold
+        if not oversized and not REGION_ON_FOREIGN_CHANGES:
+            continue
+        hunks = [t for t in case.transformations if t.fn_id == fn_id]
+        refs = [(t.region_before_ref, t.region_after_ref) for t in hunks]
+        if not hunks or any(b is None or a is None for b, a in refs):
+            if oversized:
+                record.diagnostics.append(
+                    f"{entity}: source context {size} chars > {threshold}, but not every hunk "
+                    "has region files; whole context kept")
+            continue
+        try:
+            texts = [((sap_dir / b).read_bytes().decode("utf-8"),
+                      (sap_dir / a).read_bytes().decode("utf-8")) for b, a in refs]
+        except (OSError, UnicodeDecodeError) as exc:
+            record.diagnostics.append(f"{entity}: region files unreadable ({exc}); whole context kept")
+            continue
+        if oversized:
+            reason = f"source context {size} chars > {threshold}"
+        elif text_kind(before.content, case.language) == FUNCTION:
+            # a method's own hunks are the method's edits; and a method unit whose
+            # fork target is a whole class needs its full source to be located in it
+            continue
+        else:
+            n = foreign_changes(before.content, after.content, texts)
+            if not n:
+                continue
+            reason = f"source context carries {n} changed line(s) of other hunks"
+        new_before = "".join(b for b, _ in texts)
+        new_after = "".join(a for _, a in texts)
+        if new_before == new_after or (len(new_before) >= len(before.content)
+                                       and len(new_after) >= len(after.content)):
+            continue
+        ids = ", ".join(t.hunk_id for t in hunks)
+        for payload, text in ((before, new_before), (after, new_after)):
+            payload.derivation = (f"hunk regions ({ids}) in place of the {len(payload.content)}-char "
+                                  f"source context ({reason})")
+            payload.content = text
+            payload.sha256 = hashlib.sha256(text.encode()).hexdigest()
+        record.diagnostics.append(f"{entity}: {reason}: using the hunk regions of {ids}")
+
 
 class NullTransformationFailure(Exception):
-    """tau carries no change: source.before == source.after (RCAP ref section 14).
+    """Every tau in the case carries no change: source.before == source.after
+    (RCAP ref section 14).
 
     A vacuous transformation gives the backend an empty diff to "apply" —
     observed to produce hallucinated edits — so it is a typed evidence failure
     at materialization, never a silent completion. Root cause today is
     upstream: SALP anchoring the edit region on a context line and slicing an
     untouched neighbor function.
+
+    Raised only when NO entity in the case has a real change. A composite case
+    where some entities are vacuous and others are not records the vacuous ones
+    as a per-unit disposition (`MaterializationRecord.null_entities`) and
+    proceeds with the rest: section 13 processes units independently, so
+    refusing the whole case for one inert neighbour discarded adaptable
+    functions — measured at 13 of 22 entities across 7 refused SAPs, only one of
+    which was wholly vacuous.
     """
 
-    def __init__(self, case_id: str, entity: str):
+    def __init__(self, case_id: str, entities: list[str] | str):
         self.stage = "materialization"
+        ents = [entities] if isinstance(entities, str) else list(entities)
         self.diagnostics = [
-            f"{entity}: null transformation (source.before == source.after); no change to adapt"
-        ]
-        super().__init__(f"null transformation for {case_id} ({entity})")
+            f"{e}: null transformation (source.before == source.after); "
+            "no change to adapt" for e in ents
+        ] or ["null transformation; no change to adapt"]
+        super().__init__(f"null transformation for {case_id} ({', '.join(ents)})")
 
 
 class MaterializationFailure(Exception):
@@ -62,15 +174,30 @@ class MaterializedPayload(BaseModel):
     # None when the case records no binding for the role's repository.
     repository_pin: dict[str, object] | None = None
     fidelity_flags_available: bool = False
+    # Set only when RCAP derived this content from the SAP payload instead of
+    # using it verbatim (rcap.unitkind.narrow_targets); `ref` still names the
+    # SAP payload it was derived from, `sha256` is of the content used.
+    derivation: str | None = None
 
 
 class MaterializationRecord(BaseModel):
     case_id: str
     payloads: list[MaterializedPayload] = Field(default_factory=list)
     diagnostics: list[str] = Field(default_factory=list)
+    # Entities whose tau carries no change. Excluded from processing but kept,
+    # so a partially vacuous composite is reported as such rather than silently
+    # narrowed.
+    null_entities: list[str] = Field(default_factory=list)
+    # Entities whose whole-file target payload was examined for narrowing to
+    # the source function's counterpart (rcap.unitkind), hit or miss.
+    narrowed: dict[str, dict[str, object]] = Field(default_factory=dict)
 
     def by_role(self, entity: str) -> dict[str, MaterializedPayload]:
         return {p.role: p for p in self.payloads if p.entity == entity}
+
+    def adaptable(self, entities) -> list[str]:
+        """The given entities minus the vacuous ones, order preserved."""
+        return [e for e in entities if e not in set(self.null_entities)]
 
 
 def materialize(case: CaseModel, reduction: SemanticReductionManifest) -> MaterializationRecord:
@@ -140,10 +267,20 @@ def materialize(case: CaseModel, reduction: SemanticReductionManifest) -> Materi
     if errors:
         raise MaterializationFailure(case.case_id, errors)
 
+    use_hunk_regions(case, record, reduction.materialize)
+
     for entity in reduction.materialize:
         roles = record.by_role(entity)
         before = roles.get("source.before")
         after = roles.get("source.after")
         if before and after and before.content == after.content:
-            raise NullTransformationFailure(case.case_id, entity)
+            record.null_entities.append(entity)
+    if record.null_entities:
+        if not record.adaptable(reduction.materialize):
+            # nothing in the case has a change: the refusal is the whole case
+            raise NullTransformationFailure(case.case_id, record.null_entities)
+        record.diagnostics.append(
+            f"{len(record.null_entities)} of {len(reduction.materialize)} entities "
+            f"carry no change and are excluded: {', '.join(record.null_entities)}"
+        )
     return record

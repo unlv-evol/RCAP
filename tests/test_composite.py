@@ -4,14 +4,28 @@ import pytest
 
 from rcap.coupling import detect_units
 from rcap.eval_harness import run_configs
-from rcap.generate import StubBackend
+from rcap.generate import StubBackend as _Stub
 from rcap.intake import load_case
 from rcap.model import RelationshipEdge
 from rcap.pipeline import run_case
 
-# Carries the one placeholder the reduced fn-1 target expects; harmless for
-# units whose target has none (only MISSING placeholders violate).
-CANDIDATE = "```java\nint compute(int a) { /* RCAP_PH_target.1 */ return 0; }\n```"
+# The reduced fn-1 target has one placeholder and fn-2's has none. An unknown
+# placeholder is a hard rejection (it would leak into the fork), so the stub
+# answers each unit with exactly the placeholders its own request shows.
+class _PerUnitStub(_Stub):
+    def __init__(self):
+        super().__init__("")
+
+    def generate(self, request):
+        ph = "/* RCAP_PH_target.1 */ " if "RCAP_PH_target.1" in request.prompt else ""
+        return f"```java\nint compute(int a) {{ {ph}return 0; }}\n```"
+
+
+def StubBackend(_candidate):   # noqa: N802 - keeps the call sites below unchanged
+    return _PerUnitStub()
+
+
+CANDIDATE = None
 
 
 @pytest.fixture(scope="module")

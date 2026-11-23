@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -61,3 +62,26 @@ class ExecutionConfig(BaseModel):
     generation_params: dict[str, object] = Field(default_factory=dict)
     # Program-context reduction tuning (recorded, never hard-coded).
     min_placeholder_lines: int = 3
+    # Never placehold a target line an upstream hunk maps to (rcap.reduction_program
+    # .target_hunk_lines). Off reproduces the reduction of ede1b40 and earlier.
+    protect_target_hunks: bool = True
+    # Edit evidence (rcap.evidence): a function unit's prompt also shows the same
+    # change's edits outside functions in its file (removed/added lines) and the
+    # signatures of the functions the PR edits in its other files. Off reproduces
+    # the prompts of c24f060 and earlier byte for byte.
+    edit_evidence: bool = False
+    # Relevance filter of the edit evidence (rcap.evidence, "Relevance filter"): "none" shows every
+    # entry (the prompts of 08e7a59); "names" keeps only the entries whose declared, imported or
+    # re-signed names the function uses. No effect unless edit_evidence is on.
+    evidence_filter: Literal["none", "names"] = "none"
+    # Placeholder scheme of the program cut (rcap.reduction_program, rcap.generate).
+    # "rcap-v1": each of source.before, source.after and the target is cut on its own, with
+    # per-side ids (source.before.N / source.after.N / target.N); the prompt tells the model to
+    # keep the placeholders; an answer that loses, repeats or invents one is rejected
+    # (placeholder_violation). "shared-v1" is PPatHF's scheme: a block is cut only when it is in
+    # all three sides, under ONE id the three share (copying upstream code then copies a
+    # placeholder the fork has too); the prompt says nothing about placeholders; and an answer
+    # is recovered tolerantly: a lost placeholder drops its code and is counted
+    # (GenerationRecord.placeholders_lost), a repeated or invented one is removed. Default
+    # "rcap-v1" reproduces the prompts and outcomes of 11b66e4 and earlier.
+    placeholder_scheme: Literal["rcap-v1", "shared-v1"] = "rcap-v1"

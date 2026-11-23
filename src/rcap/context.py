@@ -16,6 +16,14 @@ import re
 from pydantic import BaseModel, Field
 
 from rcap.coupling import Unit
+from rcap.evidence import (
+    OtherEdit,
+    PRFunction,
+    filter_other_edits,
+    function_names,
+    other_edits,
+    signature_relevant,
+)
 from rcap.materialize import MaterializationRecord
 from rcap.model import CaseModel
 from rcap.reduction_program import (
@@ -44,13 +52,18 @@ class ContextValidityFailure(ContextConstructionFailure):
         self.stage = "context_construction"
 
 
-def signature_of(payload_text: str) -> str | None:
+def signature_of(payload_text: str, bodyless: bool = False) -> str | None:
     """The declaration header of a function payload: the text up to the first
     body brace, whitespace-collapsed. Derived from SAP evidence (the payload
     itself), never invented; None when the payload has no brace (not a
-    function body)."""
+    function body). `bodyless` (edit evidence only): a declaration without a
+    body (an interface or abstract method, `...);`) is its own signature."""
     head, brace, _ = payload_text.partition("{")
     if not brace:
+        if bodyless:
+            head, semi, _ = payload_text.partition(";")
+            if semi and "(" in head:
+                return _WS.sub(" ", head).strip() or None
         return None
     return _WS.sub(" ", head).strip() or None
 
@@ -93,11 +106,22 @@ class Correspondence(BaseModel):
 
 class AdaptationContext(BaseModel):
     case_id: str
+    # The case's source language, so prompt fences and every parse downstream
+    # use the grammar the SAP declares rather than an assumed one.
+    language: str = "java"
     # Section 13: the processing unit this context covers (entity, ordered
     # hunks, coupling basis/note) and the sibling units' signatures. Empty
     # unit info means a plain single-unit case.
     unit: dict[str, object] = Field(default_factory=dict)
     siblings: list[SiblingSignature] = Field(default_factory=list)
+    # Edit evidence (rcap.evidence; ExecutionConfig.edit_evidence). Empty when off.
+    other_edits: list[OtherEdit] = Field(default_factory=list)
+    pr_functions: list[PRFunction] = Field(default_factory=list)
+    # ExecutionConfig.placeholder_scheme; "shared-v1" drops the placeholder rule from the
+    # prompt (rcap.request). Excluded from dumps: an rcap-v1 context hashes as before.
+    placeholder_scheme: str = Field(default="rcap-v1", exclude=True)
+    # True when the relevance filter chose them (ExecutionConfig.evidence_filter = "names").
+    evidence_filtered: bool = False
     transformation: dict[str, str]              # role -> reduced text
     edit_regions: list[str]
     # Section 9(2): file, region, containing function, match kind, and — when
@@ -144,6 +168,17 @@ def _localization(case: CaseModel, retained: set[str], entity: str) -> dict[str,
             candidates = rec.attributes.get("candidates") or []
             loc["alternatives"] = list(candidates)
             loc["ambiguous"] = bool(candidates)
+    return loc
+
+
+def _with_narrowing(loc: dict[str, object], materialized: MaterializationRecord,
+                    entity: str) -> dict[str, object]:
+    """Record that the target is RCAP's narrowing of a whole-file payload
+    (rcap.unitkind). The key is added only for such units, so every other
+    unit's context is unchanged."""
+    info = getattr(materialized, "narrowed", {}).get(entity)
+    if info:
+        loc["narrowing"] = dict(info)
     return loc
 
 
@@ -250,13 +285,19 @@ def build_context(
     unit: Unit | None = None,
     siblings: tuple[Unit, ...] = (),
     helpers: tuple[str, ...] = (),
+    edit_evidence: bool = False,
+    pr_functions: tuple[PRFunction, ...] = (),
+    evidence_filter: str = "none",
 ) -> AdaptationContext:
     """Build the context for one processing unit (section 13: per-unit
     processing). A composite case must name its unit explicitly — building
     from only the first entity would silently misrepresent the case as fully
     covered, so that remains a typed failure, never a truncation."""
     if unit is None:
-        tau_entities = [e for e in reduction.materialize if e not in helpers]
+        # Vacuous entities are not part of tau: counting them would make a
+        # single-real-unit case look composite and refuse it.
+        tau_entities = [e for e in materialized.adaptable(reduction.materialize)
+                        if e not in helpers]
         if len(tau_entities) > 1:
             raise ContextValidityFailure(case.case_id, [
                 (f"composite case: {len(tau_entities)} materialized entities "
@@ -269,6 +310,10 @@ def build_context(
         if entity not in reduction.materialize:
             raise ContextValidityFailure(case.case_id, [
                 f"unit entity {entity} is not among the materialized entities"])
+        if entity in materialized.null_entities:
+            raise ContextValidityFailure(case.case_id, [
+                f"unit entity {entity} carries no change (null transformation); "
+                "it must not be built into a request"])
     if entity is None:
         raise ContextValidityFailure(case.case_id, ["no program entity to adapt"])
     arts = {a.role: a for a in program.artifacts if a.entity == entity}
@@ -330,6 +375,13 @@ def build_context(
     # Section 13: sibling-edit signatures — the signatures (never bodies) of
     # the other units edited by this change, from their materialized payloads.
     sibling_sigs: list[SiblingSignature] = []
+    edits: list[OtherEdit] = []
+    if edit_evidence:
+        # Non-function siblings (imports, fields, class/file-level code) leave the
+        # signature list (where they could only show as `?`) for the edit-evidence
+        # section, as the lines their change removes and adds.
+        edits, moved = other_edits([s.entity for s in siblings], materialized, case.language)
+        siblings = tuple(s for s in siblings if s.entity not in moved)
     for sib in siblings:
         roles = materialized.by_role(sib.entity)
         if not roles:
@@ -337,13 +389,27 @@ def build_context(
 
         def sig(role: str, roles=roles) -> str | None:
             payload = roles.get(role)
-            return signature_of(payload.content) if payload else None
+            return signature_of(payload.content, bodyless=edit_evidence) if payload else None
 
         sibling_sigs.append(SiblingSignature(
             entity=sib.entity, hunk_ids=sib.hunk_ids,
             signature_before=sig("source.before"),
             signature_after=sig("source.after"),
             target_signature=sig("target")))
+
+    filtered = edit_evidence and evidence_filter == "names"
+    pr_funcs = list(pr_functions) if edit_evidence else []
+    if filtered:
+        # Relevance filter (rcap.evidence): keep only the entries whose names this function uses,
+        # from its unreduced payloads (so both evaluation modes keep the same entries).
+        roles = materialized.by_role(entity)
+        names = function_names(*(roles[r].content if r in roles else None
+                                 for r in ("source.before", "source.after", "target")))
+        edits = filter_other_edits(edits, names)[0]
+        sibling_sigs = [s for s in sibling_sigs if signature_relevant(
+            s.signature_before, s.signature_after, names, same_file=True)]
+        pr_funcs = [f for f in pr_funcs
+                    if signature_relevant(f.signature_before, f.signature_after, names)]
 
     unit_edit_regions = (unit.edit_regions if unit is not None
                          else [er for t in case.transformations for er in t.edit_regions])
@@ -354,12 +420,17 @@ def build_context(
                    if a.entity == h and a.role == "target"]
 
     return AdaptationContext(
+        language=case.language,
         case_id=case.case_id,
         unit=unit.model_dump() if unit is not None else {},
         siblings=sibling_sigs,
+        other_edits=edits,
+        pr_functions=pr_funcs,
+        evidence_filtered=filtered,
         transformation={role: arts[role].reduced_text for role in arts},
         edit_regions=unit_edit_regions,
-        target_localization=_localization(case, retained, entity),
+        target_localization=_with_narrowing(_localization(case, retained, entity),
+                                            materialized, entity),
         confidence={"category": dict(case.category_confidence),
                     "localization": _localization_confidence(case, retained)},
         relationships=relationships,

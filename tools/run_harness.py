@@ -1,6 +1,7 @@
 """Run the §15 four-config evaluation harness over every minted SAP (live LLM)."""
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from rcap.backend_ollama import OllamaBackend
 from rcap.eval_harness import run_configs
 
 OUT_ROOT = Path(__file__).resolve().parent.parent / "out"
-SALP_OUT = Path("/home/adam/Documents/work/SALP/data/out/linkedinKafka-apacheKafka")
+SALP_OUT = Path(os.environ.get("SALP_HOME", "/home/adam/Documents/work/SALP")) / "data/out/linkedinKafka-apacheKafka"
 
 
 def main() -> None:

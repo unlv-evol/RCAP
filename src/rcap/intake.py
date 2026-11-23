@@ -154,6 +154,8 @@ def load_case(sap_dir: str | Path, *, pr_manifest: dict | None = None) -> CaseMo
             f_s_ref=tr.get("f_s_before"),
             f_s_prime_ref=tr.get("f_s_after"),
             f_t_ref=tr.get("f_t"),
+            region_before_ref=tr.get("region_before"),
+            region_after_ref=tr.get("region_after"),
         ))
 
         for edge in index.get("relationships", []):
